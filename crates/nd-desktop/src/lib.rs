@@ -1,4 +1,5 @@
 //! GPUI 适配层。能力视图经 Slots 登记，领域事实只来自 nd-wire。
+pub mod composer;
 use gpui_kit::*;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
 use nd_view_model::{Contribution, Slot, Slots, Theme, ThemeMode, ViewState};
@@ -14,6 +15,7 @@ pub struct Presentation<'a> {
 }
 
 pub struct Desktop {
+    composer: Entity<composer::Composer>,
     state: ViewState,
     theme: Theme,
     snapshot: Option<Snapshot>,
@@ -113,7 +115,9 @@ impl Desktop {
         });
         let theme = Theme::builtin(state.theme);
         apply_theme(&theme, cx);
+        let composer = cx.new(|cx| composer::Composer::new(theme.clone(), window, cx));
         Ok(Self {
+            composer,
             state,
             theme,
             snapshot: None,
@@ -130,6 +134,10 @@ impl Desktop {
     }
     pub fn state(&self) -> &ViewState {
         &self.state
+    }
+    /// #14 订阅输入意图并接入同步副本；只在会话准入成立时启用发送。
+    pub fn composer(&self) -> &Entity<composer::Composer> {
+        &self.composer
     }
     pub fn theme(&self) -> &Theme {
         &self.theme
@@ -165,6 +173,9 @@ impl Desktop {
         self.state.theme = theme.mode;
         self.theme = theme;
         apply_theme(&self.theme, cx);
+        self.composer.update(cx, |composer, cx| {
+            composer.set_theme(self.theme.clone(), cx)
+        });
         self.save.send_replace(self.state.clone());
         cx.notify();
     }
@@ -203,6 +214,11 @@ pub fn apply_theme(theme: &Theme, cx: &mut App) {
         kit.colors.background = rgba(theme.colors.background).into();
         kit.colors.foreground = rgba(theme.colors.foreground).into();
         kit.colors.border = rgba(theme.colors.border).into();
+        kit.colors.input = rgba(theme.colors.border).into();
+        kit.colors.caret = rgba(theme.colors.accent).into();
+        kit.colors.ring = rgba(theme.colors.accent).into();
+        kit.colors.muted_foreground = rgba(theme.colors.muted).into();
+        kit.colors.selection = rgba(theme.colors.accent).into();
     });
 }
 impl Render for Desktop {
@@ -321,15 +337,27 @@ impl Render for Desktop {
                     )
                     .child(
                         div()
-                            .id("content")
                             .flex_1()
                             .min_w_0()
-                            .overflow_y_scroll()
                             .flex()
                             .flex_col()
-                            .p(px(theme.spacing.large))
-                            .gap(px(theme.spacing.medium))
-                            .children(items),
+                            .child(
+                                div()
+                                    .id("content")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .flex()
+                                    .flex_col()
+                                    .p(px(theme.spacing.large))
+                                    .gap(px(theme.spacing.medium))
+                                    .children(items),
+                            )
+                            .child(
+                                div()
+                                    .p(px(theme.spacing.medium))
+                                    .child(self.composer.clone()),
+                            ),
                     )
                     .children(right),
             )
