@@ -1,0 +1,20 @@
+{
+  "cli_version": "2.1.289 (Claude Code)",
+  "registry_removed_after_exit": true,
+  "network": "bwrap --unshare-all",
+  "model_requests": 1,
+  "cli_sha256": "a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348",
+  "files": {
+    "agents.json": "00b58571c2b482e89b4b450ba66490abf8b897048396046427c2e5bdb2466b91",
+    "history.jsonl": "88469a85ab8a8725c4d25c8ce53bf8133f47d78efecd08c2c81b0ac6bc00e4bd",
+    "identity.json": "32d7c7cce179ca8f48aebfb661f09d61b11303e494417aed6e15d29a1d7137ec",
+    "registry.frames.jsonl": "16ac0092ba8c10db3519fa28d1dbe5489ca50dba3af11f02df44744cf78cb56a",
+    "registry.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "session.json": "e67d8f238c7e3a767e3cac6df52e654baa1d4986e181c2202ed7870ebbffbafd"
+  },
+  "cleanup": {
+    "temporary_directory_removed": true,
+    "unit": "nd-test-claims-f53337d411c0.service",
+    "slice": "ndtestclaimsf53337d411c0.slice"
+  }
+}
