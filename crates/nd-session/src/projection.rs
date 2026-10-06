@@ -16,6 +16,15 @@ pub const NAMESPACE: &str = "session";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "shown", rename_all = "snake_case")]
 pub enum Shown {
+    Draft {
+        text: String,
+        version: u64,
+    },
+    Control {
+        id: String,
+        state: String,
+        outcome: Value,
+    },
     Lineage {
         data: Value,
     },
@@ -81,6 +90,8 @@ impl Shown {
     /// 条目 id；增量与它的完整条目同 id。
     pub fn id(&self) -> String {
         match self {
+            Shown::Draft { .. } => "draft".into(),
+            Shown::Control { id, .. } => format!("control/{id}"),
             Shown::Lineage { .. } => "lineage".into(),
             Shown::Header { .. } => "header".into(),
             Shown::Prompt { id, .. } => format!("prompt/{id}"),
@@ -98,6 +109,27 @@ impl Shown {
     fn render(&self, seq: u64, accumulated: Option<&str>) -> Item {
         let id = self.id();
         let (kind, mut data, title, text) = match self {
+            Shown::Draft { text, version } => (
+                "draft",
+                json!({"text":text,"version":version}),
+                "草稿".into(),
+                shorten(text),
+            ),
+            Shown::Control { id, state, outcome } => (
+                "control",
+                json!({"control": id, "state": state, "outcome": outcome}),
+                "操作结果".to_owned(),
+                match state.as_str() {
+                    "acknowledged" => "停止请求已送达",
+                    "pending" => "正在处理",
+                    "withdrawn" => "已撤回到输入框",
+                    "not_withdrawable" => "消息已开始处理，无法撤回",
+                    "unknown" => "交付不明，请核对会话状态",
+                    "failed" => "操作失败",
+                    other => other,
+                }
+                .into(),
+            ),
             Shown::Lineage { data } => (
                 "lineage",
                 data.clone(),

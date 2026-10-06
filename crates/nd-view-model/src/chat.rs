@@ -58,6 +58,7 @@ pub struct MessageView {
     pub text: String,
     pub status: String,
     pub markdown: bool,
+    pub withdraw: Option<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConversationView {
@@ -71,7 +72,10 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
     let mut items: Vec<_> = snapshot
         .items
         .iter()
-        .filter(|i| i.kind != "header" && !(i.kind == "op" && i.data["phase"] == "done"))
+        .filter(|i| {
+            !matches!(i.kind.as_str(), "header" | "draft")
+                && !(i.kind == "op" && i.data["phase"] == "done")
+        })
         .collect();
     items.sort_by_key(|i| i.data["seq"].as_u64().unwrap_or(u64::MAX));
     ConversationView {
@@ -135,12 +139,23 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                 }
                 .into(),
                 markdown: i.kind == "text",
+                withdraw: (header.is_some_and(|h| h.data["interaction"]["withdraw"] == true)
+                    && i.kind == "prompt"
+                    && matches!(
+                        i.data["state"].as_str(),
+                        Some("held" | "waiting" | "pending" | "written" | "queued")
+                    ))
+                .then(|| i.data["message"].as_str().map(str::to_owned))
+                .flatten(),
                 status: if i.kind == "prompt" {
                     match i.data["state"].as_str() {
                         Some("held") => "代持中",
                         Some("waiting") => "等待可写",
                         Some("pending") => "等待写出",
                         Some("written") => "已写出",
+                        Some("queued") => "排队中",
+                        Some("withdrawing") => "撤回中",
+                        Some("withdrawn") => "已撤回",
                         Some("landed") => "已送达",
                         Some("failed") => "发送失败",
                         Some("unknown") => "交付不明",
@@ -170,8 +185,43 @@ pub fn accepted(reply: &nd_wire::CommandReply) -> bool {
 pub struct Draft {
     text: String,
     revision: u64,
+    server_version: Option<u64>,
+    server_text: String,
 }
 impl Draft {
+    pub fn server_version(&self) -> Option<u64> {
+        self.server_version
+    }
+    /// 撤回请求携带当前编辑缓冲；随后的同文快照不是另一份待追加正文。
+    pub fn preparing_restore(&mut self) {
+        self.server_text = self.text.clone();
+    }
+    pub fn receive(&mut self, version: u64, text: &str) -> bool {
+        if self.server_version.is_some_and(|known| version <= known) {
+            return false;
+        }
+        let before = self.text.clone();
+        if self.text == self.server_text || self.text == text {
+            self.edit(text.into());
+        } else if !text.is_empty() {
+            let added = text
+                .strip_prefix(&self.server_text)
+                .unwrap_or(text)
+                .trim_start_matches('\n');
+            if !added.is_empty() {
+                let mut merged = self.text.clone();
+                if !merged.is_empty() {
+                    merged.push_str("\n\n");
+                }
+                merged.push_str(added);
+                self.edit(merged);
+            }
+        }
+        self.server_text = text.into();
+        self.server_version = Some(version);
+        self.text != before
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -190,5 +240,49 @@ impl Draft {
         }
         self.edit(String::new());
         true
+    }
+}
+
+/// 输入法已经由 Composer 消费后，按面板、活动回合、空闲双 Esc 的顺序分派。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Escape {
+    None,
+    ClosePanel,
+    Interrupt,
+    RewindMenu,
+}
+#[derive(Clone, Debug, Default)]
+pub struct EscapeState {
+    idle_at: Option<u64>,
+}
+impl EscapeState {
+    pub fn press(
+        &mut self,
+        now_ms: u64,
+        panel_open: bool,
+        running: bool,
+        can_rewind: bool,
+    ) -> Escape {
+        if panel_open {
+            self.idle_at = None;
+            return Escape::ClosePanel;
+        }
+        if running {
+            self.idle_at = None;
+            return Escape::Interrupt;
+        }
+        if !can_rewind {
+            self.idle_at = None;
+            return Escape::None;
+        }
+        if self
+            .idle_at
+            .take()
+            .is_some_and(|t| now_ms.saturating_sub(t) <= 500)
+        {
+            return Escape::RewindMenu;
+        }
+        self.idle_at = Some(now_ms);
+        Escape::None
     }
 }

@@ -74,14 +74,26 @@ impl Desktop {
             |this, _, event, window, cx| match event {
                 ComposerEvent::Changed(state) => {
                     let key = this.draft_key();
-                    this.drafts.entry(key).or_default().edit(state.text.clone());
+                    let draft = this.drafts.entry(key).or_default();
+                    draft.edit(state.text.clone());
+                    if !state.composing
+                        && let Some(remote) = this
+                            .session_snapshot
+                            .as_ref()
+                            .and_then(|s| s.items.iter().find(|i| i.kind == "draft"))
+                        && draft.receive(
+                            remote.data["version"].as_u64().unwrap_or(0),
+                            remote.data["text"].as_str().unwrap_or_default(),
+                        )
+                    {
+                        this.restore_draft(window, cx);
+                    }
                 }
                 ComposerEvent::Action(ComposerAction::Submit { text }) => {
                     this.send_text(text.clone(), window, cx)
                 }
                 ComposerEvent::Action(ComposerAction::Escape) => {
-                    this.warning = Some("当前界面暂不支持停止回合".into());
-                    cx.notify();
+                    this.escape_pressed(cx);
                 }
                 _ => {}
             },
@@ -102,14 +114,14 @@ impl Desktop {
             self.select_session(session, window, cx);
         }
     }
-    fn draft_key(&self) -> Option<String> {
+    pub(crate) fn draft_key(&self) -> Option<String> {
         if self.creating {
             None
         } else {
             self.state.selected_session.clone()
         }
     }
-    fn restore_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn restore_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self
             .drafts
             .entry(self.draft_key())
@@ -141,6 +153,8 @@ impl Desktop {
     }
     pub fn begin_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.scroll = ScrollHandle::new();
+        self.escape = Default::default();
+        self.send_intent = "fold".into();
         self.creating = true;
         self.session_feed = None;
         self.session_snapshot = None;
@@ -152,6 +166,8 @@ impl Desktop {
     }
     pub fn select_session(&mut self, session: String, window: &mut Window, cx: &mut Context<Self>) {
         self.scroll = ScrollHandle::new();
+        self.escape = Default::default();
+        self.send_intent = "fold".into();
         self.session_feed = None; // 丢掉接收任务即关闭订阅，不结束后端。
         self.session_snapshot = None;
         self.creating = false;
@@ -162,10 +178,10 @@ impl Desktop {
         let stream = format!("session/{session}");
         match ReplicaFeed::start(&self.socket, &stream) {
             Ok(mut feed) => {
-                self.session_feed = Some(cx.spawn(async move |weak, cx| {
+                self.session_feed = Some(cx.spawn_in(window, async move |weak, cx| {
                     while let Some(update) = feed.recv().await {
                         if weak
-                            .update(cx, |this, cx| {
+                            .update_in(cx, |this, window, cx| {
                                 if this.state.selected_session.as_ref() != Some(&session)
                                     || this.creating
                                 {
@@ -178,6 +194,22 @@ impl Desktop {
                                                 <= px(this.theme.spacing.small)
                                         {
                                             this.scroll.scroll_to_bottom();
+                                        }
+                                        let current = this
+                                            .composer
+                                            .update(cx, |c, cx| c.snapshot(window, cx));
+                                        let draft =
+                                            this.drafts.entry(Some(session.clone())).or_default();
+                                        draft.edit(current.text);
+                                        if !current.composing
+                                            && let Some(remote) =
+                                                s.items.iter().find(|i| i.kind == "draft")
+                                            && draft.receive(
+                                                remote.data["version"].as_u64().unwrap_or(0),
+                                                remote.data["text"].as_str().unwrap_or_default(),
+                                            )
+                                        {
+                                            this.restore_draft(window, cx);
                                         }
                                         this.session_snapshot = Some(s);
                                     }
@@ -250,6 +282,7 @@ impl Desktop {
         let draft = self.drafts.entry(key.clone()).or_default();
         draft.edit(text.clone());
         let revision = draft.revision();
+        let draft_version = draft.server_version();
         let command = Command {
             id: uuid::Uuid::new_v4().to_string(),
             device: "desktop".into(),
@@ -263,7 +296,7 @@ impl Desktop {
             args: if self.creating {
                 json!({"cwd":self.directory.read(cx).value().to_string(), "model":self.model, "text":text})
             } else {
-                json!({"session":key, "text":text})
+                json!({"session":key, "text":text, "intent":self.send_intent, "draft_version":draft_version})
             },
         };
         self.sending = true;
@@ -507,6 +540,19 @@ impl Desktop {
                             .child(format!("{} {}", message.title, message.status)),
                     )
                     .child(body)
+                    .when(message.withdraw.is_some(), |d| {
+                        let id = message.withdraw.clone().unwrap();
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("withdraw/{id}")))
+                                .text_color(rgba(t.colors.accent))
+                                .cursor_pointer()
+                                .child("撤回到输入框")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.withdraw_message(id.clone(), window, cx)
+                                })),
+                        )
+                    })
                     .into_any_element(),
             );
         }

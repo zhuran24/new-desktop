@@ -2,6 +2,32 @@ use nd_view_model::{ViewState, sidebar};
 use nd_wire::{Fallback, Item, Snapshot};
 use serde_json::json;
 
+#[test]
+fn restored_draft_survives_cold_start_and_appends_without_losing_new_typing() {
+    let mut draft = nd_view_model::Draft::default();
+    assert!(draft.receive(1, "withdrawn"));
+    assert_eq!(draft.text(), "withdrawn");
+    draft.edit("withdrawn plus typing".into());
+    assert!(draft.receive(2, "withdrawn\n\nsecond withdrawal"));
+    assert_eq!(draft.text(), "withdrawn plus typing\n\nsecond withdrawal");
+    assert!(!draft.receive(1, "stale"));
+    assert_eq!(draft.server_version(), Some(2));
+}
+
+#[test]
+fn escape_closes_panels_before_stopping_and_idle_double_escape_opens_rewind() {
+    use nd_view_model::{Escape, EscapeState};
+    let mut state = EscapeState::default();
+    assert_eq!(state.press(10, true, true, true), Escape::ClosePanel);
+    assert_eq!(state.press(20, false, true, true), Escape::Interrupt);
+    assert_eq!(state.press(30, false, false, true), Escape::None);
+    assert_eq!(state.press(200, false, false, true), Escape::RewindMenu);
+    assert_eq!(state.press(210, false, false, true), Escape::None);
+    assert_eq!(state.press(1000, false, false, true), Escape::None);
+    assert_eq!(state.press(1100, false, false, false), Escape::None);
+    assert_eq!(state.press(1200, false, false, true), Escape::None);
+}
+
 fn item(id: &str, kind: &str, data: serde_json::Value) -> Item {
     Item {
         id: id.into(),

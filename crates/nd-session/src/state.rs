@@ -59,6 +59,8 @@ pub struct Carrier {
     pub run: Option<RunId>,
     pub alive: bool,
     pub readiness: Option<Readiness>,
+    #[serde(default)]
+    pub interaction: nd_backend::InteractionCaps,
     /// `Done::Opened.adopt`：适配器在守护进程重启后接回要用。
     pub adopt: Value,
     pub checkpoint: Option<Checkpoint>,
@@ -87,10 +89,12 @@ pub struct OutRow {
 pub enum Issuer {
     Op { op: String, key: String },
     Message { id: String },
+    Control { id: String },
+    Withdrawal { id: String, message: Message },
 }
 
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
     pub text: String,
@@ -112,8 +116,16 @@ pub struct Core {
     pub ops: BTreeMap<String, OpRecord>,
     pub outbox: BTreeMap<Ticket, OutRow>,
     pub messages: BTreeMap<String, Message>,
+    /// 撤回回填和结 Send 票同事务。#16 可在此基础上扩展版本比较与落败另存。
+    #[serde(default)]
+    pub draft: Draft,
     pub next_op: u64,
     pub arrivals: u64,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Draft {
+    pub text: String,
+    pub version: u64,
 }
 impl Core {
     pub fn meta(&self) -> &Meta {

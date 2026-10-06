@@ -1,6 +1,7 @@
 //! GPUI 适配层。能力视图经 Slots 登记，领域事实只来自 nd-wire。
 mod chat;
 pub mod composer;
+mod controls;
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
@@ -30,6 +31,9 @@ pub struct Desktop {
     model_loading: bool,
     creating: bool,
     sending: bool,
+    send_intent: String,
+    escape: nd_view_model::EscapeState,
+    started: std::time::Instant,
     drafts: std::collections::BTreeMap<Option<String>, nd_view_model::Draft>,
     subscriptions: Vec<Subscription>,
     composer: Entity<composer::Composer>,
@@ -139,6 +143,9 @@ impl Desktop {
             model_loading: false,
             creating: state.selected_session.is_none(),
             sending: false,
+            send_intent: "fold".into(),
+            escape: Default::default(),
+            started: std::time::Instant::now(),
             drafts: Default::default(),
             subscriptions: vec![],
             composer,
@@ -275,8 +282,15 @@ impl Render for Desktop {
         }
         let chat_sidebar = self.chat_sidebar(cx);
         let chat_content = self.chat_content(window, cx);
+        let controls = self.chat_controls(cx);
         let theme = &self.theme;
         div()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && !event.is_held {
+                    this.escape_pressed(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -357,6 +371,7 @@ impl Render for Desktop {
                             .child(
                                 div()
                                     .p(px(theme.spacing.medium))
+                                    .child(controls)
                                     .child(self.composer.clone()),
                             ),
                     )

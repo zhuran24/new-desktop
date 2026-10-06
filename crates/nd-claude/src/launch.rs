@@ -9,9 +9,11 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 pub const OLD_MODS: [&str; 4] = ["codex-direct", "sendnow", "cc-quota", "ultracode-toggle"];
 
 /// 启动模板固定加的环境；不可由配置覆盖。
-pub const FIXED_ENV: [(&str, &str); 6] = [
+pub const FIXED_ENV: [(&str, &str); 7] = [
     ("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS", "1"),
     ("CLAUDE_CODE_FORK_SUBAGENT", "1"),
+    // E2b：可后台化的前台 MCP 在立即发送时转后台；Agent 的后台策略仍由 CLI 决定（见本版本契约场景）。
+    ("CLAUDE_AUTO_BACKGROUND_TASKS", "1"),
     ("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "true"),
     ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
     // 关掉 CLI 自动更新（手动 `claude update` 也被拒）。

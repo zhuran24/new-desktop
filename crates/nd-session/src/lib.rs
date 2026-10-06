@@ -342,10 +342,12 @@ impl Sessions {
     pub async fn execute(&self, command: &Command) -> Option<CommandReply> {
         let target = match command.name.as_str() {
             "session.create" => session_id_for(&command.id),
-            "session.send" => match command.args["session"].as_str() {
-                Some(id) => SessionId(id.to_owned()),
-                None => return Some(self.reject_without_session(command, "invalid")),
-            },
+            "session.send" | "session.interrupt" | "session.withdraw" | "session.draft.save" => {
+                match command.args["session"].as_str() {
+                    Some(id) => SessionId(id.to_owned()),
+                    None => return Some(self.reject_without_session(command, "invalid")),
+                }
+            }
             _ => return None,
         };
         let allow_unborn = command.name == "session.create";

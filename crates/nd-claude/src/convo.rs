@@ -91,6 +91,8 @@ pub struct Conversation {
     reported: Option<Drain>,
     running: bool,
     #[serde(default)]
+    cancel_queued: bool,
+    #[serde(default)]
     turn_key: Option<String>,
     #[serde(default)]
     turn_uuids: Vec<String>,
@@ -135,6 +137,10 @@ fn block_text(block: &Value) -> (ItemKind, String) {
 }
 
 impl Conversation {
+    pub fn can_cancel_queued(&self) -> bool {
+        self.cancel_queued
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -196,6 +202,9 @@ impl Conversation {
 
     fn map_turn(&mut self, frame: &Value, out: &mut Vec<Convo>) {
         if frame["type"] == "system" && frame["subtype"] == "init" {
+            self.cancel_queued = frame["capabilities"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|v| v == "interrupt_cancel_queued_v1"));
             self.turn_key = frame["uuid"].as_str().map(str::to_owned);
             self.turn_uuids.clear();
             self.last_assistant = None;

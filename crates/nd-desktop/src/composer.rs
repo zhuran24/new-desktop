@@ -113,6 +113,20 @@ impl Composer {
         self.dispatch(InputEvent::Submit, window, cx);
     }
 
+    #[cfg(feature = "scenarios")]
+    pub fn scenario_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        self.dispatch(
+            InputEvent::KeyDown {
+                key: Key::Escape,
+                modifiers: Modifiers::default(),
+                held: false,
+            },
+            window,
+            cx,
+        );
+    }
+
     fn dispatch(&mut self, event: InputEvent, window: &mut Window, cx: &mut Context<Self>) {
         let (_, actions) = step(self.snapshot(window, cx), event);
         for action in actions {
