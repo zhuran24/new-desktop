@@ -103,6 +103,22 @@ def inner():
             protocol = (out / f"{name}.log").read_text()
             assert re.search(r"wl_surface#\d+\.attach\(wl_buffer#", protocol), name
         results.append("all three real windows submitted Wayland buffers; light and dark screenshots saved")
+        if os.environ.get("ND_TEST_COMPOSER") == "1":
+            log = (out / "composer.log").open("w")
+            handles.append(log)
+            app = subprocess.Popen(["bash", "/composer-lab.sh", "/nd-composer-lab", "--quit-after", "4"], stdout=subprocess.PIPE, stderr=log,
+                                   text=True, env=dict(os.environ, ND_COMPOSER_TRACE="client"))
+            selector = selectors.DefaultSelector()
+            selector.register(app.stdout, selectors.EVENT_READ)
+            try:
+                assert selector.select(15), "composer lab never rendered"
+                assert json.loads(app.stdout.readline())["composer_lab_ready"]
+            finally:
+                selector.close()
+            screenshot("composer")
+            assert app.wait(timeout=8) == 0
+            assert re.search(r"wl_surface#\d+\.attach\(wl_buffer#", (out / "composer.log").read_text())
+            results.append("offline composer lab opened and submitted native Wayland buffers")
         (out / "result.json").write_text(json.dumps({"pass": True, "checks": results}, ensure_ascii=False, indent=2))
     finally:
         for process in [app, daemon]:
@@ -135,7 +151,11 @@ def run(args):
                    "--bind", str(work), "/sandbox", "--bind", str(out), "/sandbox/out", "--ro-bind", str(Path(__file__).resolve()), "/scenario.py"]
         for name in ["nd-desktop", "nd-daemon", "ndctl"]:
             command += ["--ro-bind", str(binaries / name), "/" + name]
+        if args.composer:
+            command += ["--ro-bind", str(binaries / "nd-composer-lab"), "/nd-composer-lab"]
+            command += ["--ro-bind", str(Path(__file__).resolve().parent.parent / "scripts/composer-lab.sh"), "/composer-lab.sh"]
         command += ["--clearenv"]
+        command += ["--setenv", "ND_TEST_COMPOSER", "1" if args.composer else "0"]
         for key, value in {"PATH": "/usr/bin", "HOME": "/sandbox/home", "CLAUDE_CONFIG_DIR": "/sandbox/claude", "XDG_RUNTIME_DIR": "/sandbox/runtime",
                            "XDG_CONFIG_HOME": "/sandbox/config", "XDG_DATA_HOME": "/sandbox/data", "XDG_STATE_HOME": "/sandbox/state", "XDG_CACHE_HOME": "/sandbox/cache",
                            "XDG_CURRENT_DESKTOP": "KDE", "QT_QPA_PLATFORM": "offscreen", "LANG": "C.UTF-8", "QT_LOGGING_RULES": "kwin_*.debug=true"}.items():
@@ -166,4 +186,5 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--bin-dir", required=True)
         parser.add_argument("--output", required=True)
+        parser.add_argument("--composer", action="store_true", help="also open the offline composer lab")
         run(parser.parse_args())
