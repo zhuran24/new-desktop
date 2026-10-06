@@ -132,3 +132,14 @@
 | UI-MODEL-HELPER：同一固定启动模板加 `--no-session-persistence` 可用于短命目录查询；两个 hello 后 initialize，退出确认后报告 Gone 和撤回 mod 登记 | 父规格「进程／辅助进程」；CLI 2.1.289 的本次实际运行 | 同上模型目录场景；场景结束清理所有独立单元和临时根。未据此关闭第 7 步 R12-X3/X6 的通用辅助进程问题 | 禁用目录查询并显示错误；不换用 owner 包装 CLI，不降成直接读取凭据或猜模型 |
 
 本单没有写 CLI 原生存储，没有新增结构/派发操作；辅助查询不发送人类提示。`haiku` 在此固定版本的离线场景解析为 `claude-haiku-4-5-20251001`，这是伪端点的版本夹具，产品不硬编码该映射。界面流式恢复依赖沿用 CONV-STREAM，不另造一套 CLI 解码。
+
+## 谱系与轮索引（#15）
+
+固定 Claude Code 2.1.289 与 SHA-256 同 #5。规格依据为 `GLOSSARY.md`「段」「轮」、ADR 0008/0010/0013、`research/round12/DESIGN.md` §2.1.9/§2.2.3，以及 `research/protocol.md` §5.2。验证记录见 [ticket-15](verification/ticket-15.md)。
+
+| 编号 | 依赖 | 出处 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|---|
+| LINEAGE-ROUND | 主对话 `system/init.uuid` 标识实际回合；带 `user_message_uuids` 的 `stream_event/message_start`、assistant、result 归属同一回合。紧邻的多条 user 可以合轮，单数 `user_message_uuid` 只作数组缺失时的兼容入口 | 上述研究；本版本真 CLI 隔离实跑及重新录制的 `stream-tool-two-turns` 流水 | `recorded_human_rounds_keep_their_user_uuids_and_final_assistant_anchor`；主接缝 `human_rounds_map_to_cli_uuids_and_survive_restart`、`coalesced_cli_prompts_share_one_navigation_round`、`a_running_round_keeps_its_identity_when_the_daemon_restarts` | 没有回显及实际归属就不生成轮；不按发出次数或文字猜。升级关卡失败则保留钉版，不把不明索引交给分叉/回退入口 |
+| LINEAGE-ANCHOR | 带原 UUID 的 user 回显对应 CLI JSONL 中同 UUID 的 user 行；最终主对话 `assistant.uuid` 对应 JSONL 的 assistant 行，和 API `message.id` 分开。工具调用中的多次模型请求仍为一轮 | CONV-ECHO/CONV-TURN；本版本主接缝读 CLI 自己写出的记录实测 | `human_rounds_map_to_cli_uuids_and_survive_restart` 同时核 user 与最终 assistant 行；默认录制回归包括真实 Bash 工具往返；纯函数测试防止迟到早期输出改写终结锚点 | 没有可核的原生位置就不给后续操作锚点；不写 CLI 记录补造位置 |
+
+本单没有编号待验证项，不验证 Codex `clientId` 回显 V3。没有写 CLI 原生存储，没有新增可选组件或结构/派发操作；图与索引均由守护进程通过 nd-wire 提供。回合进行中重启的测试只证明谱系身份与映射持久，不代替 #19 的全部流式恢复验收。

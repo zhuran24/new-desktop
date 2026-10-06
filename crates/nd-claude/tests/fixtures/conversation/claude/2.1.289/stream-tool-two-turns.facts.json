@@ -32,10 +32,29 @@
       "uuid": "8bbb9518-5d44-435a-af28-c83760afc30e"
     }
   ],
-  [],
+  [
+    {
+      "convo": "turn_mapped",
+      "turn": "b7369f3e-c137-4e9e-a721-d74b87cc97be",
+      "uuids": [
+        "8bbb9518-5d44-435a-af28-c83760afc30e"
+      ],
+      "complete": false,
+      "last_assistant": null
+    }
+  ],
   [],
   [],
   [
+    {
+      "convo": "turn_mapped",
+      "turn": "b7369f3e-c137-4e9e-a721-d74b87cc97be",
+      "uuids": [
+        "8bbb9518-5d44-435a-af28-c83760afc30e"
+      ],
+      "complete": false,
+      "last_assistant": "81079d1c-49cb-4d0e-9ada-e52b4408f109"
+    },
     {
       "convo": "tasks",
       "drain": {
@@ -80,7 +99,17 @@
     }
   ],
   [],
-  [],
+  [
+    {
+      "convo": "turn_mapped",
+      "turn": "b7369f3e-c137-4e9e-a721-d74b87cc97be",
+      "uuids": [
+        "8bbb9518-5d44-435a-af28-c83760afc30e"
+      ],
+      "complete": false,
+      "last_assistant": "81079d1c-49cb-4d0e-9ada-e52b4408f109"
+    }
+  ],
   [],
   [
     {
@@ -148,6 +177,15 @@
   ],
   [
     {
+      "convo": "turn_mapped",
+      "turn": "b7369f3e-c137-4e9e-a721-d74b87cc97be",
+      "uuids": [
+        "8bbb9518-5d44-435a-af28-c83760afc30e"
+      ],
+      "complete": false,
+      "last_assistant": "ffbbd37c-4d80-4b4b-9ed4-c28d7457003e"
+    },
+    {
       "convo": "block",
       "item": {
         "id": "msg_nd_2:0",
@@ -164,6 +202,15 @@
   [],
   [],
   [
+    {
+      "convo": "turn_mapped",
+      "turn": "b7369f3e-c137-4e9e-a721-d74b87cc97be",
+      "uuids": [
+        "8bbb9518-5d44-435a-af28-c83760afc30e"
+      ],
+      "complete": true,
+      "last_assistant": "ffbbd37c-4d80-4b4b-9ed4-c28d7457003e"
+    },
     {
       "convo": "turn_ended",
       "ok": true,
@@ -213,7 +260,17 @@
       "uuid": "c2dcd113-067a-49d8-a5f4-706d4940060d"
     }
   ],
-  [],
+  [
+    {
+      "convo": "turn_mapped",
+      "turn": "81071b01-a2d8-47c2-928f-f494064525f6",
+      "uuids": [
+        "c2dcd113-067a-49d8-a5f4-706d4940060d"
+      ],
+      "complete": false,
+      "last_assistant": null
+    }
+  ],
   [],
   [
     {
@@ -241,6 +298,15 @@
   ],
   [
     {
+      "convo": "turn_mapped",
+      "turn": "81071b01-a2d8-47c2-928f-f494064525f6",
+      "uuids": [
+        "c2dcd113-067a-49d8-a5f4-706d4940060d"
+      ],
+      "complete": false,
+      "last_assistant": "6c873027-9260-4dba-b7b4-1584cb741aca"
+    },
+    {
       "convo": "block",
       "item": {
         "id": "msg_nd_3:0",
@@ -257,6 +323,15 @@
   [],
   [],
   [
+    {
+      "convo": "turn_mapped",
+      "turn": "81071b01-a2d8-47c2-928f-f494064525f6",
+      "uuids": [
+        "c2dcd113-067a-49d8-a5f4-706d4940060d"
+      ],
+      "complete": true,
+      "last_assistant": "6c873027-9260-4dba-b7b4-1584cb741aca"
+    },
     {
       "convo": "turn_ended",
       "ok": true,

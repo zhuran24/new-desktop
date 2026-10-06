@@ -1,7 +1,7 @@
 //! 会话执行器的持久状态：一个小的核心记录（JSON）加显示缓存表。
 //!
-//! 核心只留进行中的东西（承载位、未结的票、进行中的操作、发送台里没结论的消息）；
-//! 结束了的进显示缓存，不再占核心。一个输入一个事务，整份核心随事务写回。
+//! 核心保留谱系索引、承载位、未结的票、进行中的操作和发送台里没结论的消息；
+//! 对话正文进显示缓存。一个输入一个事务，整份核心随事务写回。
 use crate::journal::OpRecord;
 use nd_backend::{
     Act, BackendKind, BackendSessionId, CarrierId, Checkpoint, Drain, Intent, Issued, Outcome,
@@ -106,6 +106,8 @@ pub struct Message {
 pub struct Core {
     pub meta: Option<Meta>,
     pub current: Option<CarrierId>,
+    #[serde(default)]
+    pub lineage: crate::lineage::Lineage,
     pub carriers: BTreeMap<CarrierId, Carrier>,
     pub ops: BTreeMap<String, OpRecord>,
     pub outbox: BTreeMap<Ticket, OutRow>,

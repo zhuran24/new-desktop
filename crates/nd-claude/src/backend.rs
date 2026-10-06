@@ -786,6 +786,20 @@ impl Actor {
                         }
                     }
                     Convo::Lifecycle { .. } | Convo::Reply { .. } => {}
+                    Convo::TurnMapped {
+                        turn,
+                        uuids,
+                        complete,
+                        last_assistant,
+                    } => facts.push(fact(
+                        key,
+                        FactBody::TurnMapped {
+                            turn: format!("{}:{turn}", self.run_id),
+                            natives: uuids,
+                            complete,
+                            last_assistant,
+                        },
+                    )),
                     Convo::TurnStarted => facts.push(fact(key, FactBody::TurnStarted)),
                     Convo::TurnEnded {
                         ok, subtype, error, ..
