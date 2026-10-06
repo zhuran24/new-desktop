@@ -55,7 +55,14 @@ impl History {
             let prompts: Vec<_> = r["messages"].as_array().into_iter().flatten()
                 .filter_map(|m| self.get(&format!("prompt/{}", m.as_str()?))).collect();
             let anchor = prompts.iter().min_by_key(|i| i.data["seq"].as_u64()).map(|i| i.id.as_str());
-            let preview: String = prompts.iter().filter_map(|i| i.data["text"].as_str()).collect::<Vec<_>>().join(" · ").chars().take(160).collect();
+            let preview: String = prompts.iter().flat_map(|i| {
+                let mut parts = Vec::new();
+                if let Some(text) = i.data["text"].as_str().filter(|text| !text.is_empty()) { parts.push(text.to_owned()); }
+                for attachment in i.data["attachments"].as_array().into_iter().flatten() {
+                    if let Some(name) = attachment["name"].as_str() { parts.push(format!("附件：{name}")); }
+                }
+                parts
+            }).collect::<Vec<_>>().join(" · ").chars().take(160).collect();
             json!({"id":r["id"],"n":r["n"],"complete":r["complete"],"anchor":anchor,"preview":preview})
         }).collect();
         Item {

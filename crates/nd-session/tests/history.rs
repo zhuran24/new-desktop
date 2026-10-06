@@ -252,3 +252,23 @@ fn walking_pages_matches_the_simple_projection_and_cursors_survive_append() {
             .is_err()
     );
 }
+
+#[test]
+fn attachment_only_rounds_have_a_readable_preview_and_a_jump_anchor() {
+    let mut history = History::new("session/images".into());
+    history.insert(item(
+        "prompt/image",
+        "prompt",
+        2,
+        json!({"message":"image","text":"","attachments":[{"name":"截图.png"}]}),
+    ));
+    history.insert(item(
+        "lineage",
+        "lineage",
+        1,
+        json!({"current":"root","rounds":[{"id":"r-image","n":1,"messages":["image"]}]}),
+    ));
+    let navigation = history.navigation();
+    assert_eq!(navigation.data["rounds"][0]["preview"], "附件：截图.png");
+    assert_eq!(navigation.data["rounds"][0]["anchor"], "prompt/image");
+}
