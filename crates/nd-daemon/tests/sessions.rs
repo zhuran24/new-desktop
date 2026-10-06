@@ -1005,6 +1005,7 @@ impl Fixture {
         Self::with_env(name, idle_reclaim_ms, "").await
     }
     async fn with_env(name: &str, idle_reclaim_ms: u64, extra_env: &str) -> Self {
+        let poll_timeout_ms = if name == "nd20-thousand" { 20 } else { 5000 };
         let config = format!(
             r#"
 [claude]
@@ -1015,7 +1016,7 @@ config_dir = "{{root}}/claude"
 inherit_env = false
 record = true
 hello_timeout_ms = 10000
-poll_timeout_ms = 5000
+poll_timeout_ms = {poll_timeout_ms}
 init_timeout_ms = 30000
 
 [claude.env]
@@ -3485,4 +3486,233 @@ async fn draft_attachments_survive_conflicts_restart_and_transfer_to_the_sent_me
     assert_eq!(draft["saved"][0]["attachments"], attachments);
     assert_eq!(prompt(&done, "A").unwrap().data["attachments"], attachments);
     fx.close();
+}
+
+#[tokio::test]
+async fn history_pages_are_read_only_ordered_and_resume_after_restart() {
+    let fx = Fixture::start("nd20-history", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("第一页回答"));
+    let session = fx
+        .create("history-create", "/sandbox/project", "第一页提示")
+        .await;
+    fx.wait(&session, "first answer", |s| {
+        texts(s).contains(&"第一页回答".into())
+    })
+    .await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("第二页回答"));
+    fx.send("history-send", &session, "第二页提示").await;
+    fx.wait(&session, "second answer", |s| {
+        texts(s).contains(&"第二页回答".into())
+    })
+    .await;
+    let mut ui = fx.ui().await;
+    let res = format!("session/{session}");
+    let mut req = nd_wire::PageReq {
+        limit: 2,
+        ..Default::default()
+    };
+    let mut pages = Vec::new();
+    loop {
+        let page = ui
+            .get(&res, req.clone())
+            .await
+            .expect("history page via nd-wire");
+        assert!(page.items.len() <= 2);
+        assert!(
+            page.items
+                .windows(2)
+                .all(|w| w[0].data["seq"].as_u64() < w[1].data["seq"].as_u64())
+        );
+        pages.splice(0..0, page.items);
+        req.before = page.next;
+        if req.before.is_none() {
+            break;
+        }
+    }
+    let ids: std::collections::BTreeSet<_> = pages.iter().map(|i| &i.id).collect();
+    assert_eq!(ids.len(), pages.len(), "no boundary duplicates");
+    let prompts: Vec<_> = pages
+        .iter()
+        .filter(|i| i.kind == "prompt")
+        .map(|i| i.data["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(prompts, ["第一页提示", "第二页提示"]);
+    assert_eq!(
+        fx.scenario.endpoint().requests().len(),
+        2,
+        "reading must not call the model"
+    );
+    fx.scenario.kill_daemon().unwrap();
+    fx.scenario.restart_daemon().unwrap();
+    let mut cold = fx.ui().await;
+    let mut req = nd_wire::PageReq {
+        limit: 100,
+        ..Default::default()
+    };
+    let restored = cold.get(&res, req.clone()).await.unwrap();
+    assert_eq!(
+        restored.items.iter().filter(|i| i.kind == "prompt").count(),
+        2
+    );
+    req.before = Some("bad-cursor".into());
+    assert!(cold.get(&res, req).await.is_err());
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_thousand_real_rounds_open_bounded_and_jump_through_public_pages() {
+    let fx = Fixture::start("nd20-thousand", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ANSWER 1"));
+    let session = fx
+        .create("scale-create", "/sandbox/project", "PROMPT 1")
+        .await;
+    for n in 1..=1000 {
+        if n > 1 {
+            fx.scenario
+                .endpoint()
+                .enqueue(fx.main(), ModelReply::text(format!("ANSWER {n}")));
+            fx.send(&format!("scale-{n}"), &session, &format!("PROMPT {n}"))
+                .await;
+        }
+        fx.wait(&session, "indexed complete round", |s| {
+            s.items.iter().any(|i| {
+                i.kind == "lineage"
+                    && i.data["rounds"]
+                        .as_array()
+                        .is_some_and(|r| r.len() == n && r[n - 1]["complete"] == true)
+            })
+        })
+        .await;
+        if n % 100 == 0 {
+            eprintln!("history-scale: {n}/1000");
+        }
+    }
+    let start = std::time::Instant::now();
+    let snapshot = fx.peek(&session).await;
+    eprintln!(
+        "history-scale: cold snapshot {:?}, {} bytes",
+        start.elapsed(),
+        serde_json::to_vec(&snapshot).unwrap().len()
+    );
+    assert!(
+        snapshot
+            .items
+            .iter()
+            .filter(|i| !matches!(
+                i.kind.as_str(),
+                "header" | "draft" | "lineage" | "navigation" | "history"
+            ))
+            .count()
+            <= 60
+    );
+    let nav = snapshot
+        .items
+        .iter()
+        .find(|i| i.kind == "navigation")
+        .unwrap();
+    assert_eq!(nav.data["rounds"].as_array().unwrap().len(), 1000);
+    let client = nd_ui_core::CommandClient::start(fx.socket()).unwrap();
+    for n in [1, 500, 1000] {
+        let round = nav.data["rounds"][n - 1]["id"].as_str().unwrap();
+        let page = client
+            .get(
+                format!("session/{session}/items"),
+                nd_wire::PageReq {
+                    around: Some(round.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].data["text"], format!("PROMPT {n}"));
+        assert_eq!(page.anchor.as_deref(), Some(page.items[0].id.as_str()));
+    }
+    native_history(
+        &fx,
+        &session,
+        nav.data["rounds"][499]["id"].as_str().unwrap(),
+        "PROMPT 500",
+        1000,
+    )
+    .await;
+    if let Some(path) = std::env::var_os("ND_HISTORY_REVIEW_FILE") {
+        let path = std::path::PathBuf::from(path);
+        std::fs::write(&path, serde_json::to_vec_pretty(&json!({"socket":fx.socket(),"session":session,"round":nav.data["rounds"][499]["id"],"desktop":std::env::var_os("ND_TEST_DESKTOP")})).unwrap()).unwrap();
+        eprintln!(
+            "owner review ready: {}; remove this file to clean up",
+            path.display()
+        );
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    assert_eq!(fx.scenario.endpoint().requests().len(), 1000);
+    fx.close();
+}
+
+#[tokio::test]
+async fn native_navigation_jumps_to_a_round_via_history_page() {
+    let fx = Fixture::start("nd20-native", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("原生导航回答"));
+    let session = fx
+        .create("native-nav-create", "/sandbox/project", "原生导航提示")
+        .await;
+    let done = fx
+        .wait(&session, "round indexed", |s| {
+            s.items
+                .iter()
+                .any(|i| i.kind == "navigation" && i.data["rounds"][0]["complete"] == true)
+        })
+        .await;
+    let nav = done.items.iter().find(|i| i.kind == "navigation").unwrap();
+    native_history(
+        &fx,
+        &session,
+        nav.data["rounds"][0]["id"].as_str().unwrap(),
+        "原生导航提示",
+        1,
+    )
+    .await;
+    assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+    fx.close();
+}
+
+async fn native_history(fx: &Fixture, session: &str, round: &str, text: &str, rounds: usize) {
+    let output = std::env::var_os("ND20_NATIVE_OUTPUT")
+        .map(|p| std::path::PathBuf::from(p).join(format!("rounds-{rounds}")))
+        .unwrap_or_else(|| fx.scenario.root().join("native-history"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").unwrap())
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--output")
+        .arg(output)
+        .arg("--session")
+        .arg(session)
+        .arg("--history")
+        .arg("--round")
+        .arg(round)
+        .arg("--text")
+        .arg(text)
+        .arg("--rounds")
+        .arg(rounds.to_string())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
 }

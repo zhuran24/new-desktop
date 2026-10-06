@@ -213,6 +213,16 @@ impl Lineage {
             .get(id)
             .ok_or_else(|| Error(format!("未知段 {id}")))
     }
+    /// 已明确属于非当前段的提示；尚未确认轮归属的提示不在这里。
+    pub fn inactive_messages(&self) -> Vec<&str> {
+        let current = self.current().and_then(|id| self.segment(id).ok());
+        self.turns
+            .values()
+            .filter(|turn| current.is_some_and(|s| !s.turns.contains(&turn.id)))
+            .flat_map(|turn| turn.messages.iter().map(String::as_str))
+            .collect()
+    }
+
     pub fn turns(&self, segment: &str) -> Result<Vec<&Turn>, Error> {
         Ok(self
             .segment(segment)?

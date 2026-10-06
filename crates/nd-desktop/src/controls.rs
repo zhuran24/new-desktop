@@ -185,6 +185,9 @@ impl Desktop {
                     .p(px(t.spacing.medium))
                     .bg(rgba(t.colors.surface))
                     .rounded(px(t.radius))
+                    .id("rewind-menu")
+                    .max_h(px(t.typography.body * 12.))
+                    .overflow_y_scroll()
                     .child("回退位置 · Esc 收起")
                     .children(
                         rounds

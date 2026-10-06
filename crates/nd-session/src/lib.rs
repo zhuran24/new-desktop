@@ -10,6 +10,7 @@
 //! 后端经 [`nd_backend::Backends`]；跨会话的独占经 [`nd_claims::Exclusivity`]，在执行器的事务里放行。
 mod executor;
 mod feed;
+pub mod history;
 pub mod journal;
 pub mod lineage;
 pub mod ops;
@@ -461,6 +462,19 @@ impl Sessions {
             .unwrap_or_else(|e| CommandReply::Unavailable {
                 reason: e.to_string(),
             })
+    }
+
+    /// 只读显示历史；不发后端动作、不产生收据。
+    pub fn page(
+        &self,
+        id: &SessionId,
+        request: &nd_wire::PageReq,
+    ) -> Result<nd_wire::Page, String> {
+        let handle = self
+            .handle(id, false)
+            .map_err(|e| e.to_string())?
+            .ok_or("not_found")?;
+        handle.shared.feed.lock().unwrap().page(request)
     }
 
     /// 订阅 `session/<id>`：装载会话（不存在则 None），先快照或续上事件。

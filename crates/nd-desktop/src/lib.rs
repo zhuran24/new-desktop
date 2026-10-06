@@ -4,6 +4,7 @@ mod chat;
 pub mod composer;
 mod controls;
 mod drafts;
+mod history;
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
@@ -23,6 +24,11 @@ pub struct Desktop {
     socket: PathBuf,
     client: nd_ui_core::CommandClient,
     session_snapshot: Option<Snapshot>,
+    history: nd_view_model::HistoryView,
+    history_client: nd_ui_core::CommandClient,
+    navigation_scroll: UniformListScrollHandle,
+    #[cfg(feature = "scenarios")]
+    navigation_bounds: Rc<std::cell::RefCell<std::collections::BTreeMap<String, Bounds<Pixels>>>>,
     session_feed: Option<Task<()>>,
     scroll: ScrollHandle,
     directory: Entity<InputState>,
@@ -139,6 +145,11 @@ impl Desktop {
         let composer = cx.new(|cx| composer::Composer::new(theme.clone(), window, cx));
         let directory = cx.new(|cx| InputState::new(window, cx).placeholder("工作目录的绝对路径"));
         let mut this = Self {
+            history_client: nd_ui_core::CommandClient::start(&socket)?,
+            history: Default::default(),
+            navigation_scroll: UniformListScrollHandle::new(),
+            #[cfg(feature = "scenarios")]
+            navigation_bounds: Default::default(),
             socket,
             client,
             session_snapshot: None,
@@ -298,6 +309,17 @@ impl Render for Desktop {
             }
             self.last_session_report = self.session_snapshot.clone();
         }
+        #[cfg(feature = "scenarios")]
+        if let Some(snapshot) = self.history.snapshot() {
+            let view = nd_view_model::conversation(&snapshot);
+            println!(
+                "{}",
+                serde_json::json!({"rendered_history":{
+                    "rounds":self.history.rounds().len(),"anchor":self.history.anchor(),
+                    "first":view.messages.first().map(|m|m.text.as_str()),"messages":view.messages.len()
+                }})
+            );
+        }
         let header = self.render_slots(Slot::Header, window, cx);
         let sidebar = self.render_slots(Slot::Sidebar, window, cx);
         let mut right = self.render_slots(Slot::RightPanel, window, cx);
@@ -309,6 +331,8 @@ impl Render for Desktop {
         let chat_sidebar = self.chat_sidebar(cx);
         let chat_content = self.chat_content(window, cx);
         let controls = self.chat_controls(cx);
+        let navigation = self.navigation(cx);
+        let history_controls = self.history_controls(cx);
         let attachments = self.draft_attachments(cx);
         let draft_panel = (!self.creating).then(|| self.draft_panel(window, cx));
         let theme = &self.theme;
@@ -383,18 +407,26 @@ impl Render for Desktop {
                             .min_w_0()
                             .flex()
                             .flex_col()
+                            .child(history_controls)
                             .child(
                                 div()
-                                    .id("content")
-                                    .track_scroll(&self.scroll)
+                                    .flex()
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_y_scroll()
-                                    .flex()
-                                    .flex_col()
-                                    .p(px(theme.spacing.large))
-                                    .gap(px(theme.spacing.medium))
-                                    .child(chat_content),
+                                    .child(
+                                        div()
+                                            .id("content")
+                                            .track_scroll(&self.scroll)
+                                            .flex_1()
+                                            .min_h_0()
+                                            .overflow_y_scroll()
+                                            .flex()
+                                            .flex_col()
+                                            .p(px(theme.spacing.large))
+                                            .gap(px(theme.spacing.medium))
+                                            .child(chat_content),
+                                    )
+                                    .child(navigation),
                             )
                             .child(
                                 div()

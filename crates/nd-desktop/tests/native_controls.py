@@ -117,6 +117,6 @@ if __name__ == '__main__':
     else:
         from native_chat import run
         parser=argparse.ArgumentParser(description=__doc__)
-        parser.set_defaults(attachments=False)
+        parser.set_defaults(attachments=False, history=False, round=None, text="", rounds=None)
         for name in ['desktop','socket','output','session']: parser.add_argument('--'+name,required=True)
         run(parser.parse_args(), __file__)
