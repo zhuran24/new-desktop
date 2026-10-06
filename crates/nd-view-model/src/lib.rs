@@ -5,8 +5,10 @@ mod slots;
 pub use slots::{Contribution, Slot, SlotGuard, Slots};
 mod chat;
 mod theme;
+mod theme_files;
 pub use chat::*;
-pub use theme::{Colors, Shadow, Spacing, Theme, ThemeMode, Typography};
+pub use theme::{Colors, Shadow, Spacing, Theme, ThemeDocument, ThemeMode, Typography};
+pub use theme_files::{ResolvedTheme, ThemeCatalog, ThemeEntry, ThemeSelection};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ItemView {

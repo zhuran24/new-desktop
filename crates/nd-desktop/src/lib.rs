@@ -3,6 +3,7 @@ mod attachments;
 mod chat;
 pub mod composer;
 mod drafts;
+mod themes;
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
@@ -42,6 +43,12 @@ pub struct Desktop {
     composer: Entity<composer::Composer>,
     state: ViewState,
     theme: Theme,
+    theme_catalog: nd_view_model::ThemeCatalog,
+    system_theme: ThemeMode,
+    theme_warning: Option<String>,
+    theme_directory: PathBuf,
+    theme_reload: tokio::sync::mpsc::Sender<Result<(), String>>,
+    _themes: Task<()>,
     snapshot: Option<Snapshot>,
     status: String,
     warning: Option<String>,
@@ -56,6 +63,8 @@ pub struct Desktop {
     last_session_report: Option<Snapshot>,
     #[cfg(feature = "scenarios")]
     last_editor_report: Option<serde_json::Value>,
+    #[cfg(feature = "scenarios")]
+    last_theme_report: Option<serde_json::Value>,
 }
 impl Desktop {
     pub fn new(
@@ -63,6 +72,7 @@ impl Desktop {
         state: ViewState,
         save: tokio::sync::watch::Sender<ViewState>,
         warning: Option<String>,
+        theme_directory: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> std::io::Result<Self> {
@@ -130,7 +140,26 @@ impl Desktop {
                 }
             }
         });
-        let theme = Theme::builtin(state.theme);
+        let system_theme = themes::system_mode(window);
+        let theme_catalog = nd_view_model::ThemeCatalog::default();
+        let theme = theme_catalog
+            .resolve(&state.theme_selection(), system_theme)
+            .theme;
+        let mut theme_feed = themes::ThemeFeed::start(theme_directory.clone())?;
+        let theme_reload = theme_feed.reload.clone();
+        let themes = cx.spawn(async move |weak, cx| {
+            while let Some(catalog) = theme_feed.recv().await {
+                if weak
+                    .update(cx, |this: &mut Self, cx| {
+                        this.theme_catalog = catalog;
+                        this.resolve_theme(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         apply_theme(&theme, cx);
         let composer = cx.new(|cx| composer::Composer::new(theme.clone(), window, cx));
         let directory = cx.new(|cx| InputState::new(window, cx).placeholder("工作目录的绝对路径"));
@@ -158,6 +187,12 @@ impl Desktop {
             composer,
             state,
             theme,
+            theme_catalog,
+            system_theme,
+            theme_warning: None,
+            theme_directory,
+            theme_reload,
+            _themes: themes,
             snapshot: None,
             status: "正在连接守护进程…".into(),
             warning,
@@ -172,8 +207,15 @@ impl Desktop {
             last_session_report: None,
             #[cfg(feature = "scenarios")]
             last_editor_report: None,
+            #[cfg(feature = "scenarios")]
+            last_theme_report: None,
         };
         this.connect_chat(window, cx);
+        this.subscriptions
+            .push(cx.observe_window_appearance(window, |this, window, cx| {
+                this.system_theme = themes::system_mode(window);
+                this.resolve_theme(cx);
+            }));
         Ok(this)
     }
     pub fn state(&self) -> &ViewState {
@@ -269,6 +311,15 @@ impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(feature = "scenarios")]
         {
+            let report = serde_json::json!({"theme":self.theme,"warning":self.theme_warning,
+                "system":self.system_theme,"selection":self.state.theme_selection(),"files":self.theme_catalog.entries.iter().map(|e| &e.file).collect::<Vec<_>>()});
+            if self.last_theme_report.as_ref() != Some(&report) {
+                println!("{}", serde_json::json!({"rendered_theme":report}));
+                self.last_theme_report = Some(report);
+            }
+        }
+        #[cfg(feature = "scenarios")]
+        {
             let editor = self.composer.update(cx, |c, cx| c.snapshot(window, cx));
             let report = serde_json::json!({"text":editor.text,"composing":editor.composing,"attachments": self.drafts.get(&self.draft_key()).map(|d| d.attachments()).unwrap_or_default(),
                 "saved": self.drafts.get(&self.draft_key()).is_some_and(|d| d.is_saved() && d.text() == editor.text)});
@@ -302,6 +353,7 @@ impl Render for Desktop {
         let chat_sidebar = self.chat_sidebar(cx);
         let chat_content = self.chat_content(window, cx);
         let attachments = self.draft_attachments(cx);
+        let theme_panel = self.theme_panel(window, cx);
         let draft_panel = (!self.creating).then(|| self.draft_panel(window, cx));
         let theme = &self.theme;
         div()
@@ -327,24 +379,9 @@ impl Render for Desktop {
                             .child("New Desktop"),
                     )
                     .children(header)
-                    .child(
-                        div()
-                            .id("theme-toggle")
-                            .cursor_pointer()
-                            .text_color(rgba(theme.colors.accent))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let mode = match this.theme.mode {
-                                    ThemeMode::Light => ThemeMode::Dark,
-                                    ThemeMode::Dark => ThemeMode::Light,
-                                };
-                                this.set_theme(Theme::builtin(mode), cx);
-                            }))
-                            .child(match theme.mode {
-                                ThemeMode::Light => "切换深色",
-                                ThemeMode::Dark => "切换浅色",
-                            }),
-                    ),
+                    .child(self.theme_button(cx)),
             )
+            .children(theme_panel)
             .child(
                 div()
                     .flex()
@@ -412,6 +449,11 @@ impl Render for Desktop {
                     .p(px(theme.spacing.small))
                     .text_size(px(theme.typography.small))
                     .text_color(rgba(theme.colors.muted))
+                    .children(
+                        self.theme_warning
+                            .clone()
+                            .map(|warning| div().child(warning)),
+                    )
                     .child(self.warning.clone().unwrap_or_else(|| self.status.clone())),
             )
     }

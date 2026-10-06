@@ -681,16 +681,57 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
 
 #[tokio::test]
 async fn native_chat_window_creates_and_recovers_during_streaming_markdown() {
-    let fx = Fixture::start("nd14-window", 3_600_000).await;
+    native_chat(false).await;
+}
+
+#[tokio::test]
+async fn native_theme_change_preserves_streaming_chat_and_draft() {
+    native_chat(true).await;
+}
+
+#[tokio::test]
+async fn native_theme_files_selection_and_system_appearance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = std::env::var_os("ND_NATIVE_THEME_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary.path().join("themes"));
+    let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_themes.py"))
+        .arg("--bin-dir")
+        .arg(Path::new(&desktop).parent().unwrap())
+        .arg("--output")
+        .arg(output)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+async fn native_chat(themes: bool) {
+    let fx = Fixture::start(
+        if themes { "nd23-window" } else { "nd14-window" },
+        3_600_000,
+    )
+    .await;
     let answer = "# 中文回答\n\n一段 **Markdown**。\n\n```rust\nfn main() { println!(\"你好\"); }\n```\n\n结束。";
     fx.scenario.endpoint().enqueue(
         Route::new(None, "claude-haiku-4-5-20251001"),
         ModelReply::streaming_text(answer, 1, 100),
     );
     let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
-    let output = std::env::var_os("ND_NATIVE_OUTPUT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| fx.scenario.root().join("native-chat"));
+    let output = std::env::var_os(if themes {
+        "ND_NATIVE_THEME_CHAT_OUTPUT"
+    } else {
+        "ND_NATIVE_OUTPUT"
+    })
+    .map(std::path::PathBuf::from)
+    .unwrap_or_else(|| fx.scenario.root().join("native-chat"));
     let result = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
         .arg("--desktop")
@@ -699,6 +740,7 @@ async fn native_chat_window_creates_and_recovers_during_streaming_markdown() {
         .arg(fx.socket())
         .arg("--output")
         .arg(&output)
+        .args(if themes { vec!["--themes"] } else { vec![] })
         .output()
         .await
         .unwrap();

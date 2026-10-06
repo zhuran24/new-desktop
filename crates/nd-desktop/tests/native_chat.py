@@ -19,6 +19,13 @@ def inner():
     out = Path('/sandbox/out')
     settings = json.loads(Path('/sandbox/plan.json').read_text())
     socket = settings['socket']
+    if settings.get('themes'):
+        theme_dir = Path('/sandbox/config/new-desktop/themes')
+        theme_dir.mkdir(parents=True)
+        theme_file = theme_dir / 'ocean.json'
+        theme_source = Path('/sandbox/ocean.json').read_text()
+        theme_file.write_text(theme_source)
+        Path('/sandbox/state/ui.json').write_text(json.dumps({'theme_selection': {'kind': 'file', 'file': 'ocean.json'}}))
     app = None
     handles = []
     apps = []
@@ -99,6 +106,35 @@ def inner():
         partial = wait('creating', lambda s: block(s) is not None and 'fn main' in block(s)['data']['text'] and block(s)['data']['complete'] is False)
         screenshot('streaming')
         # 等待截图期间可能又有增量。断点以截图前实际呈现的副本为下界。
+        if settings.get('themes'):
+            # 真实流式会话存活时，编辑主题并保留产品输入框中的未发送草稿。
+            before = json.loads(subprocess.check_output(['/ndctl', '--socket', socket, 'get', partial['stream']]))
+            session_id = partial['stream'].removeprefix('session/')
+            command = {'id': str(uuid.uuid4()), 'device': 'theme-test', 'name': 'session.draft.update',
+                       'args': {'session': session_id, 'text': '主题切换保留的草稿', 'attachments': []}, 'expect': {'draft_version': next(i['data']['version'] for i in before['items'] if i['id'] == 'draft')}}
+            # 草稿经公开 nd-wire 写入；不直接改编辑器或守护进程事实。
+            draft_reply = subprocess.run(['/ndctl', '--socket', socket, 'command', json.dumps(command)], capture_output=True, text=True)
+            assert draft_reply.returncode == 0, draft_reply.stderr
+            assert json.loads(draft_reply.stdout)['receipt']['status'] == 'done', draft_reply.stdout
+            theme_file.write_text(theme_source.replace('#123456ff', '#26384aff').replace('"body": 18', '"body": 20'))
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                events = [json.loads(line) for line in (out / 'creating.jsonl').read_text().splitlines()]
+                theme_events = [e['rendered_theme'] for e in events if 'rendered_theme' in e]
+                editor_events = [e['rendered_editor'] for e in events if 'rendered_editor' in e]
+                if (theme_events and theme_events[-1]['theme']['colors']['background'] == '#26384aff'
+                        and editor_events and editor_events[-1]['text'] == '主题切换保留的草稿'):
+                    break
+                time.sleep(.05)
+            else:
+                raise AssertionError('live theme or draft did not update')
+            screenshot('streaming-custom-theme')
+            after = json.loads(subprocess.check_output(['/ndctl', '--socket', socket, 'get', partial['stream']]))
+            before_process = next(i['data']['process'] for i in before['items'] if i['id'] == 'header')
+            after_process = next(i['data']['process'] for i in after['items'] if i['id'] == 'header')
+            assert before_process['run'] == after_process['run']
+            assert before_process['backend_session'] == after_process['backend_session']
+            assert next(i['data']['text'] for i in after['items'] if i['id'] == 'draft') == '主题切换保留的草稿'
         app.kill()
         assert app.wait(timeout=5) == -9
         app = start('reopened')
@@ -114,6 +150,7 @@ def inner():
         state_path = Path('/sandbox/state/ui.json')
         state = json.loads(state_path.read_text())
         state['theme'] = 'light'
+        state['theme_selection'] = {'kind': 'light'}
         state_path.write_text(json.dumps(state))
         app = start('light')
         light = wait('light', lambda s: block(s) is not None and block(s)['data']['complete'] is True)
@@ -156,7 +193,9 @@ def run(args):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None, 'session': args.session, 'attachments': args.attachments}))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None, 'session': args.session, 'attachments': args.attachments, 'themes': args.themes}))
+        if args.themes:
+            shutil.copy(Path(__file__).parents[2] / 'nd-view-model/tests/fixtures/ocean.json', work / 'ocean.json')
         if args.attachments:
             shutil.copy(Path(__file__).resolve().parents[2] / 'nd-daemon/tests/fixtures/preview.png', work / 'pixel.png')
             (work / 'pasted.txt').write_text('复制文件里的中文正文')
@@ -171,7 +210,8 @@ def run(args):
                    '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib', '/lib64', '--proc', '/proc',
                    '--ro-bind', '/sys', '/sys', '--dev', '/dev', '--dev-bind', '/dev/dri', '/dev/dri', '--tmpfs', '/tmp',
                    '--bind', str(work), '/sandbox', '--bind', str(out), '/sandbox/out', '--ro-bind', str(socket.parent), str(socket.parent),
-                   '--ro-bind', str(Path(__file__).resolve()), '/scenario.py', '--ro-bind', str(Path(args.desktop).resolve()), '/nd-desktop', '--clearenv']
+                   '--ro-bind', str(Path(__file__).resolve()), '/scenario.py', '--ro-bind', str(Path(args.desktop).resolve()), '/nd-desktop',
+                   '--ro-bind', str(Path(args.desktop).resolve().parent / 'ndctl'), '/ndctl', '--clearenv']
         for key, value in {'PATH': '/usr/bin', 'HOME': '/sandbox/home', 'CLAUDE_CONFIG_DIR': '/sandbox/claude',
                            'XDG_RUNTIME_DIR': '/sandbox/runtime', 'XDG_CONFIG_HOME': '/sandbox/config', 'XDG_DATA_HOME': '/sandbox/data',
                            'XDG_STATE_HOME': '/sandbox/state', 'XDG_CACHE_HOME': '/sandbox/cache', 'XDG_CURRENT_DESKTOP': 'KDE',
@@ -202,5 +242,6 @@ if __name__ == '__main__':
         parser.add_argument('--socket', required=True)
         parser.add_argument('--output', required=True)
         parser.add_argument('--attachments', action='store_true')
+        parser.add_argument('--themes', action='store_true')
         parser.add_argument('--session', help='run the draft editor scenario for this session')
         run(parser.parse_args())

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "name": "海风",
+  "theme": {
+    "mode": "dark",
+    "colors": {
+      "background": "#123456ff", "surface": "#173f5fff",
+      "foreground": "#f0f8ffff", "muted": "#b8d8e8ff",
+      "border": "#57859fff", "accent": "#88eeccff",
+      "diff_added": "#aaffbbff", "diff_removed": "#ffaabbff"
+    },
+    "typography": {"family": "Noto Sans CJK SC", "mono_family": "monospace", "body": 18, "title": 24, "small": 14},
+    "spacing": {"small": 10, "medium": 22, "large": 30},
+    "radius": 12,
+    "border_width": 2,
+    "shadow": {"inset": false, "color": "#00000040", "offset_x": 0, "offset_y": 2, "blur": 6, "spread": 0}
+  }
+}
