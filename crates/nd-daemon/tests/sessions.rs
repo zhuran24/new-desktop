@@ -1696,9 +1696,17 @@ async fn streaming_survives_kill_and_service_restart_with_a_checkpoint_mid_block
             text.starts_with(block.data["text"].as_str().unwrap()),
             "lost streamed prefix after restart: {text}"
         );
+        // 最后一个 delta 已可含完整正文，但 assistant 完整块和 result 还可能在途。
+        // 等公开的完成事实齐全，再核对两轮恰好各一次。
         let done = fx
-            .wait(&session, "both completed", |s| {
+            .wait(&session, "both replies and round results completed", |s| {
                 texts(s) == [answer.clone(), "接着聊".into()]
+                    && s.items
+                        .iter()
+                        .filter(|i| i.kind == "text")
+                        .all(|i| i.data["complete"] == true)
+                    && s.items.iter().filter(|i| i.kind == "turn").count() >= 2
+                    && header(s)["process"]["turn_running"] == false
             })
             .await;
         assert_eq!(cli_pid(&fx, &done).await, pid);
