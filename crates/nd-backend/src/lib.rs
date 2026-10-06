@@ -94,6 +94,14 @@ pub enum Act {
         carrier: CarrierId,
         how: EndHow,
     },
+    Invoke {
+        to: CarrierId,
+        invocation: Invocation,
+    },
+    Configure {
+        to: CarrierId,
+        setting: nd_wire::LiveSetting,
+    },
     Send {
         to: CarrierId,
         msg: Msg,
@@ -103,7 +111,7 @@ impl Act {
     pub fn carrier(&self) -> &CarrierId {
         match self {
             Act::Open { carrier, .. } | Act::End { carrier, .. } => carrier,
-            Act::Send { to, .. } => to,
+            Act::Send { to, .. } | Act::Configure { to, .. } | Act::Invoke { to, .. } => to,
         }
     }
     /// 恢复对账时证明没写出的票怎么办：要经独占登记放行的写类动作不补发（`Withhold`），
@@ -111,7 +119,11 @@ impl Act {
     pub fn if_unsent(&self) -> IfUnsent {
         match self {
             Act::Open { .. } | Act::Send { .. } => IfUnsent::Withhold,
-            Act::End { .. } => IfUnsent::Resend,
+            Act::Invoke {
+                invocation: Invocation::GenerateTitle { .. },
+                ..
+            } => IfUnsent::Withhold,
+            Act::End { .. } | Act::Configure { .. } | Act::Invoke { .. } => IfUnsent::Resend,
         }
     }
 }
@@ -125,6 +137,8 @@ pub enum IfUnsent {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenSpec {
+    #[serde(default)]
+    pub live_settings: Vec<nd_wire::LiveSetting>,
     pub origin: Origin,
     pub profile: Profile,
 }
@@ -149,6 +163,8 @@ impl Origin {
 /// 后端种类、模型、权限模式、工作目录；跨后端换算经这个中立形状（ADR 0017）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
+    #[serde(default)]
+    pub effort: Option<String>,
     pub kind: BackendKind,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
@@ -277,6 +293,12 @@ pub enum Refusal {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "done", rename_all = "snake_case")]
 pub enum Done {
+    Titled {
+        title: Option<String>,
+    },
+    Configured {
+        settings: Value,
+    },
     Opened {
         bs: BackendSessionId,
         run: RunId,
@@ -313,6 +335,9 @@ pub struct Fact {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "fact", rename_all = "snake_case")]
 pub enum FactBody {
+    TitleChanged {
+        title: String,
+    },
     /// 一张票的终结结果。
     Done {
         ticket: Ticket,
@@ -551,4 +576,11 @@ impl Backends {
             adapter.release(session);
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "invoke", rename_all = "snake_case")]
+pub enum Invocation {
+    Title { title: String },
+    GenerateTitle { description: String },
 }

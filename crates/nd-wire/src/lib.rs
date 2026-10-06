@@ -319,3 +319,13 @@ impl Attachment {
         Ok(())
     }
 }
+
+/// 会话运行时设置；一次命令只改一项，结果以会话头的回读为准。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSetting {
+    Model(String),
+    Effort(String),
+    Ultracode(bool),
+    PermissionMode(String),
+}

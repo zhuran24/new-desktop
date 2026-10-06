@@ -29,12 +29,16 @@ pub enum ActKind {
     Open,
     End,
     Send,
+    Configure,
+    Title,
 }
 fn kind_of(act: &Act) -> ActKind {
     match act {
         Act::Open { .. } => ActKind::Open,
         Act::End { .. } => ActKind::End,
         Act::Send { .. } => ActKind::Send,
+        Act::Configure { .. } => ActKind::Configure,
+        Act::Invoke { .. } => ActKind::Title,
     }
 }
 
@@ -276,6 +280,63 @@ impl ScriptedAdapter {
                     .applied
                     .push(format!("send?:{}", msg.text));
                 vec![done(Outcome::Unknown { evidence: why })]
+            }
+            (Act::Configure { setting, .. }, Reply::Ok) => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push(format!("configure:{setting:?}"));
+                let applied = serde_json::to_value(setting).unwrap();
+                vec![done(Outcome::Ok {
+                    done: Done::Configured {
+                        settings: json!({"applied":applied}),
+                    },
+                })]
+            }
+            (
+                Act::Invoke {
+                    invocation: nd_backend::Invocation::Title { title },
+                    ..
+                },
+                Reply::Ok,
+            ) => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push(format!("title:{title}"));
+                vec![
+                    fact(
+                        &format!("title:{ticket}"),
+                        FactBody::TitleChanged {
+                            title: title.clone(),
+                        },
+                    ),
+                    done(Outcome::Ok {
+                        done: Done::Titled {
+                            title: Some(title.clone()),
+                        },
+                    }),
+                ]
+            }
+            (
+                Act::Invoke {
+                    invocation: nd_backend::Invocation::GenerateTitle { .. },
+                    ..
+                },
+                Reply::Ok,
+            ) => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push("generate-title".into());
+                vec![done(Outcome::Ok {
+                    done: Done::Titled {
+                        title: Some("生成的标题".into()),
+                    },
+                })]
             }
             (Act::End { .. }, Reply::Ok) => {
                 let run = self.inner.lock().unwrap().live.remove(&carrier);

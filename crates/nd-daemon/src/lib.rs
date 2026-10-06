@@ -106,8 +106,13 @@ fn init_ms() -> u64 {
 }
 #[derive(Clone, Deserialize)]
 struct SessionsConfig {
+    #[serde(default = "enabled_by_default")]
+    auto_title: bool,
     idle_reclaim_ms: u64,
     tick_ms: u64,
+}
+fn enabled_by_default() -> bool {
+    true
 }
 impl Section for SessionsConfig {
     const NAME: &'static str = "sessions";
@@ -531,6 +536,7 @@ async fn assemble_sessions(
         claims.clone(),
         backends,
         nd_session::EngineConfig {
+            auto_title: sessions_config.auto_title,
             receipt_keep_ms: keep,
             idle_reclaim: Duration::from_millis(sessions_config.idle_reclaim_ms),
             tick: Duration::from_millis(sessions_config.tick_ms),

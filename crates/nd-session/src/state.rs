@@ -44,6 +44,16 @@ pub struct Meta {
     pub kind: BackendKind,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub settings: Value,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub title_source: Option<String>,
+    #[serde(default)]
+    pub title_seed: Option<String>,
+    #[serde(default)]
+    pub title_attempted: bool,
     /// 撤掉或部分完成的原因。
     pub note: Option<String>,
     /// 部分完成时已经做过（或可能做过）的不可逆步骤。

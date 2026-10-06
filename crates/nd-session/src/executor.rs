@@ -454,6 +454,69 @@ impl Executor {
                     value: json!(result),
                 })
             }
+            "session.rename" => {
+                let Some(title) = command.args["title"].as_str().filter(|s| {
+                    !s.trim().is_empty()
+                        && s.chars().count() <= 200
+                        && !s.chars().any(char::is_control)
+                }) else {
+                    return Ok(rejected("invalid_title", Value::Null));
+                };
+                if self.core.meta().status != Status::Active
+                    || self.core.ops.values().any(|op| op.spec.structural())
+                {
+                    return Ok(rejected("busy", Value::Null));
+                }
+                let carrier = self.core.current.clone().unwrap();
+                let op = self.start_op(
+                    tx,
+                    fx,
+                    OpSpec::Title(crate::ops::Title {
+                        carrier,
+                        title: title.trim().into(),
+                        generate: false,
+                    }),
+                    Some(command.id.clone()),
+                )?;
+                Ok(Receipt::Accepted {
+                    op,
+                    stream: Some(format!("session/{}", self.id)),
+                })
+            }
+            "session.configure" => {
+                if self.core.meta().status != Status::Active {
+                    return Ok(rejected("not_active", Value::Null));
+                }
+                if self.core.ops.values().any(|op| op.spec.structural()) {
+                    return Ok(rejected("busy", Value::Null));
+                }
+                let Ok(setting) =
+                    serde_json::from_value::<nd_wire::LiveSetting>(command.args["setting"].clone())
+                else {
+                    return Ok(rejected("invalid_setting", Value::Null));
+                };
+                if matches!(setting, nd_wire::LiveSetting::Ultracode(_))
+                    && self.core.meta().settings["caps"]["ultracode"] != true
+                {
+                    return Ok(rejected(
+                        "unsupported",
+                        json!({"reason":"当前进程不支持 ultracode"}),
+                    ));
+                }
+                let Some(carrier) = self.core.current.clone() else {
+                    return Ok(rejected("not_active", Value::Null));
+                };
+                let op = self.start_op(
+                    tx,
+                    fx,
+                    OpSpec::Configure(crate::ops::Configure { carrier, setting }),
+                    Some(command.id.clone()),
+                )?;
+                Ok(Receipt::Accepted {
+                    op,
+                    stream: Some(format!("session/{}", self.id)),
+                })
+            }
             "session.send" => {
                 if !self.born {
                     return Ok(rejected("not_found", Value::Null));
@@ -562,6 +625,13 @@ impl Executor {
                 kind,
                 model: optional("model"),
                 permission_mode: optional("permission_mode"),
+                settings: Value::Null,
+                title: Some(text.trim().chars().take(60).collect()),
+                title_source: Some("summary".into()),
+                title_seed: (text.trim().chars().count() >= 10
+                    && !text.trim_start().starts_with('/'))
+                .then(|| text.to_owned()),
+                title_attempted: false,
                 note: None,
                 irreversible: vec![],
             }),
@@ -678,6 +748,13 @@ impl Executor {
         }
         for fact in batch.facts {
             match fact.body {
+                FactBody::TitleChanged { title } => {
+                    if self.core.current.as_ref() == Some(&batch.carrier) {
+                        let meta = self.core.meta.as_mut().unwrap();
+                        meta.title = Some(title);
+                        meta.title_source = Some("manual".into());
+                    }
+                }
                 FactBody::Done { ticket, outcome } => {
                     self.record_outcome(tx, fx, &ticket, outcome)?
                 }
@@ -826,7 +903,44 @@ impl Executor {
                     c.checkpoint = None;
                     c.turn_running = false;
                 }
+                if let Some(settings) = adopt.get("settings") {
+                    self.core.meta.as_mut().unwrap().settings = settings.clone();
+                }
                 self.ensure_lineage(carrier)?;
+            }
+            (
+                Act::Invoke {
+                    invocation: nd_backend::Invocation::GenerateTitle { .. },
+                    ..
+                },
+                Outcome::Ok {
+                    done: Done::Titled { title: Some(title) },
+                },
+            ) => {
+                let meta = self.core.meta.as_mut().unwrap();
+                if meta.title_source.as_deref() != Some("manual") {
+                    meta.title = Some(title.clone());
+                    meta.title_source = Some("ai".into());
+                }
+            }
+            (
+                Act::Configure { setting, .. },
+                Outcome::Ok {
+                    done: Done::Configured { settings },
+                },
+            ) => {
+                let meta = self.core.meta.as_mut().unwrap();
+                match setting {
+                    nd_wire::LiveSetting::Model(model) => meta.model = Some(model.clone()),
+                    nd_wire::LiveSetting::PermissionMode(mode) => {
+                        meta.permission_mode = Some(mode.clone())
+                    }
+                    _ => {}
+                }
+                let models = meta.settings["models"].clone();
+                meta.settings = settings.clone();
+                meta.settings["models"] = models;
+                meta.settings["permission_mode"] = json!(meta.permission_mode);
             }
             (Act::End { carrier, .. }, Outcome::Ok { .. }) => {
                 if let Some(c) = self.core.carriers.get_mut(carrier) {
@@ -1023,6 +1137,31 @@ impl Executor {
     /// 发送台随之重排（新票、代持、按需拉起）。
     fn settle_all(&mut self, tx: &mut Tx<'_>, fx: &mut Effects) -> nd_store::Result<()> {
         for _ in 0..64 {
+            if self.deps.config.auto_title
+                && self.core.meta().status == Status::Active
+                && !self.core.meta().title_attempted
+                && self.core.meta().title_seed.is_some()
+                && self.core.meta().title_source.as_deref() != Some("manual")
+                && self
+                    .core
+                    .current_carrier()
+                    .is_some_and(|c| c.alive && !c.turn_running)
+                && !self.core.ops.values().any(|op| op.spec.structural())
+            {
+                let title = self.core.meta().title_seed.clone().unwrap();
+                let carrier = self.core.current.clone().unwrap();
+                self.core.meta.as_mut().unwrap().title_attempted = true;
+                self.start_op(
+                    tx,
+                    fx,
+                    OpSpec::Title(crate::ops::Title {
+                        carrier,
+                        title,
+                        generate: true,
+                    }),
+                    None,
+                )?;
+            }
             let mut progress = false;
             let mut ids: Vec<String> = self.core.ops.keys().cloned().collect();
             ids.sort_by_key(|id| id.rsplit(':').next().and_then(|n| n.parse::<u64>().ok()));
@@ -1310,7 +1449,10 @@ impl Executor {
             });
             return Ok(true);
         };
-        if let Act::Send { .. } = &*act {
+        if matches!(
+            &*act,
+            Act::Send { .. } | Act::Configure { .. } | Act::Invoke { .. }
+        ) {
             let bs = self.core.carriers[carrier].bs.clone();
             match self.deps.claims.admit(
                 tx,
@@ -1613,7 +1755,7 @@ impl Executor {
             return Ok(false);
         }
         queued.sort_by_key(|m| m.arrival);
-        let structural = !self.core.ops.is_empty();
+        let structural = self.core.ops.values().any(|op| op.spec.structural());
         let mut progress = false;
         for m in queued {
             let current = self.core.current_carrier().cloned();
@@ -1807,7 +1949,11 @@ pub(crate) fn header(core: &Core) -> Value {
         "cwd": meta.cwd,
         "backend": format!("{:?}", meta.kind).to_lowercase(),
         "model": meta.model,
+        "title":meta.title,
+        "title_source":meta.title_source,
         "permission_mode": meta.permission_mode,
+        "settings": meta.settings,
+        "caps": meta.settings["caps"],
         "note": meta.note,
         "irreversible": meta.irreversible,
         "process": carrier.map(|c| json!({
