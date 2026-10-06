@@ -118,3 +118,56 @@ fn a_page_reply_cannot_roll_back_streaming_content_received_while_it_was_loading
         "片段和后续"
     );
 }
+
+#[test]
+fn a_lagging_subscription_cannot_overwrite_a_newer_history_page() {
+    let mut view = HistoryView::default();
+    let mut live = snapshot("session/a", "root");
+    view.observe(live.clone());
+    let token = view.request();
+    let mut current = live.items[2].clone();
+    current.data["text"] = json!("查询已看到的终稿");
+    view.loaded(
+        token,
+        Ok(Page {
+            items: vec![current],
+            next: None,
+            newer: None,
+            anchor: None,
+            at: Some(nd_wire::Cursor {
+                epoch: "e".into(),
+                seq: 5,
+            }),
+        }),
+    );
+    live.cursor = 2;
+    view.observe(live);
+    assert_eq!(
+        conversation(&view.snapshot().unwrap()).messages[0].text,
+        "查询已看到的终稿"
+    );
+}
+
+#[test]
+fn reconnect_keeps_the_reading_page_but_rejects_a_reply_from_the_old_connection() {
+    let mut view = HistoryView::default();
+    view.observe(snapshot("session/a", "root"));
+    let token = view.request();
+    let page = Page {
+        items: vec![],
+        next: None,
+        newer: None,
+        anchor: Some("old-anchor".into()),
+        at: Some(nd_wire::Cursor {
+            epoch: "e".into(),
+            seq: 1,
+        }),
+    };
+    view.loaded(token, Ok(page.clone()));
+    let pending = view.request();
+    let mut fresh = snapshot("session/a", "root");
+    fresh.epoch = "reopened".into();
+    view.observe(fresh);
+    assert!(!view.loaded(pending, Ok(page)));
+    assert_eq!(view.anchor(), Some("old-anchor"));
+}

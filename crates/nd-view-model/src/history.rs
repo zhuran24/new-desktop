@@ -37,6 +37,17 @@ impl HistoryView {
         {
             self.latest();
         }
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|old| old.epoch != snapshot.epoch)
+        {
+            self.generation += 1;
+            self.loading = false;
+            if let Some(page) = &mut self.page {
+                page.at = None;
+            }
+        }
         self.rounds = snapshot
             .items
             .iter()
@@ -53,7 +64,12 @@ impl HistoryView {
                 })
             })
             .collect();
-        if let Some(page) = &mut self.page {
+        if let Some(page) = &mut self.page
+            && page
+                .at
+                .as_ref()
+                .is_none_or(|at| at.epoch == snapshot.epoch && snapshot.cursor >= at.seq)
+        {
             for item in &mut page.items {
                 if let Some(new) = snapshot.items.iter().find(|new| new.id == item.id) {
                     *item = new.clone();

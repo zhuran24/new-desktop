@@ -180,6 +180,7 @@ fn walking_pages_matches_the_simple_projection_and_cursors_survive_append() {
             state: "landed".into(),
             native: None,
             reason: None,
+            attachments: vec![],
         })
         .collect();
     let expected = project(&log);
