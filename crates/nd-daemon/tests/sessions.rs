@@ -320,3 +320,303 @@ async fn ndctl_creates_a_session_and_streams_the_reply() {
     );
     fx.close();
 }
+
+/// 当前后端进程的 pid：会话头报的后端进程编号，在看守托管那里查身份。
+async fn cli_pid(fx: &Fixture, snapshot: &Snapshot) -> i32 {
+    let run = header(snapshot)["process"]["run"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let page = fx.ui().await.get("runs", Default::default()).await.unwrap();
+    let found = page
+        .items
+        .iter()
+        .find(|i| i.data["run"] == run)
+        .unwrap_or_else(|| panic!("no run {run}: {:#?}", page.items));
+    found.data["identity"]["pid"].as_i64().unwrap() as i32
+}
+
+fn signal(pid: i32, signal: rustix::process::Signal) {
+    rustix::process::kill_process(rustix::process::Pid::from_raw(pid).unwrap(), signal).unwrap();
+}
+
+async fn listed(fx: &Fixture, session: &str) -> Option<Item> {
+    let page = fx
+        .ui()
+        .await
+        .get("sessions", Default::default())
+        .await
+        .unwrap();
+    page.items
+        .into_iter()
+        .find(|i| i.id == format!("session/{session}"))
+}
+
+#[tokio::test]
+async fn a_message_counts_as_landed_only_when_the_cli_echoes_its_uuid() {
+    let fx = Fixture::start("nd13-echo", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("第一轮"));
+    let session = fx.create("echo-create", "/sandbox/project", "你好").await;
+    let snapshot = fx
+        .wait(&session, "first turn done", |s| {
+            has_header(s, |h| {
+                h["status"] == "active" && h["process"]["turn_running"] == false
+            }) && texts(s) == ["第一轮"]
+        })
+        .await;
+    let pid = cli_pid(&fx, &snapshot).await;
+    // 后端进程停住：这条消息写进了看守（已写出），CLI 还没读到，不会有回显。
+    signal(pid, rustix::process::Signal::STOP);
+    endpoint.enqueue(fx.main(), ModelReply::text("第二轮"));
+    fx.send("echo-send", &session, "停住时发的").await;
+    let written = fx
+        .wait(&session, "written", |s| {
+            prompt(s, "停住时发的").is_some_and(|p| p.data["state"] == "written")
+        })
+        .await;
+    let native = prompt(&written, "停住时发的").unwrap().data["native"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let still = fx.peek(&session).await;
+    assert_eq!(
+        prompt(&still, "停住时发的").unwrap().data["state"],
+        "written"
+    );
+    assert_eq!(endpoint.requests().len(), 1);
+    signal(pid, rustix::process::Signal::CONT);
+    let landed = fx
+        .wait(&session, "landed", |s| {
+            prompt(s, "停住时发的").is_some_and(|p| p.data["state"] == "landed")
+                && texts(s) == ["第一轮", "第二轮"]
+        })
+        .await;
+    assert_eq!(
+        prompt(&landed, "停住时发的").unwrap().data["native"],
+        native
+    );
+    let bs = header(&landed)["process"]["backend_session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let transcript = fx.transcript(&bs);
+    assert!(transcript.contains(&native));
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_create_that_never_started_a_backend_is_withdrawn_with_one_notice() {
+    let fx = Fixture::start("nd13-withdraw", 3_600_000).await;
+    let session = fx
+        .create("bad-cwd", "/sandbox/project/没有这个目录", "你好")
+        .await;
+    let snapshot = fx
+        .wait(&session, "withdrawn", |s| {
+            has_header(s, |h| h["status"] == "withdrawn")
+        })
+        .await;
+    assert!(
+        header(&snapshot)["note"]
+            .as_str()
+            .is_some_and(|n| !n.is_empty())
+    );
+    assert!(listed(&fx, &session).await.is_none());
+    let global = fx.ui().await.subscribe("global").await.unwrap();
+    let notices: Vec<&Item> = global
+        .items
+        .iter()
+        .filter(|i| i.kind == "notice" && i.data["session"] == session)
+        .collect();
+    assert_eq!(notices.len(), 1, "{:#?}", global.items);
+    // 没做过不可逆步骤：模型没被请求，后端进程从没起来。
+    assert!(fx.scenario.endpoint().requests().is_empty());
+    let runs = fx.ui().await.get("runs", Default::default()).await.unwrap();
+    assert!(
+        runs.items.iter().all(|r| r.data["state"] == "Gone"),
+        "{:#?}",
+        runs.items
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_create_whose_backend_died_after_the_first_message_was_written_is_partial() {
+    let fx = Fixture::start("nd13-partial", 3_600_000).await;
+    // 场景故障点：写首条消息之前让后端进程停住，消息写出了、CLI 没读到。
+    std::fs::write(
+        fx.scenario.root().join("runtime/backend-fault.json"),
+        r#"{"contains":"ND-STOP"}"#,
+    )
+    .unwrap();
+    let session = fx
+        .create("partial-create", "/sandbox/project", "ND-STOP 你好")
+        .await;
+    let written = fx
+        .wait(&session, "first message written", |s| {
+            prompt(s, "ND-STOP 你好").is_some_and(|p| p.data["state"] == "written")
+        })
+        .await;
+    assert_eq!(header(&written)["status"], "preparing");
+    let pid = cli_pid(&fx, &written).await;
+    signal(pid, rustix::process::Signal::KILL);
+    let snapshot = fx
+        .wait(&session, "partial", |s| {
+            has_header(s, |h| h["status"] == "partial")
+        })
+        .await;
+    let irreversible = header(&snapshot)["irreversible"].to_string();
+    assert!(
+        irreversible.contains("first") && irreversible.contains("可能已做"),
+        "{irreversible}"
+    );
+    assert_eq!(
+        prompt(&snapshot, "ND-STOP 你好").unwrap().data["state"],
+        "unknown"
+    );
+    assert_eq!(
+        listed(&fx, &session).await.unwrap().data["status"],
+        "partial"
+    );
+    assert!(fx.scenario.endpoint().requests().is_empty());
+    fx.close();
+}
+
+#[tokio::test]
+async fn an_idle_backend_is_reclaimed_and_the_next_message_resumes_it() {
+    let fx = Fixture::start("nd13-idle", 1500).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("第一轮"));
+    let session = fx.create("idle-create", "/sandbox/project", "你好").await;
+    let first = fx
+        .wait(&session, "first turn", |s| {
+            texts(s) == ["第一轮"] && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    let first_run = header(&first)["process"]["run"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // 没人订阅这个会话：只经列表看它的后端进程还在不在。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while listed(&fx, &session).await.unwrap().data["process_alive"] == true {
+        assert!(tokio::time::Instant::now() < deadline, "never reclaimed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let runs = fx.ui().await.get("runs", Default::default()).await.unwrap();
+    assert!(
+        runs.items
+            .iter()
+            .any(|r| r.data["run"] == first_run && r.data["state"] == "Gone"),
+        "{:#?}",
+        runs.items
+    );
+    endpoint.enqueue(fx.main(), ModelReply::text("第二轮"));
+    fx.send("idle-send", &session, "继续").await;
+    let after = fx
+        .wait(&session, "relaunched and answered", |s| {
+            texts(s) == ["第一轮", "第二轮"]
+        })
+        .await;
+    assert_ne!(header(&after)["process"]["run"], first_run);
+    assert_eq!(prompt(&after, "继续").unwrap().data["state"], "landed");
+    // 续接同一个后端会话：第二次请求带着第一轮的历史。
+    let requests = endpoint.requests();
+    assert_eq!(requests.len(), 2);
+    let second = request_text(&requests[1].body);
+    assert!(second.contains("你好") && second.contains("第一轮") && second.contains("继续"));
+    assert_eq!(
+        header(&after)["process"]["backend_session"],
+        header(&first)["process"]["backend_session"]
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_backend_with_a_running_background_task_is_not_reclaimed() {
+    let fx = Fixture::start("nd13-busy", 1000).await;
+    // 只给这个场景放行 Bash（CLI 自己的用户设置），审批台是第 3 步的事。
+    std::fs::create_dir_all(fx.scenario.root().join("claude")).unwrap();
+    std::fs::write(
+        fx.scenario.root().join("claude/settings.json"),
+        r#"{"permissions":{"allow":["Bash"]}}"#,
+    )
+    .unwrap();
+    let mut fifo = fx.scenario.fifo("hold").unwrap();
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(
+        fx.main(),
+        ModelReply::tool(
+            "toolu_bg_1",
+            "Bash",
+            json!({"command": format!("head -n 1 {}", fifo.sandbox_path().display()), "run_in_background": true, "description": "wait for the test"}),
+        ),
+    );
+    endpoint.enqueue(fx.main(), ModelReply::text("后台任务在跑"));
+    let session = fx
+        .create("busy-create", "/sandbox/project", "跑个后台命令")
+        .await;
+    let busy = fx
+        .wait(&session, "turn done with a background task", |s| {
+            texts(s).contains(&"后台任务在跑".to_owned())
+                && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    assert_eq!(
+        header(&busy)["process"]["drain"]["drain"],
+        "busy",
+        "{}",
+        header(&busy)
+    );
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        listed(&fx, &session).await.unwrap().data["process_alive"],
+        true,
+        "a backend with a running task must not be reclaimed"
+    );
+    // 任务结束后 CLI 会把结果交给模型；之后没有任务了，闲置到时限就回收。
+    endpoint.enqueue(fx.main(), ModelReply::text("收到任务结果"));
+    fifo.release("done").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while listed(&fx, &session).await.unwrap().data["process_alive"] == true {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never reclaimed after the task finished"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    fx.close();
+}
+
+#[tokio::test]
+async fn the_session_keeps_its_backend_process_across_a_daemon_restart() {
+    let fx = Fixture::start("nd13-restart", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("重启前"));
+    let session = fx
+        .create("restart-create", "/sandbox/project", "你好")
+        .await;
+    let before = fx
+        .wait(&session, "first turn", |s| {
+            texts(s) == ["重启前"] && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    let pid = cli_pid(&fx, &before).await;
+    fx.scenario.kill_daemon().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    endpoint.enqueue(fx.main(), ModelReply::text("重启后"));
+    fx.send("restart-send", &session, "还在吗").await;
+    let after = fx
+        .wait(&session, "answered after restart", |s| {
+            texts(s) == ["重启前", "重启后"]
+        })
+        .await;
+    assert_eq!(
+        header(&after)["process"]["run"],
+        header(&before)["process"]["run"]
+    );
+    assert_eq!(cli_pid(&fx, &after).await, pid);
+    assert_eq!(prompt(&after, "还在吗").unwrap().data["state"], "landed");
+    fx.close();
+}

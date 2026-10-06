@@ -323,6 +323,10 @@ impl ClaudeRun {
         self.next_in = link.hello.written + 1;
         self.link = link;
     }
+    /// 下一行 stdin 的输入序号。看守按输入序号去重：同一序号重写不会写两次。
+    pub fn next_input(&self) -> u64 {
+        self.next_in
+    }
     /// 流水游标：下一次 `read` 从它之后读。
     pub fn cursor(&self) -> u64 {
         self.cursor

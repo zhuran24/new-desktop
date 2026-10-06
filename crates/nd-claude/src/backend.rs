@@ -227,14 +227,8 @@ impl Inner {
         .unwrap_or_default()
     }
 
-    fn start_actor(
-        self: &Arc<Self>,
-        session: SessionId,
-        carrier: CarrierId,
-        run: ClaudeRun,
-        convo: Conversation,
-        pending: HashMap<String, Ticket>,
-    ) {
+    /// 先占住承载位的命令队列：接回进行中交来的票排在这里，任务起来后按序写出。
+    fn reserve(&self, session: &SessionId, carrier: &CarrierId) -> mpsc::UnboundedReceiver<Cmd> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.carriers.lock().unwrap().insert(
             carrier.clone(),
@@ -243,6 +237,30 @@ impl Inner {
                 tx,
             },
         );
+        rx
+    }
+
+    fn start_actor(
+        self: &Arc<Self>,
+        session: SessionId,
+        carrier: CarrierId,
+        run: ClaudeRun,
+        convo: Conversation,
+        pending: HashMap<String, Ticket>,
+    ) {
+        let rx = self.reserve(&session, &carrier);
+        self.spawn_actor(session, carrier, run, convo, pending, rx);
+    }
+
+    fn spawn_actor(
+        self: &Arc<Self>,
+        session: SessionId,
+        carrier: CarrierId,
+        run: ClaudeRun,
+        convo: Conversation,
+        pending: HashMap<String, Ticket>,
+        rx: mpsc::UnboundedReceiver<Cmd>,
+    ) {
         let actor = Actor {
             inner: self.clone(),
             session,
@@ -339,7 +357,11 @@ impl Inner {
     }
 
     /// 守护进程重启后接回：活着的进程续读流水，没写出的票证明没写出，已退出的报退出。
-    async fn adopt(self: Arc<Self>, part: AdoptPart) {
+    async fn adopt(
+        self: Arc<Self>,
+        part: AdoptPart,
+        mut queues: HashMap<CarrierId, mpsc::UnboundedReceiver<Cmd>>,
+    ) {
         let mut handled: HashSet<Ticket> = HashSet::new();
         for record in &part.carriers {
             let mine: Vec<&PendingTicket> = part
@@ -349,8 +371,11 @@ impl Inner {
                 .filter(|p| !matches!(p.act, Act::Open { .. }))
                 .collect();
             handled.extend(mine.iter().map(|p| p.issued.ticket.clone()));
+            let Some(queued) = queues.remove(&record.carrier) else {
+                continue;
+            };
             self.clone()
-                .adopt_carrier(&part.session, record, mine)
+                .adopt_carrier(&part.session, record, mine, queued)
                 .await;
         }
         for pending in &part.pending {
@@ -390,6 +415,7 @@ impl Inner {
         session: &SessionId,
         record: &CarrierRecord,
         pending: Vec<&PendingTicket>,
+        mut queued: mpsc::UnboundedReceiver<Cmd>,
     ) {
         let Some(run) = record.run.clone() else {
             return;
@@ -437,6 +463,26 @@ impl Inner {
                     ));
                 }
             }
+            // 接回期间交来的票：一行都没写，证明没写出。
+            self.carriers.lock().unwrap().remove(&record.carrier);
+            queued.close();
+            while let Ok(cmd) = queued.try_recv() {
+                match cmd {
+                    Cmd::Send { ticket, .. } => facts.push(done(
+                        &ticket,
+                        Outcome::Refused {
+                            refusal: Refusal::Withheld,
+                        },
+                    )),
+                    Cmd::End { ticket, .. } => facts.push(done(
+                        &ticket,
+                        Outcome::Ok {
+                            done: Done::Ended { code: None },
+                        },
+                    )),
+                    Cmd::Ack(_) => {}
+                }
+            }
             facts.push(fact(
                 format!("exit:{run}"),
                 FactBody::Exited {
@@ -469,12 +515,13 @@ impl Inner {
                 ));
             }
         }
-        self.start_actor(
+        self.spawn_actor(
             session.clone(),
             record.carrier.clone(),
             claude_run,
             convo,
             waiting,
+            queued,
         );
         for p in &pending {
             if let Act::End { how, .. } = &p.act {
@@ -557,13 +604,20 @@ impl Actor {
                 #[cfg(feature = "scenarios")]
                 self.stop_fault(&msg.text);
                 if let Err(error) = self.run.write(&frame).await {
-                    // 传输出错：看守可能已经记下了这一行，也可能没有。换连接后按流水定。
-                    self.relink().await;
-                    let written = self
-                        .inner
-                        .written(&self.run_id, &HashSet::from([uuid.clone()]))
-                        .await;
-                    if !written.contains(&uuid) {
+                    // 传输出错（例如别处接管了看守连接）：换连接后按看守报的已写高水位定，
+                    // 没写过就同一行再写一次（传输层重发，uuid 与输入序号都不变）。
+                    let mut failure = Some(error.to_string());
+                    let seq = self.run.next_input();
+                    if self.relink().await {
+                        // 新连接报的已写高水位越过了这一行的序号：写过了。否则用同一个序号再写，
+                        // 旧连接上已受理的那次若也落了地，看守按序号去重。
+                        failure = if self.run.next_input() > seq {
+                            None
+                        } else {
+                            self.run.write(&frame).await.err().map(|e| e.to_string())
+                        };
+                    }
+                    if let Some(error) = failure {
                         self.pending.remove(&uuid);
                         self.inner
                             .deliver_facts(
@@ -571,7 +625,9 @@ impl Actor {
                                 &self.carrier,
                                 vec![done(
                                     &ticket,
-                                    Outcome::failed(format!("没写进看守：{error}")),
+                                    Outcome::Unknown {
+                                        evidence: format!("写给看守时连接出错：{error}"),
+                                    },
                                 )],
                             )
                             .await;
@@ -805,8 +861,20 @@ impl BackendAdapter for ClaudeBackend {
         if part.carriers.is_empty() && part.pending.is_empty() {
             return;
         }
+        // 接回是异步的；执行器这时交来的票先排进承载位的队列，不回 Gone。
+        let queues = part
+            .carriers
+            .iter()
+            .filter(|c| c.run.is_some())
+            .map(|c| {
+                (
+                    c.carrier.clone(),
+                    self.inner.reserve(&part.session, &c.carrier),
+                )
+            })
+            .collect();
         let inner = self.inner.clone();
-        self.inner.runtime.spawn(inner.adopt(part));
+        self.inner.runtime.spawn(inner.adopt(part, queues));
     }
 
     fn act(&self, issued: Issued, act: Act) -> Admit {
