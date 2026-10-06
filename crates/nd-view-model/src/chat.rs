@@ -58,6 +58,8 @@ pub struct MessageView {
     pub text: String,
     pub status: String,
     pub markdown: bool,
+    pub detail: String,
+    pub resend: Option<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConversationView {
@@ -79,18 +81,22 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
             .is_some_and(|i| matches!(i.data["status"].as_str(), Some("active" | "preparing"))),
         header: header
             .map(|i| {
-                let status = match i.data["status"].as_str() {
-                    Some("preparing") => "准备中",
-                    Some("partial") => "部分完成",
-                    Some("withdrawn") => "创建失败",
-                    Some("active") => {
-                        if i.data["process"]["turn_running"] == true {
-                            "正在回复"
-                        } else {
-                            "可对话"
+                let status = if i.data["recovering"] == true {
+                    "正在恢复"
+                } else {
+                    match i.data["status"].as_str() {
+                        Some("preparing") => "准备中",
+                        Some("partial") => "部分完成",
+                        Some("withdrawn") => "创建失败",
+                        Some("active") => {
+                            if i.data["process"]["turn_running"] == true {
+                                "正在回复"
+                            } else {
+                                "可对话"
+                            }
                         }
+                        _ => &i.fallback.text,
                     }
-                    _ => &i.fallback.text,
                 };
                 let mut label = format!(
                     "{status} · {} · {}",
@@ -135,6 +141,10 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                 }
                 .into(),
                 markdown: i.kind == "text",
+                detail: i.data["reason"].as_str().unwrap_or_default().into(),
+                resend: (i.kind == "prompt" && i.data["state"] == "not_delivered")
+                    .then(|| i.data["message"].as_str().map(str::to_owned))
+                    .flatten(),
                 status: if i.kind == "prompt" {
                     match i.data["state"].as_str() {
                         Some("held") => "代持中",
@@ -144,6 +154,8 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                         Some("landed") => "已送达",
                         Some("failed") => "发送失败",
                         Some("unknown") => "交付不明",
+                        Some("not_delivered") => "未送达",
+                        Some("resent") => "已重发",
                         _ => "",
                     }
                 } else if i.data["complete"] == false {

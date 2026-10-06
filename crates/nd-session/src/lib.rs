@@ -279,6 +279,15 @@ impl Sessions {
         Ok(ids)
     }
 
+    /// 已装载会话的全部来源完成流水追平与对账；随后才完成独占登记的首轮扫描。
+    pub fn adopted(&self) -> bool {
+        self.executors
+            .lock()
+            .unwrap()
+            .values()
+            .all(|h| h.shared.adopted.load(Ordering::Acquire))
+    }
+
     pub fn kick_all(&self) {
         for handle in self.executors.lock().unwrap().values() {
             let _ = handle.inputs.try_send(Input::Kick);
@@ -317,6 +326,7 @@ impl Sessions {
                 vec![],
             )),
             watchers: Default::default(),
+            adopted: Default::default(),
         });
         let (ready, born) = std::sync::mpsc::sync_channel(1);
         let deps = self.deps.clone();
@@ -342,12 +352,31 @@ impl Sessions {
     pub async fn execute(&self, command: &Command) -> Option<CommandReply> {
         let target = match command.name.as_str() {
             "session.create" => session_id_for(&command.id),
-            "session.send" => match command.args["session"].as_str() {
+            "session.send" | "session.resend" => match command.args["session"].as_str() {
                 Some(id) => SessionId(id.to_owned()),
                 None => return Some(self.reject_without_session(command, "invalid")),
             },
             _ => return None,
         };
+        if !self.adopted() || self.deps.claims.recovery().ok() != Some(nd_claims::Recovery::Ready) {
+            // 恢复闸门不遮住已有收据；新命令没有受理、没有收据，允许同 id 退避重试。
+            return Some(
+                match nd_ledger::lookup(
+                    &self.deps.store,
+                    &command.id,
+                    Some(&command.content_hash()),
+                ) {
+                    Ok(nd_wire::ReceiptLookup::Found { receipt }) => {
+                        CommandReply::Receipt { receipt }
+                    }
+                    Ok(nd_wire::ReceiptLookup::Conflict) => CommandReply::Conflict,
+                    Ok(nd_wire::ReceiptLookup::Expired) => CommandReply::Expired,
+                    _ => CommandReply::Unavailable {
+                        reason: "守护进程恢复中，命令未受理".into(),
+                    },
+                },
+            );
+        }
         let allow_unborn = command.name == "session.create";
         let handle = match self.handle(&target, allow_unborn) {
             Ok(Some(handle)) => handle,

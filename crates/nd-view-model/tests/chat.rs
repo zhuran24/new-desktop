@@ -152,3 +152,36 @@ fn completed_creation_is_out_of_the_chat_and_partial_failure_stays_explained() {
     assert_eq!(view.messages[0].title, "新建会话");
     assert_eq!(view.messages[0].text, "首条消息交付不明");
 }
+
+#[test]
+fn delivery_unknown_is_explained_and_only_confirmed_non_delivery_offers_resend() {
+    let snapshot = Snapshot {
+        stream: "session/s".into(),
+        epoch: "e".into(),
+        cursor: 0,
+        items: vec![
+            item(
+                "prompt/u",
+                "prompt",
+                json!({"message":"u","state":"unknown","text":"一条提示","reason":"还没有原 uuid 的回显"}),
+            ),
+            item(
+                "prompt/l",
+                "prompt",
+                json!({"message":"l","state":"not_delivered","text":"另一条提示","reason":"CLI 明确拒绝"}),
+            ),
+            item(
+                "prompt/r",
+                "prompt",
+                json!({"message":"r","state":"resent","text":"旧提示"}),
+            ),
+        ],
+    };
+    let view = nd_view_model::conversation(&snapshot);
+    assert_eq!(view.messages[0].status, "交付不明");
+    assert_eq!(view.messages[0].detail, "还没有原 uuid 的回显");
+    assert_eq!(view.messages[0].resend, None);
+    assert_eq!(view.messages[1].status, "未送达");
+    assert_eq!(view.messages[1].resend.as_deref(), Some("l"));
+    assert_eq!(view.messages[2].resend, None);
+}
