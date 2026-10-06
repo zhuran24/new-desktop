@@ -363,3 +363,15 @@ impl SyncReplica {
         }
     }
 }
+
+mod feed;
+pub use feed::{FeedUpdate, ReplicaFeed};
+
+impl SyncReplica {
+    /// 交还本界面的连接；不结束会话或后端进程。
+    pub async fn close(&mut self) -> Result<()> {
+        self.send(Request::Bye).await?;
+        self.socket.close(None).await?;
+        Ok(())
+    }
+}
