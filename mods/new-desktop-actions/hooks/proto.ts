@@ -58,7 +58,7 @@ export type HelloReply = {
   binding_epoch: number;
 };
 
-/** 两个 mod 的插件名（plugin.json 的 name，也是 pluginConfigs 的键）。 */
+/** 两个 mod 的名字（plugin.json 的 name，也是 pluginConfigs 的键）。 */
 export type ModName = "new-desktop" | "new-desktop-actions";
 
 /** 把全部消息类型挂在一个根上，供 JSON Schema 与 TypeScript 一次导出。 */

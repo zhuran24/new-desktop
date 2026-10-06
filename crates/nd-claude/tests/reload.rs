@@ -16,12 +16,12 @@ async fn a_reloaded_mod_reports_a_new_generation_and_refuses_commands_for_the_ol
         .await
         .unwrap();
     let old_gen = run.binding().mods[&ModName::Actions].mod_gen.clone();
-    let op_id = run.send(ModName::Actions, Action::Ping);
+    let op_id = run.send(ModName::Actions, Action::Ping).unwrap();
     assert!(matches!(
         run.result(&op_id, Duration::from_secs(10)).await,
         Some(CommandResult::Outcome(Outcome::Done { .. }))
     ));
-    // 改动模块文件后让 CLI 重载插件：模块变量清零，session.start 再跑一遍。
+    // 改动模块文件后让 CLI 重载 mod（reload_plugins）：模块变量清零，session.start 再跑一遍。
     let file = fx
         .scenario
         .root()

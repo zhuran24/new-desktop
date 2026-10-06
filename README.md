@@ -18,6 +18,9 @@ Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 
 | `crates/nd-daemon` | 守护进程、UDS HTTP/WebSocket、可选组件和 ndctl |
 | [`crates/nd-claude-records`](crates/nd-claude-records/README.md) | Claude 主记录选链、字节偏移索引、历史分页；只读纯库 |
 | [`crates/nd-convert`](crates/nd-convert/README.md) | Claude/Codex 经中间条目互转、损失清单与中立设置换算；纯库 |
+| `crates/nd-mod-proto` | mod 协议的 Rust 类型、JSON Schema 与两个 mod 的 TypeScript 生成器 |
+| [`crates/nd-claude`](crates/nd-claude/README.md) | Claude 后端进程的启动模板、mod 通道、就绪判定与 mod 往返录制 |
+| [`mods/`](mods/README.md) | 带进每个 Claude 后端进程的钩子 mod 与动作 mod（TypeScript） |
 | `ime-lab/variants/*` | 独立实验工作区，不参与产品的 workspace 测试 |
 
 工作区按实现逐步增加 crate。`default-members` 显式列出无需 GPUI 的成员；后续 `nd-desktop` 加入 `members`，保持在 `default-members` 之外。同步副本 `nd-ui-core` 已提供；视图模型 `nd-view-model`、输入框状态机 `nd-composer` 各自作为不依赖 GPUI 的库接入。

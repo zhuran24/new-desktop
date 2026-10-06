@@ -41,9 +41,11 @@ async fn interrupt_while_a_declared_background_agent_runs(
 ) -> Observed {
     let fx = Fixture::start(name).await;
     let claude = fx.claude(fx.config());
-    let mut init = InitOptions::default();
-    init.per_task_stop_affordance = per_task_stop;
-    init.dialog_kinds = vec!["refusal_fallback_prompt".into()];
+    let mut init = InitOptions {
+        per_task_stop_affordance: per_task_stop,
+        dialog_kinds: vec!["refusal_fallback_prompt".into()],
+        ..Default::default()
+    };
     init.hook_agents.insert(
         "nd-probe".into(),
         json!({"description":"offline probe agent","prompt":PROBE_PROMPT,"model":MODEL}),

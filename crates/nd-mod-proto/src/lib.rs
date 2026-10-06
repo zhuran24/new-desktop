@@ -14,7 +14,7 @@ pub const PROTO_VERSION: u32 = 1;
 /// 两个 mod 与本 crate 同一版本号，plugin.json 的 version 与它一致。
 pub const MOD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 两个 mod 的插件名（plugin.json 的 name，也是 pluginConfigs 的键）。
+/// 两个 mod 的名字（plugin.json 的 name，也是 pluginConfigs 的键）。
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]

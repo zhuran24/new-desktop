@@ -17,7 +17,7 @@ async fn mods_rebind_after_an_adapter_restart_and_earlier_operations_can_be_quer
             .open("restart", fx.fresh(&session), InitOptions::default())
             .await
             .unwrap();
-        let op_id = run.send(ModName::Actions, Action::Ping);
+        let op_id = run.send(ModName::Actions, Action::Ping).unwrap();
         let outcome = run.result(&op_id, Duration::from_secs(10)).await;
         assert!(
             matches!(outcome, Some(CommandResult::Outcome(Outcome::Done { .. }))),

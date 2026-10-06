@@ -163,7 +163,7 @@
       "type": "object"
     },
     "ModName": {
-      "description": "两个 mod 的插件名（plugin.json 的 name，也是 pluginConfigs 的键）。",
+      "description": "两个 mod 的名字（plugin.json 的 name，也是 pluginConfigs 的键）。",
       "enum": [
         "new-desktop",
         "new-desktop-actions"

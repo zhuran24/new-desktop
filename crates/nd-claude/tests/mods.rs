@@ -66,3 +66,40 @@ async fn both_mods_pass_the_pinned_cli_static_check_with_their_multi_file_layout
     assert_eq!(hooks(&listed[1]), ["session.start".to_owned()].into());
     scenario.close().unwrap();
 }
+
+/// N5 的边界：钩子可以从本 mod 的其他文件导入，但 `$` 不能跨文件传；
+/// 所以每个能力文件自带用 `$` 的辅助函数，共享状态文件里不碰 `$`。
+#[tokio::test]
+async fn the_static_check_refuses_passing_dollar_across_an_import() {
+    let mut scenario = Scenario::start(ScenarioOptions::new(
+        "mod-dollar",
+        std::env::var_os("ND_TEST_DAEMON").unwrap(),
+    ))
+    .await
+    .unwrap();
+    let probe = scenario.root().join("mods/probe");
+    copy_dir(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mods/new-desktop"),
+        &probe,
+    );
+    std::fs::write(
+        probe.join("hooks/helper.ts"),
+        "export async function helper($: any) { await $.session.id() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        probe.join("hooks/register.ts"),
+        "import { helper } from './helper.ts'\nexport function register(on: any) {\n  on('session.start', async ($: any, e: any, next: any) => { await helper($); return next(e) })\n}\n",
+    )
+    .unwrap();
+    let process = scenario
+        .spawn(
+            "validate-probe",
+            Program::claude().args(["plugin", "validate", "/sandbox/mods/probe"]),
+        )
+        .unwrap();
+    assert_ne!(process.wait(Duration::from_secs(60)).await.unwrap(), 0);
+    let out = process.stdout().unwrap();
+    assert!(out.contains("never across an import"), "{out}");
+    scenario.close().unwrap();
+}

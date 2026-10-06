@@ -288,3 +288,68 @@ async fn hello_timeout_still_launches_but_only_for_chat_and_without_hook_routed_
     drop(claude);
     fx.close();
 }
+
+#[tokio::test]
+async fn a_resumed_backend_is_ready_when_both_mods_report_the_resumed_session() {
+    use nd_claude::{Open, Start};
+    use nd_testkit::{ModelReply, Route};
+    let fx = Fixture::start("claude-resume").await;
+    let claude = fx.claude(fx.config());
+    let session = session_id();
+    {
+        let mut first = claude
+            .open("first", fx.fresh(&session), InitOptions::default())
+            .await
+            .unwrap();
+        fx.scenario
+            .endpoint()
+            .enqueue(Route::new(None, MODEL), ModelReply::text("FIRST_TURN"));
+        first
+            .write(&serde_json::json!({"type":"user","message":{"role":"user","content":"remember this"},"parent_tool_use_id":null,"session_id":session}))
+            .await
+            .unwrap();
+        first
+            .wait_frame(std::time::Duration::from_secs(30), |f| {
+                f["type"] == "result"
+            })
+            .await
+            .unwrap();
+    }
+    // 结束第一个后端进程（关 stdin），再用 --resume 拉起同一个后端会话。
+    let runs = fx.scenario.watchdogs().unwrap();
+    runs.link("first")
+        .await
+        .unwrap()
+        .finish(nd_watchdog_proto::Finish::CloseStdin)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while runs
+            .inspect()
+            .unwrap()
+            .iter()
+            .any(|f| f.run == "first" && f.state == "Up")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let open = Open {
+        start: Start::Resume {
+            session: session.clone(),
+        },
+        ..fx.fresh(&session)
+    };
+    let resumed = claude
+        .open("second", open, InitOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(resumed.ready().caps.readiness, Readiness::Full);
+    for module in ModName::ALL {
+        assert_eq!(resumed.ready().hellos[&module].backend_session_id, session);
+    }
+    drop(resumed);
+    drop(claude);
+    fx.close();
+}

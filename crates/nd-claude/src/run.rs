@@ -342,32 +342,20 @@ impl ClaudeRun {
             .wait_binding(&self.ready.run, timeout, until)
             .await
     }
-    /// 按当前绑定发命令并等结论；None 表示到时限仍无结论（交付不明）。
+    /// 按当前绑定发命令并等结论；None 表示 mod 没绑定，或到时限仍无结论（交付不明）。
     pub async fn command(
         &self,
         module: ModName,
         action: Action,
         timeout: Duration,
     ) -> Option<CommandResult> {
+        let op_id = self.send(module, action)?;
+        self.result(&op_id, timeout).await
+    }
+    /// 按当前绑定把命令放进 mod 的队列，返回操作 id；这个 mod 没绑定在当前后端会话上就不发。
+    pub fn send(&self, module: ModName, action: Action) -> Option<String> {
         let binding = self.binding();
         let mod_gen = binding.mods.get(&module)?.mod_gen.clone();
-        self.command_as(
-            module,
-            action,
-            &binding.backend_session_id,
-            &mod_gen,
-            timeout,
-        )
-        .await
-    }
-    /// 按当前绑定把命令放进 mod 的队列，返回操作 id。
-    pub fn send(&self, module: ModName, action: Action) -> String {
-        let binding = self.binding();
-        let mod_gen = binding
-            .mods
-            .get(&module)
-            .map(|h| h.mod_gen.clone())
-            .unwrap_or_default();
         let op_id = uuid::Uuid::new_v4().to_string();
         self.channel.send(
             &self.ready.run,
@@ -379,7 +367,7 @@ impl ClaudeRun {
                 action,
             },
         );
-        op_id
+        Some(op_id)
     }
     /// 等某条命令的结论；None 表示到时限仍无结论。
     pub async fn result(&self, op_id: &str, timeout: Duration) -> Option<CommandResult> {

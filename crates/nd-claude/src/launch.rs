@@ -16,7 +16,7 @@ pub const FIXED_ENV: [(&str, &str); 6] = [
     ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
     // 关掉 CLI 自动更新（手动 `claude update` 也被拒）。
     ("DISABLE_UPDATES", "1"),
-    // 不监视插件目录；显式写 0，不依赖 print 模式的默认值。
+    // 不监视 mod 目录（CLI 叫插件目录）；显式写 0，不依赖 print 模式的默认值。
     ("CLAUDE_CODE_PLUGIN_DIR_WATCH", "0"),
 ];
 
