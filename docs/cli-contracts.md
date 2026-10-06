@@ -1,6 +1,6 @@
 # CLI 与 Codex 契约清单
 
-日期：2026-10-06。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#5 的离线端点和 #8 的只读记录契约已通过真 CLI 离线验收；#9 的转换契约区分格式回归与后续真实后端验证。
+日期：2026-10-06。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#5 的离线端点、#6 的 Workflow 流水和 #8 的只读记录契约已通过真 CLI 离线验收；#9 的转换契约区分格式回归与后续真实后端验证。
 
 ## 离线场景端点与真 CLI（#5）
 
@@ -13,6 +13,18 @@
 | SSE `tool_use` / `input_json_delta` 能触发真 Bash，结果出现在下一次模型请求 | `research/round9/verify/mock_base.py` 的工具 SSE；父规格 FIFO 控时约定；本版本实跑 | `real_claude_executes_scripted_tool_and_reports_fifo_result_to_endpoint`：真实 Bash 阻塞 FIFO，放行后实际 tool_result 带回指定文字 | 离线场景失败，保留 CLI 输出与请求检查契约；不直接伪造 tool_result 或代写 CLI 记录 |
 
 本条目不写 CLI 原生存储、不新增产品结构/派发操作；命令故障点沿用 #4，后端操作的引擎崩溃矩阵随实际操作工单增加。以上验证全在断网临时环境中完成，不代表真模型服务或产品看守保活验证。
+
+## 看守流水与 Workflow（#6）
+
+版本及二进制指纹同 #5；默认复验入口 `scripts/test-scenarios.sh`。N7 的 systemd/高吞吐验证不依赖 CLI 格式，V6 使用同一固定 CLI 和离线端点。
+
+| 依赖 | 出处 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|
+| 顶层 `type=stream_event` 是可从后续事实重建的流式增量；完整 assistant、result、system、控制回应不能丢 | 父规格「进程」L227；`research/impl/cli-protocol.md` 流式输出小节 | `soft_limit_marks_only_deltas_and_hard_limit_preserves_facts_in_overflow`；真实 V6 流水的主对话 stream_event 与 Workflow 事实原样录制 | 未识别类型全部作为事实保留；候选若改 stream_event 语义，禁用丢增量（提高软限）并修正分类；硬限仍转存，真损失仍报 LostLines |
+| 双向 stdin 在回合后保持开放，可 initialize 后执行后台 Workflow，并从 stdout 得到 task_started/progress/notification | 父规格 L226、L231–234；`research/round9/VERIFY.md` E3；本版本 V6 实跑 | `v6_real_workflow_records_versioned_fixture_and_measures_stream_share`：六个真 Workflow 子代理实际请求、约 75 秒后完成，零真实模型请求，录制读回一致 | 该版本的场景关卡失败，继续用已钉版本；不伪造 CLI 任务结果、不把看守的 PID 存活当作 Workflow 成功 |
+| Workflow agent 请求带实际 agent id；本版本 `sonnet` 解析为 `claude-sonnet-5-5`；子代理模型 SSE 不全部出现在看守 stdout | 固定 2.1.289 的实际请求与任务进度帧；录制 `nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl` | V6 核对六个 agent 请求与完成通知，统计实际 stdout 的行数/字节/stream_event 比例，所有原始行保留 | 重新测量候选版本的实际路由与体积，调整软/硬限值；不能按模型端点 SSE 数量冒充看守流水吞吐，也不改变溢出策略 |
+
+本单没有写 CLI 原生存储；输入/输出录制是看守自己的运行数据。没有新增会话结构或派发操作，因此引擎崩溃矩阵由 #13 及实际操作工单接入；本单真实故障测试覆盖看守的输入去重、守护进程重启和结束清理。N7/V6 的证据、默认无 OOM 验证与手动 OOM 结果见 [验证记录](verification/ticket-6.md)。
 
 ## Claude 记录解析（#8）
 

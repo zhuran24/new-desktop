@@ -31,6 +31,12 @@ class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+if sys.argv[1] == '--watchdog':
+    server = Server(('127.0.0.1', 8765), Proxy)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # The real watchdog still owns CLI stdin/stdout and reads its host PID.
+    sys.exit(subprocess.call(sys.argv[2:]))
+
 config = json.loads(Path(sys.argv[1]).read_text())
 stem = Path('/sandbox/out') / config['name']
 env = dict(os.environ)

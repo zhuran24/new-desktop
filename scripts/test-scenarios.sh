@@ -12,6 +12,7 @@ export CARGO_BUILD_JOBS=6
 limited() {
   systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- "$@"
 }
-limited cargo build -p nd-daemon --features scenarios --locked
+limited cargo build -p nd-watchdog -p nd-daemon --features scenarios --locked
+export ND_TEST_WATCHDOG="$CARGO_TARGET_DIR/debug/nd-watchdog"
 export ND_TEST_DAEMON="$CARGO_TARGET_DIR/debug/nd-daemon"
 limited cargo test -p nd-daemon -p nd-testkit --features nd-daemon/scenarios,nd-testkit/scenarios --locked "$@"

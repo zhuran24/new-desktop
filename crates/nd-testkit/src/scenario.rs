@@ -130,6 +130,8 @@ pub struct ScenarioOptions {
     pub config: String,
     pub memory_max: u64,
     pub timeout: Duration,
+    pub watchdog: Option<PathBuf>,
+    pub disk_scratch: bool,
 }
 impl ScenarioOptions {
     pub fn new(name: &str, daemon: impl Into<PathBuf>) -> Self {
@@ -139,16 +141,20 @@ impl ScenarioOptions {
             config: String::new(),
             memory_max: 2 * 1024 * 1024 * 1024,
             timeout: Duration::from_secs(10),
+            watchdog: None,
+            disk_scratch: false,
         }
     }
 }
 
 pub struct Scenario {
     dir: Option<tempfile::TempDir>,
+    disk: Option<tempfile::TempDir>,
     slice: String,
     services: Vec<String>,
     timeout: Duration,
     endpoint: Option<ClaudeEndpoint>,
+    watchdog_config: Option<nd_runs::Config>,
 }
 
 /// The command commit windows supplied by the daemon's `scenarios` build.
@@ -210,10 +216,20 @@ impl Scenario {
         let unit = format!("nd-test-{}-{id}-daemon.service", options.name);
         let mut this = Self {
             dir: Some(dir),
+            disk: if options.disk_scratch {
+                Some(
+                    tempfile::Builder::new()
+                        .prefix("nd-test-disk-")
+                        .tempdir_in("/mnt/wd_external/nd-build/tmp")?,
+                )
+            } else {
+                None
+            },
             slice,
             services: vec![unit],
             timeout: options.timeout,
             endpoint: None,
+            watchdog_config: None,
         };
         // A transient slice leaves no runtime drop-ins behind on success or failure.
         checked(
@@ -241,10 +257,81 @@ impl Scenario {
                 "0",
             ],
         )?;
+        if let Some(watchdog) = options.watchdog {
+            let watchdog = watchdog.canonicalize()?;
+            // Keep host PIDs for /proc identity checks. Network and home remain isolated.
+            let mut launcher = this.sandbox_args(&watchdog)?;
+            launcher.retain(|s| s != "--unshare-all");
+            launcher.splice(
+                1..1,
+                [
+                    "--unshare-user",
+                    "--unshare-ipc",
+                    "--unshare-net",
+                    "--unshare-uts",
+                ]
+                .map(str::to_owned),
+            );
+            launcher.extend([
+                "--ro-bind".into(),
+                watchdog.to_string_lossy().into_owned(),
+                watchdog.to_string_lossy().into_owned(),
+            ]);
+            launcher.extend(
+                [
+                    "--ro-bind",
+                    "/mnt/wd_external/nd-build/cli/claude-2.1.289",
+                    "/cli",
+                    "/usr/bin/python3",
+                    "/sandbox/sandbox.py",
+                    "--watchdog",
+                ]
+                .map(str::to_owned),
+            );
+            let config = nd_runs::Config {
+                root: this.root().join("runtime/runs"),
+                watchdog,
+                unit_prefix: this.services[0].trim_end_matches("-daemon.service").into(),
+                slice: this.slice.clone(),
+                memory_max: 2 * 1024 * 1024 * 1024,
+                launcher,
+            };
+            let section = toml::to_string(&serde_json::json!({"watchdogs":config}))?;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(this.root().join("config.toml"))?;
+            writeln!(file, "\n{section}")?;
+            this.watchdog_config = Some(config);
+        }
         this.endpoint = Some(ClaudeEndpoint::bind(this.root().join("model.sock")).await?);
         let mut args = this.service_args(&this.services[0], true);
         args.extend(this.sandbox_args(&daemon)?);
-        args.extend(["/program", "--root", "/sandbox"].map(str::to_owned));
+        if this.watchdog_config.is_some() {
+            let bus = format!("/run/user/{}/bus", rustix::process::geteuid().as_raw());
+            args.retain(|s| s != "--unshare-all");
+            let at = args.iter().position(|s| s == "/usr/bin/bwrap").unwrap() + 1;
+            args.splice(
+                at..at,
+                [
+                    "--unshare-user",
+                    "--unshare-ipc",
+                    "--unshare-net",
+                    "--unshare-uts",
+                ]
+                .map(str::to_owned),
+            );
+            args.extend(["--ro-bind".into(), bus.clone(), bus]);
+            let private = format!(
+                "/run/user/{}/systemd/private",
+                rustix::process::geteuid().as_raw()
+            );
+            args.extend(["--ro-bind".into(), private.clone(), private]);
+        }
+        args.extend([
+            "/program".into(),
+            "--root".into(),
+            this.root().to_string_lossy().into_owned(),
+        ]);
         checked(
             "systemd-run",
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -277,7 +364,17 @@ impl Scenario {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         if restart {
-            args.extend(["-p", "Restart=on-failure", "-p", "RestartSec=100ms"].map(str::to_owned));
+            args.extend(
+                [
+                    "-p",
+                    "StartLimitIntervalSec=0",
+                    "-p",
+                    "Restart=on-failure",
+                    "-p",
+                    "RestartSec=100ms",
+                ]
+                .map(str::to_owned),
+            );
         }
         args
     }
@@ -310,6 +407,9 @@ impl Scenario {
             "--bind",
             self.root().to_str().ok_or("non-UTF8 scenario root")?,
             "/sandbox",
+            "--bind",
+            self.root().to_str().ok_or("non-UTF8 scenario root")?,
+            self.root().to_str().ok_or("non-UTF8 scenario root")?,
             "--ro-bind",
             binary.to_str().ok_or("non-UTF8 program path")?,
             "/program",
@@ -320,6 +420,13 @@ impl Scenario {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+        if let Some(disk) = &self.disk {
+            args.extend([
+                "--bind".into(),
+                disk.path().to_string_lossy().into_owned(),
+                "/scratch".into(),
+            ]);
+        }
         for (key, value) in [
             ("PATH", "/usr/bin:/bin"),
             ("LANG", "C.UTF-8"),
@@ -334,6 +441,91 @@ impl Scenario {
             args.extend(["--setenv", key, value].map(str::to_owned));
         }
         Ok(args)
+    }
+    pub fn watchdog_config(&self) -> Result<nd_runs::Config> {
+        self.watchdog_config
+            .clone()
+            .ok_or_else(|| "watchdog not configured".into())
+    }
+    pub fn watchdogs(&self) -> Result<nd_runs::Watchdogs> {
+        nd_runs::Watchdogs::new(
+            self.watchdog_config
+                .clone()
+                .ok_or("watchdog not configured")?,
+        )
+    }
+    pub fn claude_watchdog_spec(&self, run: &str) -> Result<nd_watchdog_proto::LaunchSpec> {
+        let mut spec = self.watchdog_spec(
+            run,
+            "/cli",
+            &[
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-haiku-4-5",
+                "--permission-mode",
+                "bypassPermissions",
+                "--dangerously-skip-permissions",
+                "--setting-sources",
+                "",
+                "--strict-mcp-config",
+                "--replay-user-messages",
+                "--include-partial-messages",
+                "--settings",
+                r#"{"enableWorkflows":true}"#,
+            ],
+        )?;
+        for (key, value) in [
+            ("ANTHROPIC_BASE_URL", "http://127.0.0.1:8765"),
+            ("ANTHROPIC_API_KEY", "offline-fixture"),
+            ("DISABLE_AUTOUPDATER", "1"),
+            ("DISABLE_TELEMETRY", "1"),
+            ("DISABLE_ERROR_REPORTING", "1"),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+            ("CLAUDE_CODE_EAGER_FLUSH", "1"),
+            ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
+            ("TERM", "dumb"),
+        ] {
+            spec.env.insert(key.into(), value.into());
+        }
+        Ok(spec)
+    }
+    pub fn watchdog_spec(
+        &self,
+        run: &str,
+        binary: &str,
+        args: &[&str],
+    ) -> Result<nd_watchdog_proto::LaunchSpec> {
+        Ok(nd_watchdog_proto::LaunchSpec {
+            argv: std::iter::once(binary.to_owned())
+                .chain(args.iter().map(|s| (*s).to_owned()))
+                .collect(),
+            cwd: "/sandbox/project".into(),
+            limits: nd_watchdog_proto::Limits {
+                overflow: self.root().join("cache/spool-overflow").join(run),
+                ..Default::default()
+            },
+            env: [
+                ("PATH", "/usr/bin:/bin"),
+                ("HOME", "/sandbox/home"),
+                ("CLAUDE_CONFIG_DIR", "/sandbox/claude"),
+                ("XDG_CONFIG_HOME", "/sandbox/config"),
+                ("XDG_DATA_HOME", "/sandbox/data"),
+                ("XDG_STATE_HOME", "/sandbox/state"),
+                ("XDG_CACHE_HOME", "/sandbox/cache"),
+                ("XDG_RUNTIME_DIR", "/sandbox/runtime"),
+                ("LANG", "C.UTF-8"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect(),
+        })
+    }
+    pub fn disk_root(&self) -> Option<&Path> {
+        self.disk.as_ref().map(|d| d.path())
     }
     pub fn root(&self) -> &Path {
         self.dir.as_ref().expect("open scenario").path()
@@ -494,6 +686,9 @@ impl Scenario {
         checked("systemctl", &["--user", "stop", &self.slice])?;
         self.endpoint.take();
         self.dir.take().unwrap().close()?;
+        if let Some(disk) = self.disk.take() {
+            disk.close()?;
+        }
         Ok(())
     }
     pub fn close(mut self) -> Result<()> {
