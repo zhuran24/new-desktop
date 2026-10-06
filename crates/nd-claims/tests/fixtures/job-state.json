@@ -1,0 +1,38 @@
+{
+  "state": "blocked",
+  "detail": "",
+  "tempo": "blocked",
+  "output": null,
+  "children": null,
+  "linkScanOffset": 0,
+  "template": "bg",
+  "respawnFlags": [
+    "--tools",
+    "",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--model",
+    "claude-haiku-4-5"
+  ],
+  "providerEnv": {
+    "CLAUDE_CONFIG_DIR": "/fixture/config"
+  },
+  "intent": "BG_REGISTRY_FIXTURE",
+  "sessionId": "b11357e2-e21a-45a8-b210-5b1d8debe1e0",
+  "resumeSessionId": "b11357e2-e21a-45a8-b210-5b1d8debe1e0",
+  "daemonShort": "b11357e2",
+  "cwd": "/fixture/project",
+  "createdAt": "2026-10-06T20:12:18.822Z",
+  "updatedAt": "2026-10-06T20:12:19.175Z",
+  "firstTerminalAt": null,
+  "backend": "daemon",
+  "inFlight": {
+    "tasks": 0,
+    "queued": 0,
+    "kinds": [],
+    "drainableMonitors": 0
+  },
+  "needs": "login required — run /login",
+  "linkScanPath": "/fixture/config/projects/-fixture-project/b11357e2-e21a-45a8-b210-5b1d8debe1e0.jsonl"
+}

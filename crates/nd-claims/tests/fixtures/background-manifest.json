@@ -1,0 +1,26 @@
+{
+  "cli_version": "2.1.289 (Claude Code)",
+  "registry_removed_after_exit": true,
+  "network": "bwrap --unshare-all",
+  "model_requests": 1,
+  "cli_sha256": "a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348",
+  "files": {
+    "agents.json": "bcbc8178dc310714cbfd72b767de39a40661db2216cbd94178602259c1d51bd5",
+    "background-status.json": "c365161d39236fe0f1d32937fbc549796b8487d8faf65ed3879b96897c78ea5d",
+    "background.stderr": "b98a4f887c0ef481b785645c57332d693a1b7b54a97661cabc5355d6f0f30f79",
+    "background.stdout": "0315f0722a90f7de57f83b2e9d7f4dc094da921f42f55c3e1edba0540a0da500",
+    "history.jsonl": "bd7fb75d3b015dcbe5b90c52992510c287603ff207e40d48298711126c0e288e",
+    "identity.json": "4ef07208da8ee484b287e1d1903234dff40ec8d0d9166be5db0614153d6ca353",
+    "job-pins.json": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "job-state.json": "8705faba889e2aee4985aaeb433b75eb8cbf6005c1954ef3dc3cbef8e9fa2147",
+    "jobs-layout.json": "027588a31e15a21ad155c052a7f58252b61f73fcd26ad9758d9eaf746b8fd28c",
+    "registry.frames.jsonl": "a07be7853523bc84045237a238d730ddceb9cfb01949a3030c7308cde613227b",
+    "registry.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "session.json": "8a538e8db07b2fa4fa08f0e8d7abcb5236a7d3577fe701816ff5f6d804e9c26d"
+  },
+  "cleanup": {
+    "temporary_directory_removed": true,
+    "unit": "nd-test-claims-b3ace2bf6705.service",
+    "slice": "ndtestclaimsb3ace2bf6705.slice"
+  }
+}
