@@ -123,7 +123,7 @@ impl Shown {
                 match state.as_str() {
                     "acknowledged" => "停止请求已送达",
                     "pending" => "正在处理",
-                    "withdrawn" => "已撤回到输入框",
+                    "withdrawn" => "已撤回，内容已保存在草稿中",
                     "not_withdrawable" => "消息已开始处理，无法撤回",
                     "unknown" => "交付不明，请核对会话状态",
                     "failed" => "操作失败",

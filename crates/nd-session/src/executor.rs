@@ -1225,7 +1225,7 @@ impl Executor {
                             )?;
                         }
                         self.restore_withdrawn(tx, fx, &message)?;
-                        self.refill_draft(tx, &id, &restore, &[message.clone()])?;
+                        self.refill_draft(tx, &id, &restore, std::slice::from_ref(&message))?;
                         "withdrawn"
                     }
                     Outcome::Ok {
