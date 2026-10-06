@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import uuid
+from PIL import Image
 
 
 def inner():
@@ -59,12 +60,19 @@ def inner():
         return next((i for i in snapshot['items'] if i['kind'] == 'text'), None)
 
     def screenshot(name):
-        # 副本观测在 Render 开始时输出；给 GPUI 提交和 KWin 合成留出呈现窗口。
-        # 这是截图稳定等待，不是输入到上屏的延迟测量。
-        time.sleep(0.25)
-        result = subprocess.run(['spectacle', '-b', '-n', '-f', '-o', str(out / f'{name}.png')], capture_output=True,
-                                timeout=10, env=dict(os.environ, QT_QPA_PLATFORM='wayland'))
-        assert result.returncode == 0, result.stderr.decode()
+        # Render 观测先于 KWin 呈现；等待实际非空屏幕，不能用固定延时冒充帧证据。
+        # 仅为截图采样，不是输入到上屏的延迟测量。
+        target = out / f'{name}.png'
+        for _ in range(20):
+            time.sleep(0.25)
+            result = subprocess.run(['spectacle', '-b', '-n', '-f', '-o', str(target)], capture_output=True,
+                                    timeout=10, env=dict(os.environ, QT_QPA_PLATFORM='wayland'))
+            assert result.returncode == 0, result.stderr.decode()
+            with Image.open(target) as image:
+                histogram = image.convert('L').histogram()
+                if sum(histogram[16:]) > image.width * image.height * 0.05:
+                    return
+        raise AssertionError(f'{name}: compositor only produced empty screenshots')
 
     try:
         if settings.get('history'):

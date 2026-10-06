@@ -1,6 +1,6 @@
 # #20 导航条与历史分页验收
 
-日期：2026-10-06。实现完成；自动验证结果见下表，日常桌面上的呈现延迟与 CPU 为 OWNER_PENDING。
+日期：2026-10-06。实现与自动验收完成；日常桌面上的呈现延迟与 CPU 为 OWNER_PENDING。
 
 ## 对外行为
 
@@ -32,6 +32,8 @@ export CARGO_BUILD_JOBS=6
 systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- cargo test --workspace --locked
 RUST_TEST_THREADS=3 scripts/test-scenarios.sh -- --nocapture
 ```
+
+原生截图检查依赖系统 Python 的 Pillow，用于排除尚未呈现窗口的空帧；它不是延迟测量。
 
 场景严格使用临时 HOME/CLAUDE_CONFIG_DIR/XDG、bwrap 断网、`nd-test-` 独立单元与限额 slice。仅替换模型端点；千轮场景将 mod 长轮询超时缩短到 20 ms。默认不触及真服务或 owner 的配置、凭据、会话。
 
