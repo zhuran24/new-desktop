@@ -131,7 +131,13 @@ impl Executor {
             Some((write_gen, core)) => (write_gen, core, true),
             None => (0, Core::default(), false),
         };
-        let projection = Projection::restore(state::items(&deps.store, &id)?);
+        let mut projection = Projection::restore(state::items(&deps.store, &id)?);
+        if born {
+            // 草稿是核心事实；即使旧版显示缓存没有它，冷启动也必须给出可编辑的版本。
+            projection.apply(&Shown::Draft {
+                draft: core.draft.clone(),
+            });
+        }
         let recovering = core
             .carriers
             .values()
@@ -456,6 +462,26 @@ impl Executor {
         match command.name.as_str() {
             "session.create" => self.create(tx, command, fx),
             "session.resend" => self.resend(tx, command, fx),
+            "session.draft.update" => {
+                let (Ok(args), Ok(expected)) = (
+                    serde_json::from_value::<nd_wire::DraftUpdate>(command.args.clone()),
+                    serde_json::from_value::<nd_wire::DraftExpected>(command.expect.clone()),
+                ) else {
+                    return Ok(rejected(
+                        "invalid",
+                        json!({"need":["text", "expect.draft_version"]}),
+                    ));
+                };
+                let result = self.core.update_draft(
+                    &command.id,
+                    &command.device,
+                    expected.draft_version,
+                    args.text,
+                );
+                Ok(Receipt::Done {
+                    value: json!(result),
+                })
+            }
             "session.send" => {
                 if !self.born {
                     return Ok(rejected("not_found", Value::Null));
@@ -593,9 +619,17 @@ impl Executor {
                 arrival: self.core.arrivals,
             },
         );
+        // 发送与清稿同一事务；旧界面、不同正文和重试均不能清掉后来编辑的草稿。
+        if command.expect["draft_version"].as_u64() == Some(self.core.draft.version)
+            && self.core.draft.text == text
+        {
+            self.core.draft.version += 1;
+            self.core.draft.text.clear();
+            self.core.draft.device = command.device.clone();
+        }
         // Done 只表示进了发送台；代持、写出、回显看这条消息的状态。
         Ok(Receipt::Done {
-            value: json!({"message": command.id}),
+            value: json!({"message": command.id, "draft": self.core.draft}),
         })
     }
 
@@ -1733,6 +1767,13 @@ impl Executor {
     }
 
     fn persist(&mut self, tx: &Tx<'_>, fx: &mut Effects) -> nd_store::Result<()> {
+        self.show(
+            tx,
+            fx,
+            Shown::Draft {
+                draft: self.core.draft.clone(),
+            },
+        )?;
         let mut header = header(&self.core);
         header["recovering"] = json!(self.recovering());
         self.show(tx, fx, Shown::Header { data: header })?;

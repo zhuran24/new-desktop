@@ -220,6 +220,315 @@ fn request_text(body: &Value) -> String {
     body["messages"].to_string()
 }
 
+fn draft(snapshot: &Snapshot) -> &Value {
+    &snapshot
+        .items
+        .iter()
+        .find(|i| i.id == "draft")
+        .expect("session draft")
+        .data
+}
+
+fn edit_draft(id: &str, device: &str, session: &str, version: u64, text: &str) -> Command {
+    Command {
+        id: id.into(),
+        device: device.into(),
+        name: "session.draft.update".into(),
+        args: json!({"session":session,"text":text}),
+        expect: json!({"draft_version":version}),
+    }
+}
+
+#[tokio::test]
+async fn draft_survives_ui_close_and_daemon_crash() {
+    let fx = Fixture::start("nd16-draft-reopen", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("draft-create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "first turn", |s| !texts(s).is_empty())
+        .await;
+    let mut ui = fx.ui().await;
+    let command = edit_draft(
+        "draft-edit",
+        "desktop-a",
+        &session,
+        0,
+        "未发送的中文\n第二行 🦀",
+    );
+    let reply = ui.command(&command).await.unwrap();
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Done { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    ui.close().await.unwrap();
+    let before = fx.peek(&session).await;
+    assert_eq!(draft(&before)["text"], "未发送的中文\n第二行 🦀");
+    assert_eq!(draft(&before)["version"], 1);
+    fx.scenario.kill_daemon().unwrap();
+    let mut reopened = fx.scenario.connect().await.unwrap();
+    let after = reopened
+        .subscribe(&format!("session/{session}"))
+        .await
+        .unwrap();
+    assert_eq!(draft(&after), draft(&before));
+    assert_eq!(
+        reopened.command(&command).await.unwrap(),
+        reply,
+        "retry returns original receipt"
+    );
+    let client = nd_ui_core::CommandClient::start(fx.socket()).unwrap();
+    assert!(matches!(
+        client.receipt(command.id.clone()).await.unwrap(),
+        nd_wire::ReceiptLookup::Found {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    assert_eq!(
+        client.receipt("never-submitted".into()).await.unwrap(),
+        nd_wire::ReceiptLookup::Missing
+    );
+    assert_eq!(
+        draft(&fx.peek(&session).await)["version"],
+        1,
+        "receipt recovery cannot reissue an edit"
+    );
+    assert_eq!(
+        fx.scenario.endpoint().requests().len(),
+        1,
+        "drafts never prompt the model"
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn draft_two_devices_preserve_the_loser_and_publish_it_to_both() {
+    let fx = Fixture::start("nd16-draft-conflict", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("draft-pair", "/sandbox/project", "hello").await;
+    let first = fx
+        .wait(&session, "first turn", |s| !texts(s).is_empty())
+        .await;
+    let stream = format!("session/{session}");
+    let mut a = fx.ui().await;
+    let mut b = fx.ui().await;
+    assert_eq!(draft(&a.subscribe(&stream).await.unwrap())["version"], 0);
+    assert_eq!(draft(&b.subscribe(&stream).await.unwrap())["version"], 0);
+    let ca = edit_draft("draft-a", "desktop-a", &session, 0, "A 的草稿");
+    let cb = edit_draft("draft-b", "desktop-b", &session, 0, "B 的草稿");
+    let (ra, rb) = tokio::join!(a.command(&ca), b.command(&cb));
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    let sa = a.subscribe(&stream).await.unwrap();
+    let sb = b.subscribe(&stream).await.unwrap();
+    assert_eq!(draft(&sa), draft(&sb));
+    let d = draft(&sa);
+    assert_eq!(d["version"], 1);
+    let saved = d["saved"].as_array().expect("saved drafts");
+    assert_eq!(saved.len(), 1);
+    let (winner, loser, loser_id, loser_device) = if d["text"] == "A 的草稿" {
+        (&ra, &rb, "draft-b", "desktop-b")
+    } else {
+        (&rb, &ra, "draft-a", "desktop-a")
+    };
+    assert!(
+        matches!(winner, CommandReply::Receipt { receipt: Receipt::Done { value } } if value["saved"].is_null())
+    );
+    assert!(
+        matches!(loser, CommandReply::Receipt { receipt: Receipt::Done { value } } if value["saved"] == loser_id)
+    );
+    assert_eq!(saved[0]["id"], loser_id);
+    assert_eq!(saved[0]["device"], loser_device);
+    assert_eq!(saved[0]["base_version"], 0);
+    assert_ne!(saved[0]["text"], d["text"]);
+    assert_eq!(a.command(&ca).await.unwrap(), ra);
+    assert_eq!(b.command(&cb).await.unwrap(), rb);
+    let mut changed = cb.clone();
+    changed.args["text"] = json!("同 id 改内容");
+    assert_eq!(b.command(&changed).await.unwrap(), CommandReply::Conflict);
+    // 暂停真实 CLI，保证两台界面都在恢复窗口内订阅，不靠调度碰巧复现。
+    let pid = cli_pid(&fx, &first).await;
+    signal(pid, rustix::process::Signal::STOP);
+    fx.scenario.restart_daemon().unwrap();
+    assert_eq!(draft(&fx.peek(&session).await), d);
+    // 取回落败稿仍是一次带版本的普通编辑，成功后两台通过事件同步。
+    let restore = edit_draft(
+        "draft-restore",
+        "desktop-b",
+        &session,
+        1,
+        saved[0]["text"].as_str().unwrap(),
+    );
+    let mut watcher = fx.ui().await;
+    let mut other_watcher = fx.ui().await;
+    for reader in [&mut watcher, &mut other_watcher] {
+        let cold = reader.subscribe(&stream).await.unwrap();
+        assert_ne!(cold.epoch, sa.epoch, "restart starts a new epoch");
+        assert_eq!(header(&cold)["recovering"], true);
+        assert_eq!(draft(&cold), d, "both devices recover the saved drafts");
+    }
+    signal(pid, rustix::process::Signal::CONT);
+    let restored = fx.ui().await.command(&restore).await.unwrap();
+    assert!(matches!(
+        restored,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    for reader in [&mut watcher, &mut other_watcher] {
+        // next() 返回任意事件应用后的完整副本。恢复头部可以先变化，
+        // 此时草稿仍是版本 1；按业务条件等待，不能假定下一次就是草稿编辑。
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = reader.next().await.unwrap();
+                if draft(&snapshot)["version"] == 2 {
+                    break snapshot;
+                }
+                assert_eq!(draft(&snapshot), d, "recovery cannot change saved drafts");
+            }
+        })
+        .await
+        .expect("both subscribers must receive the restored draft");
+        assert_eq!(draft(&event)["text"], saved[0]["text"]);
+        assert_eq!(
+            draft(&event)["saved"],
+            d["saved"],
+            "recovery keeps the saved original"
+        );
+    }
+    assert_eq!(fx.ui().await.command(&restore).await.unwrap(), restored);
+    assert_eq!(draft(&fx.peek(&session).await)["version"], 2);
+    assert_eq!(
+        fx.scenario.endpoint().requests().len(),
+        1,
+        "draft recovery never prompts the model"
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn draft_send_consumes_only_the_matching_version_atomically() {
+    let fx = Fixture::start("nd16-draft-send", 3_600_000).await;
+    for answer in ["ready", "sent", "again"] {
+        fx.scenario
+            .endpoint()
+            .enqueue(fx.main(), ModelReply::text(answer));
+    }
+    let session = fx
+        .create("draft-send-create", "/sandbox/project", "hello")
+        .await;
+    fx.wait(&session, "first turn", |s| !texts(s).is_empty())
+        .await;
+    let mut ui = fx.ui().await;
+    ui.command(&edit_draft("to-send", "a", &session, 0, "发出去"))
+        .await
+        .unwrap();
+    let send = Command {
+        id: "send-draft".into(),
+        device: "a".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"发出去"}),
+        expect: json!({"draft_version":1}),
+    };
+    let reply = ui.command(&send).await.unwrap();
+    assert!(matches!(
+        reply,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    let cleared = fx.peek(&session).await;
+    assert_eq!(draft(&cleared)["text"], "");
+    assert_eq!(draft(&cleared)["version"], 2);
+    ui.command(&edit_draft("newer", "b", &session, 2, "保留的新草稿"))
+        .await
+        .unwrap();
+    assert_eq!(ui.command(&send).await.unwrap(), reply);
+    let mut stale_send = send.clone();
+    stale_send.id = "send-stale".into();
+    ui.command(&stale_send).await.unwrap();
+    let retained = fx.peek(&session).await;
+    assert_eq!(draft(&retained)["text"], "保留的新草稿");
+    assert_eq!(draft(&retained)["version"], 3);
+    // 缺版本的编辑不能成为无条件覆盖；非法发送不能清草稿。
+    let mut invalid = edit_draft("bad-edit", "a", &session, 3, "丢弃");
+    invalid.expect = json!({});
+    assert!(
+        matches!(ui.command(&invalid).await.unwrap(), CommandReply::Receipt { receipt: Receipt::Rejected { code, .. } } if code == "invalid")
+    );
+    stale_send.id = "empty-send".into();
+    stale_send.args["text"] = json!("");
+    stale_send.expect = json!({"draft_version":3});
+    ui.command(&stale_send).await.unwrap();
+    assert_eq!(draft(&fx.peek(&session).await), draft(&retained));
+    fx.close();
+}
+
+#[tokio::test]
+async fn draft_native_windows_save_reopen_follow_and_recover() {
+    let fx = Fixture::start("nd16-native-drafts", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("sent"));
+    let session = fx
+        .create("native-drafts", "/sandbox/project", "hello")
+        .await;
+    fx.wait(&session, "first turn", |s| !texts(s).is_empty())
+        .await;
+    fx.ui()
+        .await
+        .command(&edit_draft(
+            "native-loser",
+            "test",
+            &session,
+            99,
+            "可找回的落败稿",
+        ))
+        .await
+        .unwrap();
+    let output = std::env::var_os("ND_NATIVE_DRAFT_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-drafts"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
+        .args([
+            "--desktop",
+            &std::env::var("ND_TEST_DESKTOP").expect("build scenarios desktop"),
+        ])
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot = fx
+        .wait(&session, "native draft sent", |s| {
+            texts(s).contains(&"sent".into())
+        })
+        .await;
+    assert_eq!(draft(&snapshot)["text"], "");
+    assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+    fx.close();
+}
+
 #[tokio::test]
 async fn new_session_models_come_from_the_backend_before_any_conversation() {
     let fx = Fixture::start("nd14-models", 3_600_000).await;

@@ -2,6 +2,127 @@ use nd_view_model::{ViewState, sidebar};
 use nd_wire::{Fallback, Item, Snapshot};
 use serde_json::json;
 
+#[test]
+fn an_unconfirmed_send_keeps_its_text_until_the_user_edits_or_retries_saving() {
+    let mut editor = nd_view_model::Draft::default();
+    editor.observe(
+        nd_wire::Draft {
+            version: 1,
+            text: "交付不明的正文".into(),
+            ..Default::default()
+        },
+        false,
+    );
+    editor.unconfirmed_send();
+    editor.observe(
+        nd_wire::Draft {
+            version: 2,
+            ..Default::default()
+        },
+        false,
+    );
+    assert_eq!(editor.text(), "交付不明的正文");
+    assert!(
+        editor.save_command("s", "a", "automatic").is_none(),
+        "a snapshot must not silently overwrite or resave uncertain text"
+    );
+    editor.retry_save();
+    let command = editor.save_command("s", "a", "explicit").unwrap();
+    assert_eq!(command.expect["draft_version"], 1);
+    assert_eq!(command.args["text"], "交付不明的正文");
+}
+
+#[test]
+fn draft_sync_preserves_new_edits_while_an_older_save_is_in_flight() {
+    use nd_view_model::Draft;
+    let remote = |version, text: &str| nd_wire::Draft {
+        version,
+        text: text.into(),
+        ..Default::default()
+    };
+    let mut editor = Draft::default();
+    editor.observe(remote(1, "原稿"), false);
+    assert_eq!(editor.text(), "原稿");
+    editor.edit("第一改".into());
+    let save = editor.save_command("s", "a", "save-1").unwrap();
+    editor.edit("第二改".into());
+    editor.observe(remote(2, "第一改"), false);
+    assert_eq!(editor.text(), "第二改");
+    assert_eq!(
+        editor.save_command("s", "a", "unused"),
+        Some(save.clone()),
+        "uncertain save retries use exactly the same id and body"
+    );
+    editor.saved(
+        nd_wire::DraftUpdated {
+            draft: remote(2, "第一改"),
+            saved: None,
+        },
+        false,
+    );
+    assert_eq!(editor.text(), "第二改");
+    let next = editor.save_command("s", "a", "save-2").unwrap();
+    assert_eq!(next.expect["draft_version"], 2);
+    assert_eq!(next.args["text"], "第二改");
+    editor.saved(
+        nd_wire::DraftUpdated {
+            draft: remote(3, "第二改"),
+            saved: None,
+        },
+        false,
+    );
+    assert!(editor.is_saved());
+    editor.observe(remote(4, "另一台"), false);
+    assert_eq!(editor.text(), "另一台");
+}
+
+#[test]
+fn draft_remote_updates_defer_to_composition_and_a_sent_reply_keeps_new_edits() {
+    let remote = |version, text: &str| nd_wire::Draft {
+        version,
+        text: text.into(),
+        ..Default::default()
+    };
+    let mut editor = nd_view_model::Draft::default();
+    editor.observe(remote(1, "原稿"), false);
+    editor.observe(remote(2, "另一台"), true);
+    assert_eq!(editor.text(), "原稿");
+    editor.edit("组词确认后的内容".into());
+    let command = editor.save_command("s", "a", "conflict").unwrap();
+    assert_eq!(command.expect["draft_version"], 1);
+    editor.saved(
+        nd_wire::DraftUpdated {
+            draft: remote(2, "另一台"),
+            saved: Some("conflict".into()),
+        },
+        false,
+    );
+    assert_eq!(editor.text(), "另一台");
+    let sent = editor.revision();
+    editor.edit("发送后继续输入".into());
+    editor.sent(sent, remote(3, ""), false);
+    assert_eq!(editor.text(), "发送后继续输入");
+    assert_eq!(
+        editor.save_command("s", "a", "next").unwrap().expect["draft_version"],
+        3
+    );
+    editor.saved(
+        nd_wire::DraftUpdated {
+            draft: remote(4, "发送后继续输入"),
+            saved: None,
+        },
+        false,
+    );
+    editor.sent(editor.revision(), remote(5, ""), true);
+    assert_eq!(
+        editor.text(),
+        "发送后继续输入",
+        "an in-progress composition is protected"
+    );
+    editor.observe(remote(5, ""), false);
+    assert_eq!(editor.text(), "");
+}
+
 fn item(id: &str, kind: &str, data: serde_json::Value) -> Item {
     Item {
         id: id.into(),

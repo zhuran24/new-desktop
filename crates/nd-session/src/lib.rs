@@ -348,14 +348,16 @@ impl Sessions {
         Ok(Some(handle))
     }
 
-    /// 命令：`session.create`、`session.send`。不是会话命令时返回 None，由别的提供者处理。
+    /// 会话命令统一经过恢复闸门和收据账本；其他命令返回 None，由别的提供者处理。
     pub async fn execute(&self, command: &Command) -> Option<CommandReply> {
         let target = match command.name.as_str() {
             "session.create" => session_id_for(&command.id),
-            "session.send" | "session.resend" => match command.args["session"].as_str() {
-                Some(id) => SessionId(id.to_owned()),
-                None => return Some(self.reject_without_session(command, "invalid")),
-            },
+            "session.send" | "session.draft.update" | "session.resend" => {
+                match command.args["session"].as_str() {
+                    Some(id) => SessionId(id.to_owned()),
+                    None => return Some(self.reject_without_session(command, "invalid")),
+                }
+            }
             _ => return None,
         };
         if !self.adopted() || self.deps.claims.recovery().ok() != Some(nd_claims::Recovery::Ready) {
