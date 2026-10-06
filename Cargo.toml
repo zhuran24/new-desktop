@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/nd-kernel", "crates/nd-claude-records", "crates/nd-convert"]
-default-members = ["crates/nd-kernel", "crates/nd-claude-records", "crates/nd-convert"]
+members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert"]
+default-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert"]
 exclude = ["ime-lab/variants/main", "ime-lab/variants/v070"]
 
 [workspace.package]
@@ -12,14 +12,34 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/zhuran24/new-desktop"
 
 [workspace.dependencies]
-nd-kernel = { path = "crates/nd-kernel" }
 nd-claude-records = { path = "crates/nd-claude-records" }
 nd-convert = { path = "crates/nd-convert" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-sha2 = "0.10"
 base64 = "0.22"
+nd-kernel = { path = "crates/nd-kernel" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.29"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha2 = "0.10"
+thiserror = "2"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+toml = "0.9"
+notify = "8"
+fs2 = "0.4"
+rustix = { version = "1", features = ["process", "fs"] }
+nd-wire = { path = "crates/nd-wire" }
+nd-ui-core = { path = "crates/nd-ui-core" }
+nd-store = { path = "crates/nd-store" }
+nd-config = { path = "crates/nd-config" }
+nd-daemon = { path = "crates/nd-daemon" }
 futures = "0.3.31"
 proptest = "1.6"
 # 桌面 crate 加入时继承此版本，且不加入 default-members。

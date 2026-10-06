@@ -1,0 +1,33 @@
+[package]
+name = "nd-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nd-ui-core.workspace = true
+nd-kernel.workspace = true
+nd-wire.workspace = true
+nd-config.workspace = true
+nd-store.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+futures.workspace = true
+uuid.workspace = true
+fs2.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+tempfile.workspace = true
+
+[features]
+scenarios = []

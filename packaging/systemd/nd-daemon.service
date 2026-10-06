@@ -1,0 +1,17 @@
+[Unit]
+Description=New Desktop 守护进程
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/nd-daemon
+Restart=on-failure
+RestartSec=1s
+RuntimeDirectory=new-desktop
+RuntimeDirectoryMode=0700
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=10s
+MemoryAccounting=true
+
+[Install]
+WantedBy=default.target
