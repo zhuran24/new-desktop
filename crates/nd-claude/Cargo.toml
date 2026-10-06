@@ -1,0 +1,27 @@
+[package]
+name = "nd-claude"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nd-mod-proto.workspace = true
+nd-runs.workspace = true
+nd-watchdog-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+uuid.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+nd-testkit.workspace = true
+tempfile.workspace = true
+
+[features]
+scenarios = []
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+{
+  "description": "New Desktop mod",
+  "modules": ["./register.ts"]
+}

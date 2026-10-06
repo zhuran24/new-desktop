@@ -1,0 +1,10 @@
+{
+  "name": "new-desktop-actions",
+  "version": "0.1.0",
+  "description": "New Desktop 动作 mod：只在 session.start 起控制循环，替守护进程发起调用并按操作 id 留结果。",
+  "author": { "name": "New Desktop" },
+  "userConfig": {
+    "sock": { "type": "string", "title": "mod 通道", "description": "守护进程 mod 通道的 unix socket 路径", "default": "" },
+    "run": { "type": "string", "title": "后端进程编号", "description": "New Desktop 给这个后端进程的编号", "default": "" }
+  }
+}

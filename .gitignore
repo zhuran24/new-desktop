@@ -15,3 +15,6 @@ __pycache__/
 
 # 实施用的 git 工作树
 /.worktrees/
+
+# CLI 装载 mod 时写入的类型声明
+/mods/*/.claude-plugin/types/

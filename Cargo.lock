@@ -4146,6 +4146,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nd-claude"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "nd-mod-proto",
+ "nd-runs",
+ "nd-testkit",
+ "nd-watchdog-proto",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nd-claude-records"
 version = "0.1.0"
 dependencies = [
@@ -4228,6 +4245,15 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "proptest",
+]
+
+[[package]]
+name = "nd-mod-proto"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

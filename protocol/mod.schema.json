@@ -1,0 +1,566 @@
+{
+  "$defs": {
+    "Action": {
+      "description": "命令的动作。可重发类别见 [`Action::resend`]。",
+      "oneOf": [
+        {
+          "description": "核对通道与身份，结果是 [`Pong`]。",
+          "properties": {
+            "type": {
+              "const": "ping",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "按操作 id 查本代次留下的状态和结果，结果是 [`QueryAnswer`]。",
+          "properties": {
+            "op_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "query",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "op_ids"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Command": {
+      "description": "守护进程发给 mod 的一条命令。mod 执行前核对身份，对不上就拒绝。",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/Action"
+        },
+        "expected_backend_session_id": {
+          "type": "string"
+        },
+        "expected_mod_gen": {
+          "type": "string"
+        },
+        "op_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "op_id",
+        "expected_backend_session_id",
+        "expected_mod_gen",
+        "action"
+      ],
+      "type": "object"
+    },
+    "ErrorReply": {
+      "description": "非 200 回应的正文。",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "Hello": {
+      "description": "`POST /hello`：mod 报到并绑定到（后端进程，后端会话）。",
+      "properties": {
+        "backend_session_id": {
+          "description": "`$.session.id()`：CLI 当前的后端会话 id。",
+          "type": "string"
+        },
+        "cause": {
+          "$ref": "#/$defs/HelloCause"
+        },
+        "cli_version": {
+          "description": "`$.session.version().version`。",
+          "type": "string"
+        },
+        "mod": {
+          "$ref": "#/$defs/ModName"
+        },
+        "mod_gen": {
+          "description": "每次模块装载新生成；重载后旧代次的结果查不到。",
+          "type": "string"
+        },
+        "mod_version": {
+          "type": "string"
+        },
+        "proto": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "proto",
+        "run",
+        "mod",
+        "mod_version",
+        "mod_gen",
+        "backend_session_id",
+        "cli_version",
+        "cause"
+      ],
+      "type": "object"
+    },
+    "HelloCause": {
+      "description": "发 hello 的原因。",
+      "oneOf": [
+        {
+          "const": "start",
+          "description": "模块装载（含热重载、worker 重生）后的 `session.start`。",
+          "type": "string"
+        },
+        {
+          "const": "clear",
+          "description": "`/clear` 之后 CLI 换了后端会话 id。",
+          "type": "string"
+        },
+        {
+          "const": "rehello",
+          "description": "守护进程要求重报（例如守护进程重启后不认得这个绑定）。",
+          "type": "string"
+        },
+        {
+          "const": "id_changed",
+          "description": "轮询前重读后端会话 id，发现变了。",
+          "type": "string"
+        }
+      ]
+    },
+    "HelloReply": {
+      "properties": {
+        "binding_epoch": {
+          "description": "绑定代次：这个后端进程每换一次后端会话 id 加一。",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "binding_epoch"
+      ],
+      "type": "object"
+    },
+    "ModName": {
+      "description": "两个 mod 的插件名（plugin.json 的 name，也是 pluginConfigs 的键）。",
+      "enum": [
+        "new-desktop",
+        "new-desktop-actions"
+      ],
+      "type": "string"
+    },
+    "Next": {
+      "description": "`GET /next` 的回应：长轮询到时限、有命令或要求重报 hello 时返回。",
+      "properties": {
+        "commands": {
+          "items": {
+            "$ref": "#/$defs/Command"
+          },
+          "type": "array"
+        },
+        "rehello": {
+          "description": "守护进程不认得这个绑定（或后端会话 id 刚换），mod 应重读 id 并重报 hello。",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "commands",
+        "rehello"
+      ],
+      "type": "object"
+    },
+    "NextQuery": {
+      "description": "`GET /next` 的查询参数。",
+      "properties": {
+        "backend_session_id": {
+          "type": "string"
+        },
+        "mod": {
+          "$ref": "#/$defs/ModName"
+        },
+        "mod_gen": {
+          "type": "string"
+        },
+        "run": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run",
+        "mod",
+        "mod_gen",
+        "backend_session_id"
+      ],
+      "type": "object"
+    },
+    "OpPhase": {
+      "oneOf": [
+        {
+          "enum": [
+            "running",
+            "done"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "本代次没见过这个操作 id。",
+          "type": "string"
+        }
+      ]
+    },
+    "OpState": {
+      "properties": {
+        "op_id": {
+          "type": "string"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Outcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "$ref": "#/$defs/OpPhase"
+        }
+      },
+      "required": [
+        "op_id",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "Outcome": {
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "done",
+              "type": "string"
+            },
+            "value": true
+          },
+          "required": [
+            "status",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "error": {
+              "type": "string"
+            },
+            "status": {
+              "const": "failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "mod 没有执行这条命令。",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/Rejection"
+            },
+            "status": {
+              "const": "rejected",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PluginOptions": {
+      "description": "`--settings` 的 `pluginConfigs.<mod>.options`；字段在 plugin.json 的 userConfig 里声明。",
+      "properties": {
+        "run": {
+          "description": "后端进程编号。",
+          "type": "string"
+        },
+        "sock": {
+          "description": "守护进程 mod 通道的 unix socket 路径（约 100 字节以内）。",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sock",
+        "run"
+      ],
+      "type": "object"
+    },
+    "Pong": {
+      "description": "ping 的结果。",
+      "properties": {
+        "backend_session_id": {
+          "type": "string"
+        },
+        "mod_gen": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backend_session_id",
+        "mod_gen"
+      ],
+      "type": "object"
+    },
+    "QueryAnswer": {
+      "description": "query 的结果。",
+      "properties": {
+        "ops": {
+          "items": {
+            "$ref": "#/$defs/OpState"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ops"
+      ],
+      "type": "object"
+    },
+    "Rejection": {
+      "oneOf": [
+        {
+          "description": "命令带的后端会话 id 不是当前的（例如 `/clear` 之后）。",
+          "properties": {
+            "code": {
+              "const": "stale_session",
+              "type": "string"
+            },
+            "current": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "current"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "命令带的 mod 代次不是当前装载的。",
+          "properties": {
+            "code": {
+              "const": "stale_gen",
+              "type": "string"
+            },
+            "current": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "current"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "这个 mod 不认识或不执行这种动作。",
+          "properties": {
+            "code": {
+              "const": "unsupported",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Report": {
+      "description": "`POST /report`：mod 主动上报的事实。",
+      "properties": {
+        "backend_session_id": {
+          "type": "string"
+        },
+        "body": {
+          "$ref": "#/$defs/ReportBody"
+        },
+        "dispatch_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mod": {
+          "$ref": "#/$defs/ModName"
+        },
+        "mod_gen": {
+          "type": "string"
+        },
+        "report_id": {
+          "description": "由 mod 生成，重发时不变，守护进程据此去重。",
+          "type": "string"
+        },
+        "run": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run",
+        "mod",
+        "mod_gen",
+        "backend_session_id",
+        "report_id",
+        "body"
+      ],
+      "type": "object"
+    },
+    "ReportAck": {
+      "properties": {
+        "durable": {
+          "description": "只有报告已落库才为 true；false 表示守护进程只收在内存里。",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "durable"
+      ],
+      "type": "object"
+    },
+    "ReportBody": {
+      "oneOf": [
+        {
+          "description": "`session.end`：`reason` 原样转发（`clear`、`other` 等）。",
+          "properties": {
+            "ended_session_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "session_end",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "ended_session_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ResultPost": {
+      "description": "`POST /result/<op_id>` 的正文。",
+      "properties": {
+        "backend_session_id": {
+          "type": "string"
+        },
+        "mod": {
+          "$ref": "#/$defs/ModName"
+        },
+        "mod_gen": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome"
+        },
+        "run": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run",
+        "mod",
+        "mod_gen",
+        "backend_session_id",
+        "outcome"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "把全部消息类型挂在一个根上，供 JSON Schema 与 TypeScript 一次导出。",
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/ErrorReply"
+    },
+    "hello": {
+      "$ref": "#/$defs/Hello"
+    },
+    "hello_reply": {
+      "$ref": "#/$defs/HelloReply"
+    },
+    "next": {
+      "$ref": "#/$defs/Next"
+    },
+    "next_query": {
+      "$ref": "#/$defs/NextQuery"
+    },
+    "options": {
+      "$ref": "#/$defs/PluginOptions"
+    },
+    "pong": {
+      "$ref": "#/$defs/Pong"
+    },
+    "query_answer": {
+      "$ref": "#/$defs/QueryAnswer"
+    },
+    "report": {
+      "$ref": "#/$defs/Report"
+    },
+    "report_ack": {
+      "$ref": "#/$defs/ReportAck"
+    },
+    "result": {
+      "$ref": "#/$defs/ResultPost"
+    }
+  },
+  "required": [
+    "options",
+    "hello",
+    "hello_reply",
+    "next_query",
+    "next",
+    "result",
+    "pong",
+    "query_answer",
+    "report",
+    "report_ack",
+    "error"
+  ],
+  "title": "ModProtocol",
+  "type": "object"
+}
