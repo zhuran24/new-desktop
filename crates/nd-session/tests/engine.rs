@@ -223,3 +223,110 @@ async fn a_watched_session_is_not_reclaimed_until_nobody_is_watching() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_delivery_survives_restart_and_only_confirmed_loss_allows_one_user_resend() {
+    use nd_backend::{Outcome, Refusal};
+    use nd_session::scripted::{ActKind, Reply};
+    use nd_wire::{CommandReply, Receipt};
+    use serde_json::json;
+    let h = Harness::new(config()).await;
+    let session = accepted_session(&h.create("clarify-create", "开始").await);
+    h.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    h.adapter
+        .script(ActKind::Send, Reply::Unknown("连接中断".into()));
+    let original = command(
+        "uncertain",
+        "session.send",
+        json!({"session":session,"text":"不能盲重发"}),
+    );
+    let receipt = h.sessions.execute(&original).await.unwrap();
+    h.wait(&session, "unknown", |s| {
+        prompt(s, "不能盲重发").is_some_and(|i| i.data["state"] == "unknown")
+    })
+    .await;
+    let resend = |id| {
+        command(
+            id,
+            "session.resend",
+            json!({"session":session,"message":"uncertain"}),
+        )
+    };
+    assert!(matches!(
+        h.sessions.execute(&resend("too-early")).await,
+        Some(CommandReply::Receipt {
+            receipt: Receipt::Rejected { .. }
+        })
+    ));
+    let ticket = h.adapter.received().last().unwrap().0.clone();
+    let h = h.restart(config()).await;
+    h.wait(&session, "recovered", |s| header(s)["recovering"] == false)
+        .await;
+    assert_eq!(h.sessions.execute(&original).await.unwrap(), receipt);
+    assert_eq!(
+        h.adapter
+            .received()
+            .iter()
+            .filter(|(_, a)| matches!(a, Act::Send { msg, .. } if msg.text == "不能盲重发"))
+            .count(),
+        1
+    );
+    h.adapter.clarify(
+        &ticket,
+        Outcome::Refused {
+            refusal: Refusal::Lost {
+                evidence: "后端明确拒绝，未消费".into(),
+            },
+        },
+    );
+    h.wait(&session, "confirmed loss", |s| {
+        prompt(s, "不能盲重发").is_some_and(|i| i.data["state"] == "not_delivered")
+    })
+    .await;
+    assert_eq!(
+        h.adapter
+            .received()
+            .iter()
+            .filter(|(_, a)| matches!(a, Act::Send { msg, .. } if msg.text == "不能盲重发"))
+            .count(),
+        1
+    );
+    let h = h.restart(config()).await;
+    h.wait(&session, "recovered loss", |s| {
+        header(s)["recovering"] == false
+    })
+    .await;
+    let sent = h.sessions.execute(&resend("resend-once")).await.unwrap();
+    assert!(matches!(
+        sent,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    assert_eq!(
+        h.sessions.execute(&resend("resend-once")).await.unwrap(),
+        sent
+    );
+    assert!(matches!(
+        h.sessions.execute(&resend("other-device")).await,
+        Some(CommandReply::Receipt {
+            receipt: Receipt::Rejected { .. }
+        })
+    ));
+    h.wait(&session, "resend lands", |s| {
+        s.items
+            .iter()
+            .any(|i| i.data["message"] == "resend-once" && i.data["state"] == "landed")
+    })
+    .await;
+    assert_eq!(h.sessions.execute(&original).await.unwrap(), receipt);
+    assert_eq!(
+        h.adapter
+            .applied()
+            .iter()
+            .filter(|s| *s == "send:不能盲重发")
+            .count(),
+        1
+    );
+}

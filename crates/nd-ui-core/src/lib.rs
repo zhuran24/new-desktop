@@ -143,10 +143,13 @@ impl SyncReplica {
     }
     /// 正文只送一次。传输中断只查收据；查不到返回交付不明。
     pub async fn command(&mut self, command: &nd_wire::Command) -> Result<nd_wire::CommandReply> {
-        for attempt in 0..5 {
+        let mut attempt = 0u32;
+        loop {
             match self.command_once(command).await {
-                Ok(nd_wire::CommandReply::Unavailable { .. }) if attempt < 4 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                Ok(nd_wire::CommandReply::Unavailable { .. }) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(5)))
+                        .await;
+                    attempt = attempt.saturating_add(1);
                 }
                 Ok(result) => return Ok(result),
                 Err(_) => {
@@ -166,7 +169,6 @@ impl SyncReplica {
                 }
             }
         }
-        unreachable!()
     }
 
     async fn command_once(&mut self, command: &nd_wire::Command) -> Result<nd_wire::CommandReply> {

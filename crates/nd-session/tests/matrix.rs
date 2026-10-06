@@ -96,7 +96,21 @@ async fn run(scenario: &Scenario, crash: Option<(Fault, usize)>) -> (Harness, Sn
     let mut index = 0;
     while index < scenario.steps.len() {
         let step = &scenario.steps[index];
-        let _ = h.sessions.execute(&step.command).await;
+        // 与同步副本一样：仅明确未受理的 unavailable 可同 id 重试。
+        let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while matches!(
+            h.sessions.execute(&step.command).await,
+            Some(nd_wire::CommandReply::Unavailable { .. })
+        ) {
+            if fired() && !restarted {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < retry_deadline,
+                "recovery gate stayed closed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut reached = false;
         while tokio::time::Instant::now() < deadline {
@@ -361,6 +375,80 @@ async fn idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_eve
                 counts.keys().filter(|k| k.starts_with("open:")).count(),
                 2,
                 "{counts:?}"
+            );
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn confirmed_loss_and_user_resend_are_atomic_at_every_commit_point() {
+    use sha2::{Digest, Sha256};
+    let bytes = b"resend attachment";
+    let blob = format!("{:x}", Sha256::digest(bytes));
+    let attachments =
+        json!([{"blob":blob,"name":"resend.txt","media_type":"text/plain","size":bytes.len()}]);
+    let session = session_id_for("matrix-resend");
+    matrix(Scenario {
+        name: "send/lost-and-user-resend",
+        uploads: vec![bytes.to_vec()],
+        script: vec![
+            (ActKind::Send, Reply::Ok),
+            (ActKind::Send, Reply::Lost("证实未消费".into())),
+        ],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-resend", "开始"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "matrix-lost",
+                    "session.send",
+                    json!({"session":session,"text":"重发的消息","attachments":attachments}),
+                ),
+                until: |s| {
+                    s.items.iter().any(|i| {
+                        i.data["message"] == "matrix-lost" && i.data["state"] == "not_delivered"
+                    })
+                },
+            },
+            Step {
+                command: command(
+                    "matrix-resend-once",
+                    "session.resend",
+                    json!({"session":session,"message":"matrix-lost"}),
+                ),
+                until: |s| {
+                    s.items.iter().any(|i| {
+                        i.data["message"] == "matrix-resend-once" && i.data["state"] == "landed"
+                    })
+                },
+            },
+        ],
+        check: |h, s| {
+            assert_eq!(applied_counts(h).get("send:重发的消息"), Some(&1));
+            for id in ["matrix-lost", "matrix-resend-once"] {
+                let item = s.items.iter().find(|i| i.data["message"] == id).unwrap();
+                assert_eq!(item.data["attachments"][0]["name"], "resend.txt");
+            }
+            for (_, act) in h.adapter.received() {
+                if let nd_backend::Act::Send { msg, .. } = act
+                    && msg.text == "重发的消息"
+                {
+                    assert_eq!(msg.attachments.len(), 1);
+                    assert_eq!(msg.attachments[0].name, "resend.txt");
+                    assert_eq!(msg.attachments[0].size, 17);
+                }
+            }
+            assert_eq!(
+                s.items
+                    .iter()
+                    .find(|i| i.data["message"] == "matrix-lost")
+                    .unwrap()
+                    .data["state"],
+                "resent"
             );
         },
     })

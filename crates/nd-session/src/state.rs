@@ -145,6 +145,10 @@ pub struct Core {
     pub carriers: BTreeMap<CarrierId, Carrier>,
     pub ops: BTreeMap<String, OpRecord>,
     pub outbox: BTreeMap<Ticket, OutRow>,
+    #[serde(default)]
+    pub uncertain: BTreeMap<Ticket, OutRow>,
+    #[serde(default)]
+    pub undelivered: BTreeMap<String, nd_backend::Msg>,
     pub messages: BTreeMap<String, Message>,
     pub next_op: u64,
     pub arrivals: u64,
@@ -312,6 +316,7 @@ pub fn needing_recovery(store: &nd_store::Store) -> nd_store::Result<Vec<Session
         let core: Core = serde_json::from_str(&core).map_err(corrupt)?;
         if !core.ops.is_empty()
             || !core.outbox.is_empty()
+            || !core.uncertain.is_empty()
             || !core.messages.is_empty()
             || core.carriers.values().any(|c| c.run.is_some())
         {

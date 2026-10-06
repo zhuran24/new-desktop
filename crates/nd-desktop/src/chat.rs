@@ -475,6 +475,43 @@ impl Desktop {
         })
         .detach();
     }
+    fn resend_message(&mut self, message: String, cx: &mut Context<Self>) {
+        if self.sending {
+            return;
+        }
+        let Some(session) = self.state.selected_session.clone() else {
+            return;
+        };
+        self.sending = true;
+        self.warning = None;
+        self.refresh_send(cx);
+        let client = self.client.clone();
+        let command = Command {
+            id: uuid::Uuid::new_v4().to_string(),
+            device: "desktop".into(),
+            name: "session.resend".into(),
+            args: json!({"session":session,"message":message}),
+            expect: json!({}),
+        };
+        cx.spawn(async move |weak, cx| {
+            let result = client.command(command).await;
+            let _ = weak.update(cx, |this, cx| {
+                this.sending = false;
+                match result {
+                    Ok(reply) if accepted(&reply) => {}
+                    Ok(CommandReply::DeliveryUnknown) => {
+                        this.warning = Some("重发请求交付不明，请等待会话状态更新".into())
+                    }
+                    other => this.warning = Some(format!("重发未确认：{other:?}")),
+                }
+                this.refresh_send(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(crate) fn chat_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = &self.theme;
         let rows = self
@@ -672,6 +709,24 @@ impl Desktop {
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.withdraw_message(id.clone(), window, cx)
                                 })),
+                        )
+                    })
+                    .when(!message.detail.is_empty(), |d| {
+                        d.child(div().text_color(rgba(t.colors.muted)).child(message.detail))
+                    })
+                    .when_some(message.resend, |d, target| {
+                        d.child(
+                            div()
+                                .id("resend")
+                                .text_color(rgba(t.colors.accent))
+                                .child("重发")
+                                .when(!self.sending, |d| {
+                                    d.cursor_pointer().on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.resend_message(target.clone(), cx)
+                                        },
+                                    ))
+                                }),
                         )
                     })
                     .into_any_element(),

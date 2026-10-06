@@ -103,3 +103,6 @@ CLI 依赖逐条登记在 [CLI 契约清单](../../docs/cli-contracts.md) 的「
 `Act::Withdraw{send}` 用原 Send 票派生 UUID，发 `cancel_async_message`。`cancelled:true` 才结撤回成功；false 保留原 Send 的后续结果。`Act::Interrupt{queued:Keep}` 发普通 `interrupt`，ACK 只结控制票，后续 result 才结束回合。Cancel 必须先观察 `system/init.capabilities` 的 `interrupt_cancel_queued_v1`，再发 `cancel_queued:true`，仅返回明确列出的取消票；缺少列表记交付不明。
 
 单一写入者优先处理控制和流水确认；普通输入最多 128 条，满时同步 Busy，由引擎保留同票重试。撤回和取消排队先完成目标输入的因果前置写出。检查点保存未答控制请求；恢复时已写请求只等重放回应，证实未写才派发。进程退出时已写未答记 Unknown，尚未写出的普通输入记 Withheld。没有把 ACK、空 success 或进程存活当作停止完成。
+
+
+#19 集成后，检查点的 writes 覆盖用户输入和控制请求的实际输入序号，controls 只保留回应配对。对旧版不含 writes 的控制检查点按旧格式兼容；无法证明未写出时保持 Unknown。接回先追平并报 Recovered，写过的控制继续等原回应；已终结 Unknown 的票只对账，不重新执行。明确回应同时提供 Clarified，供引擎更新原 Unknown 的当前结论。

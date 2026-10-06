@@ -4,6 +4,51 @@ use serde_json::json;
 use support::*;
 
 #[tokio::test]
+async fn late_withdrawal_confirmation_restores_the_original_draft_once() {
+    let h = Harness::new(config()).await;
+    let session = accepted_session(&h.create("clarify-withdraw", "ready").await);
+    h.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    h.adapter.script(ActKind::Send, Reply::Hold);
+    h.adapter
+        .script(ActKind::Withdraw, Reply::Unknown("reply lost".into()));
+    h.send("pending", &session, "late return").await;
+    h.sessions
+        .execute(&command(
+            "withdraw",
+            "session.withdraw",
+            json!({"session":session,"message":"pending"}),
+        ))
+        .await;
+    h.wait(&session, "unknown", |s| {
+        s.items
+            .iter()
+            .any(|i| i.id == "control/withdraw" && i.data["state"] == "unknown")
+    })
+    .await;
+    let ticket = h
+        .adapter
+        .received()
+        .into_iter()
+        .find(|(_, a)| matches!(a, nd_backend::Act::Withdraw { .. }))
+        .unwrap()
+        .0;
+    h.adapter.clarify(
+        &ticket,
+        nd_backend::Outcome::Ok {
+            done: nd_backend::Done::Withdrawn { ok: true },
+        },
+    );
+    let returned = h
+        .wait(&session, "confirmed withdrawal", |s| {
+            prompt(s, "late return").is_some_and(|i| i.data["state"] == "withdrawn")
+        })
+        .await;
+    assert_eq!(item(&returned, "draft").data["text"], "late return");
+    assert_eq!(item(&returned, "draft").data["version"], 1);
+}
+
+#[tokio::test]
 async fn a_late_withdrawal_failure_cannot_erase_confirmed_delivery() {
     let h = Harness::new(config()).await;
     let session = accepted_session(&h.create("late-withdraw", "ready").await);

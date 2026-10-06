@@ -358,6 +358,13 @@ pub enum FactBody {
     CanCancelQueued {
         available: bool,
     },
+    /// 此承载位的 hello、流水追平和未结票对账完成；本代恢复闸门据此放行。
+    Recovered,
+    /// Unknown 之后的新证据；不产生第二个终结结果，由原签发者更新当前结论。
+    Clarified {
+        ticket: Ticket,
+        outcome: Outcome,
+    },
     /// 一张票的终结结果。
     Done {
         ticket: Ticket,
@@ -494,6 +501,8 @@ pub struct CarrierRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTicket {
+    /// 已经终结为 Unknown；只对账，不重新执行。
+    pub unknown: bool,
     pub issued: Issued,
     pub act: Act,
 }
