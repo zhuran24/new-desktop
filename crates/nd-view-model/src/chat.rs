@@ -58,6 +58,8 @@ pub struct MessageView {
     pub text: String,
     pub status: String,
     pub markdown: bool,
+    pub blocks: Vec<crate::MessageBlock>,
+    pub attachments: Vec<nd_wire::Attachment>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConversationView {
@@ -135,6 +137,13 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                 }
                 .into(),
                 markdown: i.kind == "text",
+                blocks: crate::message_blocks(
+                    &i.kind,
+                    i.data["text"].as_str().unwrap_or(&i.fallback.text),
+                    &i.data["raw"],
+                ),
+                attachments: serde_json::from_value(i.data["attachments"].clone())
+                    .unwrap_or_default(),
                 status: if i.kind == "prompt" {
                     match i.data["state"].as_str() {
                         Some("held") => "代持中",
@@ -168,10 +177,26 @@ pub fn accepted(reply: &nd_wire::CommandReply) -> bool {
 
 #[derive(Clone, Debug, Default)]
 pub struct Draft {
+    attachments: Vec<nd_wire::Attachment>,
     text: String,
     revision: u64,
 }
 impl Draft {
+    pub fn attachments(&self) -> &[nd_wire::Attachment] {
+        &self.attachments
+    }
+    pub fn attach(&mut self, attachment: nd_wire::Attachment) {
+        if !self.attachments.contains(&attachment) {
+            self.attachments.push(attachment);
+            self.revision += 1;
+        }
+    }
+    pub fn detach(&mut self, index: usize) {
+        if index < self.attachments.len() {
+            self.attachments.remove(index);
+            self.revision += 1;
+        }
+    }
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -189,6 +214,10 @@ impl Draft {
             return false;
         }
         self.edit(String::new());
+        if !self.attachments.is_empty() {
+            self.attachments.clear();
+            self.revision += 1;
+        }
         true
     }
 }

@@ -1,4 +1,5 @@
 //! GPUI 适配层。能力视图经 Slots 登记，领域事实只来自 nd-wire。
+mod attachments;
 mod chat;
 pub mod composer;
 use gpui_kit::component::input::InputState;
@@ -30,6 +31,8 @@ pub struct Desktop {
     model_loading: bool,
     creating: bool,
     sending: bool,
+    uploading: usize,
+    images: std::collections::BTreeMap<String, Option<std::sync::Arc<Image>>>,
     drafts: std::collections::BTreeMap<Option<String>, nd_view_model::Draft>,
     subscriptions: Vec<Subscription>,
     composer: Entity<composer::Composer>,
@@ -139,6 +142,8 @@ impl Desktop {
             model_loading: false,
             creating: state.selected_session.is_none(),
             sending: false,
+            uploading: 0,
+            images: Default::default(),
             drafts: Default::default(),
             subscriptions: vec![],
             composer,
@@ -275,6 +280,7 @@ impl Render for Desktop {
         }
         let chat_sidebar = self.chat_sidebar(cx);
         let chat_content = self.chat_content(window, cx);
+        let attachments = self.draft_attachments(cx);
         let theme = &self.theme;
         div()
             .size_full()
@@ -356,7 +362,20 @@ impl Render for Desktop {
                             )
                             .child(
                                 div()
+                                    .id("attachment-drop")
+                                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                                        this.upload_attachments(
+                                            paths
+                                                .0
+                                                .iter()
+                                                .cloned()
+                                                .map(nd_ui_core::AttachmentSource::Path)
+                                                .collect(),
+                                            cx,
+                                        );
+                                    }))
                                     .p(px(theme.spacing.medium))
+                                    .child(attachments)
                                     .child(self.composer.clone()),
                             ),
                     )

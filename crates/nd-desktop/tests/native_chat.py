@@ -28,7 +28,7 @@ def inner():
         handles.extend([stdout, stderr])
         args = ['/nd-desktop', '--socket', socket, '--state', '/sandbox/state/ui.json', '--quit-after', '45']
         if create:
-            args += ['--scenario-create', json.dumps({'cwd': '/sandbox/project', 'model': 'haiku', 'text': '请写代码'})]
+            args += ['--scenario-create', json.dumps({'cwd': '/sandbox/project', 'model': 'haiku', 'text': '请写代码', 'attachments': settings.get('attachments', False)})]
         return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=dict(os.environ, WAYLAND_DEBUG='client'))
 
     def wait(name, predicate, timeout=40):
@@ -45,6 +45,7 @@ def inner():
                 if value is not None and predicate(value):
                     return value
             time.sleep(0.03)
+        screenshot('timeout')
         raise AssertionError(f'{name} never reached expected state: {(out / (name + ".jsonl")).read_text()[-4000:]}')
 
     def block(snapshot):
@@ -107,7 +108,11 @@ def run(args):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket)}))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'attachments': args.attachments}))
+        if args.attachments:
+            shutil.copy(Path(__file__).resolve().parents[2] / 'nd-daemon/tests/fixtures/preview.png', work / 'pixel.png')
+            (work / 'pasted.txt').write_text('复制文件里的中文正文')
+            (work / 'dropped.txt').write_text('拖入文件里的独立正文')
         (work / 'dbus.conf').write_text('<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen><policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/></policy></busconfig>')
         (work / 'session.sh').write_text('#!/bin/sh\nexec /usr/bin/python /scenario.py --inner\n')
         (work / 'session.sh').chmod(0o700)
@@ -148,4 +153,5 @@ if __name__ == '__main__':
         parser.add_argument('--desktop', required=True)
         parser.add_argument('--socket', required=True)
         parser.add_argument('--output', required=True)
+        parser.add_argument('--attachments', action='store_true')
         run(parser.parse_args())

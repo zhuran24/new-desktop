@@ -1,6 +1,6 @@
 # 桌面聊天界面
 
-日期：2026-10-06。状态：Claude 会话创建、侧栏、流式 Markdown/代码块和界面冷启动恢复已实现。真实输入法、上屏延迟、空闲 CPU 与真模型对话保留为人工验收。
+日期：2026-10-06。状态：Claude 会话创建、侧栏、流式 Markdown/代码块、附件、diff 和界面冷启动恢复已实现。真实输入法、上屏延迟、空闲 CPU 与真模型对话保留为人工验收。
 
 依赖锁定为 `gpui-pre 0.3.7` 和 gpui-kit Git 提交 `4c7f1350331562436df868c55ac33bebc4c6406c`。桌面 crate 属于 workspace，位于 `default-members` 之外；没有使用 ime-lab 观测补丁。
 
@@ -56,3 +56,11 @@ bash scripts/test-scenarios.sh
 脚本自动构建 scenarios 版桌面并设置 `ND_TEST_DESKTOP`。可设 `ND_NATIVE_OUTPUT=/mnt/wd_external/nd-build/tmp/ticket-14/native` 保留截图和清理记录。测试需要 KWin、Spectacle、bwrap、systemd 用户实例及 `/dev/dri`，不操作 owner 的显示会话。每场景断网、临时 HOME/CLAUDE_CONFIG_DIR/XDG、独立限额 slice；模型只访问离线伪端点。
 
 `scenarios` 下的 stdout 副本观测和 `--scenario-create` 仅用于上述隔离测试；生产构建没有自动输入入口、不打印对话。原生冒烟不能证明豆包/Rime、真实上屏性能、静止 CPU 或真模型服务。
+
+## 附件与 diff
+
+粘贴图片、复制文件后粘贴，或拖到输入区，上传完成后可发送。支持 PNG/JPEG/GIF/WebP、PDF、UTF-8 文本，每个最多 5 MiB、每条最多 8 个且总计不超过 16 MiB。只有附件也能发送。失败保留草稿；移除只影响当前草稿。发送后的图片从守护进程加载，其他文件保留名称和散列引用。Wayland 复制文件粘贴需要 `wl-clipboard`（`/usr/bin/wl-paste`），图片/文字由 Kit 处理，拖放无需该程序。
+
+正文中的 diff/patch 围栏与 Edit 替换片段显示增删、行号和无末尾换行标记。Edit 行号是片段内的位置。diff 颜色由 `Theme.colors.diff_added/diff_removed` 提供。详情、协议字段和证明边界见 [#17 验证](../../docs/verification/ticket-17.md)。
+
+`CommandClient::upload(AttachmentSource)` 与 `blob` 使用同一个 nd-wire UDS 的 HTTP 通道；没有桌面私有文件发送路径。输入框只发一次 `ComposerEvent::Attach`，宿主仍只有原来的一个 Submit 接收者。未发送草稿的持久所有权由 #16 接续。

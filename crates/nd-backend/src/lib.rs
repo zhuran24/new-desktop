@@ -170,6 +170,8 @@ pub enum EndHow {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Msg {
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
     pub text: String,
     pub intent: Intent,
 }

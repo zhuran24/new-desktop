@@ -143,6 +143,7 @@ fn simple_and_incremental_projections_agree_on_the_recorded_conversation() {
     for fact in replay(&records).into_iter().flatten() {
         match fact {
             Convo::Written { uuid } => log.push(Shown::Prompt {
+                attachments: vec![],
                 id: uuid.clone(),
                 text: "…".into(),
                 intent: "fold".into(),
@@ -151,6 +152,7 @@ fn simple_and_incremental_projections_agree_on_the_recorded_conversation() {
                 reason: None,
             }),
             Convo::Echo { uuid } => log.push(Shown::Prompt {
+                attachments: vec![],
                 id: uuid.clone(),
                 text: "…".into(),
                 intent: "fold".into(),

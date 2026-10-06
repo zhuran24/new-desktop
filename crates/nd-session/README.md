@@ -8,7 +8,7 @@
 
 | 接口 | 用法 |
 |---|---|
-| `Sessions::new(store, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
+| `Sessions::new(store, blobs, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
 | `Sessions::recover()` | 守护进程启动时装载有活进程、进行中操作或未结票的会话，交端口 `adopt` 对账 |
 | `Sessions::execute(&Command)` | `session.create`、`session.send`；不是会话命令时返回 None |
 | `Sessions::subscribe(&SessionId, since)` | `session/<id>` 流：快照或同纪元续上的事件，外加 `WatchGuard`（持有期间算「有人在看」） |

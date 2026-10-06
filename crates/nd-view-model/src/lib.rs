@@ -36,3 +36,6 @@ pub fn project(snapshot: &nd_wire::Snapshot, state: &ViewState) -> View {
             .collect(),
     }
 }
+
+mod diff;
+pub use diff::*;

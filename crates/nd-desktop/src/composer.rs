@@ -7,6 +7,7 @@ use nd_view_model::Theme;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposerEvent {
     Changed(ComposerState),
+    Attach(Vec<nd_ui_core::AttachmentSource>),
     Action(ComposerAction),
 }
 
@@ -16,6 +17,10 @@ pub struct Composer {
     input: Entity<TextareaState>,
     theme: Theme,
     send_enabled: bool,
+    has_attachments: bool,
+    paste_native: bool,
+    paste_pending: bool,
+    paste_generation: u64,
     pressed: [bool; 2],
     _subscriptions: Vec<Subscription>,
 }
@@ -78,6 +83,10 @@ impl Composer {
             input,
             theme,
             send_enabled: false,
+            has_attachments: false,
+            paste_native: false,
+            paste_pending: false,
+            paste_generation: 0,
             pressed: [false; 2],
             _subscriptions: vec![changed, keys],
         }
@@ -92,12 +101,22 @@ impl Composer {
     pub fn snapshot(&self, window: &mut Window, cx: &mut App) -> ComposerState {
         self.input.update(cx, |input, cx| ComposerState {
             text: input.value().to_string(),
+            has_attachments: self.has_attachments,
             composing: input.marked_text_range(window, cx).is_some(),
             focused: input.focus_handle(cx).is_focused(window),
             send_enabled: self.send_enabled,
         })
     }
 
+    /// 宿主换草稿时撤销尚未完成的剪贴板读取，即使两份草稿的文字相同。
+    pub fn cancel_pending_paste(&mut self) {
+        self.paste_generation += 1;
+        self.paste_pending = false;
+    }
+    pub fn set_has_attachments(&mut self, present: bool, cx: &mut Context<Self>) {
+        self.has_attachments = present;
+        cx.notify();
+    }
     pub fn set_send_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.send_enabled = enabled;
         cx.notify();
@@ -111,6 +130,64 @@ impl Composer {
     /// 按钮、命令面板和其他发送入口必须共用此组词守卫。
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(InputEvent::Submit, window, cx);
+    }
+
+    /// 固定 GPUI 的 Wayland clipboard 只解文本/图片；文件 MIME 在这里补上。
+    /// 查询在后台限时执行，普通文本/图片仍由 Kit 的原生 Paste 处理。
+    fn paste(
+        &mut self,
+        _: &gpui_kit::component::input::Paste,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if std::mem::take(&mut self.paste_native) || std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            cx.propagate();
+            return;
+        }
+        let state = self.snapshot(window, cx);
+        if state.composing {
+            cx.propagate();
+            return;
+        }
+        cx.stop_propagation();
+        if self.paste_pending {
+            return;
+        }
+        self.paste_pending = true;
+        let selection = self.input.read(cx).selected_range();
+        let generation = self.paste_generation;
+        cx.spawn_in(window, async move |weak, cx| {
+            let paths = cx
+                .background_executor()
+                .spawn(async { wayland_files() })
+                .await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                if generation != this.paste_generation {
+                    return;
+                }
+                this.paste_pending = false;
+                let current = this.snapshot(window, cx);
+                if current.composing
+                    || !current.focused
+                    || current.text != state.text
+                    || this.input.read(cx).selected_range() != selection
+                {
+                    return;
+                }
+                if let Some(paths) = paths {
+                    cx.emit(ComposerEvent::Attach(
+                        paths
+                            .into_iter()
+                            .map(nd_ui_core::AttachmentSource::Path)
+                            .collect(),
+                    ));
+                } else {
+                    this.paste_native = true;
+                    window.dispatch_action(Box::new(gpui_kit::component::input::Paste), cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn dispatch(&mut self, event: InputEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -136,6 +213,7 @@ impl Render for Composer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = &self.theme;
         div()
+            .capture_action(cx.listener(Self::paste))
             .flex()
             .flex_col()
             .gap(px(t.spacing.small))
@@ -160,7 +238,40 @@ impl Render for Composer {
                     .bordered(false)
                     .p(px(t.spacing.small))
                     .text_size(px(t.typography.body))
-                    .aria_label("消息输入框"),
+                    .aria_label("消息输入框")
+                    .on_paste({
+                        let weak = cx.entity().downgrade();
+                        move |clipboard, _, cx| {
+                            let sources: Vec<_> = clipboard
+                                .entries
+                                .iter()
+                                .flat_map(|entry| match entry {
+                                    ClipboardEntry::Image(image) => {
+                                        vec![nd_ui_core::AttachmentSource::Bytes {
+                                            name: format!(
+                                                "粘贴图片.{}",
+                                                image.format().extension()
+                                            ),
+                                            bytes: image.bytes().to_vec(),
+                                        }]
+                                    }
+                                    ClipboardEntry::ExternalPaths(paths) => paths
+                                        .0
+                                        .iter()
+                                        .cloned()
+                                        .map(nd_ui_core::AttachmentSource::Path)
+                                        .collect(),
+                                    _ => vec![],
+                                })
+                                .collect();
+                            if sources.is_empty() {
+                                return false;
+                            }
+                            let _ =
+                                weak.update(cx, |_, cx| cx.emit(ComposerEvent::Attach(sources)));
+                            true
+                        }
+                    }),
             )
             .child(
                 div()
@@ -200,4 +311,51 @@ fn key_index(key: Key) -> usize {
         Key::Enter => 0,
         Key::Escape => 1,
     }
+}
+
+fn wayland_files() -> Option<Vec<std::path::PathBuf>> {
+    use std::{
+        io::Read,
+        process::{Command, Stdio},
+    };
+    // 不继承模型环境，也不启动 shell；只读当前桌面剪贴板。
+    let mut command = Command::new("/usr/bin/timeout");
+    command
+        .args([
+            "2",
+            "/usr/bin/wl-paste",
+            "--type",
+            "text/uri-list",
+            "--no-newline",
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for key in ["XDG_RUNTIME_DIR", "WAYLAND_DISPLAY"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let mut child = command.spawn().ok()?;
+    let mut bytes = vec![];
+    let read = child
+        .stdout
+        .take()?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes);
+    if bytes.len() > 64 * 1024 {
+        let _ = child.kill();
+    }
+    let status = child.wait().ok()?;
+    if read.is_err() || !status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let paths: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| url::Url::parse(line.trim()).ok()?.to_file_path().ok())
+        .collect();
+    (!paths.is_empty()).then_some(paths)
 }

@@ -31,6 +31,7 @@ impl Desktop {
                 .timer(std::time::Duration::from_millis(100))
                 .await;
             weak.update(cx, |this, cx| this.load_models(cx)).unwrap();
+            let mut attach_stage = 0;
             for _ in 0..500 {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(100))
@@ -47,6 +48,43 @@ impl Desktop {
                             this.warning
                         );
                         this.model = Some(value.into());
+                        if plan["attachments"] == true {
+                            println!("{}", json!({"attachment_stage":attach_stage,"uploading":this.uploading,"attached":this.drafts.get(&None).map(|d| d.attachments().len()),"warning":this.warning}));
+                        }
+                        if plan["attachments"] == true && attach_stage < 6 {
+                            this.composer
+                                .read(cx)
+                                .editor()
+                                .clone()
+                                .update(cx, |input, cx| input.focus(window, cx));
+                            let bounds = window.viewport_size();
+                            let position = point(bounds.width / 2., bounds.height - px(this.theme.spacing.large * 3.));
+                            match attach_stage {
+                                0 => {
+                                    assert!(std::process::Command::new("wl-copy").args(["--type", "image/png"]).stdin(std::fs::File::open("/sandbox/pixel.png").unwrap()).status().unwrap().success());
+                                }
+                                1 | 3 => window.dispatch_action(Box::new(gpui_kit::component::input::Paste), cx),
+                                2 => {
+                                    assert!(std::process::Command::new("wl-copy").args(["--type", "text/uri-list", "file:///sandbox/pasted.txt"]).status().unwrap().success());
+                                }
+                                4 => {
+                                    window.defer(cx, move |window, cx| { window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Entered { position, paths: ExternalPaths([std::path::PathBuf::from("/sandbox/dropped.txt")].into_iter().collect()) }), cx); });
+                                }
+                                5 => { window.defer(cx, move |window, cx| { window.dispatch_event(PlatformInput::FileDrop(FileDropEvent::Submit { position }), cx); }); }
+                                _ => unreachable!(),
+                            }
+                            attach_stage += 1;
+                            return false;
+                        }
+                        if plan["attachments"] == true
+                            && (this.uploading > 0
+                                || this
+                                    .drafts
+                                    .get(&None)
+                                    .is_none_or(|d| d.attachments().len() != 3))
+                        {
+                            return false;
+                        }
                         this.refresh_send(cx);
                         let composer = this.composer.clone();
                         composer.update(cx, |composer, cx| {
@@ -72,6 +110,7 @@ impl Desktop {
             &self.composer,
             window,
             |this, _, event, window, cx| match event {
+                ComposerEvent::Attach(sources) => this.upload_attachments(sources.clone(), cx),
                 ComposerEvent::Changed(state) => {
                     let key = this.draft_key();
                     this.drafts.entry(key).or_default().edit(state.text.clone());
@@ -102,7 +141,7 @@ impl Desktop {
             self.select_session(session, window, cx);
         }
     }
-    fn draft_key(&self) -> Option<String> {
+    pub(crate) fn draft_key(&self) -> Option<String> {
         if self.creating {
             None
         } else {
@@ -110,6 +149,7 @@ impl Desktop {
         }
     }
     fn restore_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |c, _| c.cancel_pending_paste());
         let text = self
             .drafts
             .entry(self.draft_key())
@@ -124,6 +164,7 @@ impl Desktop {
     }
     pub(crate) fn refresh_send(&mut self, cx: &mut Context<Self>) {
         let enabled = !self.sending
+            && self.uploading == 0
             && self.snapshot.is_some()
             && if self.creating {
                 self.model_cwd.as_deref() == Some(self.directory.read(cx).value().as_ref())
@@ -136,8 +177,14 @@ impl Desktop {
                     .as_ref()
                     .is_some_and(|s| conversation(s).can_send)
             };
-        self.composer
-            .update(cx, |c, cx| c.set_send_enabled(enabled, cx));
+        let has_attachments = self
+            .drafts
+            .get(&self.draft_key())
+            .is_some_and(|d| !d.attachments().is_empty());
+        self.composer.update(cx, |c, cx| {
+            c.set_has_attachments(has_attachments, cx);
+            c.set_send_enabled(enabled, cx);
+        });
     }
     pub fn begin_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.scroll = ScrollHandle::new();
@@ -178,6 +225,17 @@ impl Desktop {
                                                 <= px(this.theme.spacing.small)
                                         {
                                             this.scroll.scroll_to_bottom();
+                                        }
+                                        let attachments: Vec<_> = nd_view_model::conversation(&s)
+                                            .messages
+                                            .into_iter()
+                                            .rev()
+                                            .flat_map(|m| m.attachments)
+                                            .filter(|a| a.media_type.starts_with("image/"))
+                                            .take(8)
+                                            .collect();
+                                        for attachment in attachments {
+                                            this.load_attachment_image(&attachment, cx);
                                         }
                                         this.session_snapshot = Some(s);
                                     }
@@ -250,6 +308,7 @@ impl Desktop {
         let draft = self.drafts.entry(key.clone()).or_default();
         draft.edit(text.clone());
         let revision = draft.revision();
+        let attachments = draft.attachments().to_vec();
         let command = Command {
             id: uuid::Uuid::new_v4().to_string(),
             device: "desktop".into(),
@@ -261,9 +320,9 @@ impl Desktop {
             }
             .into(),
             args: if self.creating {
-                json!({"cwd":self.directory.read(cx).value().to_string(), "model":self.model, "text":text})
+                json!({"cwd":self.directory.read(cx).value().to_string(), "model":self.model, "text":text,"attachments":attachments})
             } else {
-                json!({"session":key, "text":text})
+                json!({"session":key, "text":text,"attachments":attachments})
             },
         };
         self.sending = true;
@@ -465,32 +524,28 @@ impl Desktop {
                 ));
                 continue;
             }
-            let body = if message.markdown {
-                TextView::markdown(
-                    SharedString::from(format!("{}/{}", snapshot.stream, message.id)),
-                    message.text,
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap(px(t.spacing.small))
+                .children(
+                    (if message.kind == "op" {
+                        vec![nd_view_model::MessageBlock::Plain(message.text.clone())]
+                    } else {
+                        message.blocks
+                    })
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, block)| {
+                        render_block(format!("{}/{}/{n}", snapshot.stream, message.id), block, t)
+                    }),
                 )
-                .selectable(true)
-                .on_link_click(|url, _, _, cx| {
-                    if url.starts_with("https://") || url.starts_with("http://") {
-                        cx.open_url(url);
-                    }
-                })
-                .style(TextViewStyle {
-                    paragraph_gap: rems(t.spacing.medium / t.typography.body),
-                    heading_base_font_size: px(t.typography.title),
-                    code_block: StyleRefinement::default()
-                        .bg(rgba(t.colors.background))
-                        .p(px(t.spacing.small))
-                        .rounded(px(t.radius))
-                        .font_family(t.typography.mono_family.clone())
-                        .text_size(px(t.typography.body)),
-                    ..Default::default()
-                })
-                .into_any_element()
-            } else {
-                div().child(message.text).into_any_element()
-            };
+                .children(
+                    message
+                        .attachments
+                        .iter()
+                        .map(|a| self.attachment_view(a, cx)),
+                );
             items.push(
                 div()
                     .id(SharedString::from(message.id))
@@ -517,5 +572,66 @@ impl Desktop {
             .child(div().text_color(rgba(t.colors.muted)).child(view.header))
             .children(items)
             .into_any_element()
+    }
+}
+
+fn render_block(
+    id: String,
+    block: nd_view_model::MessageBlock,
+    t: &nd_view_model::Theme,
+) -> AnyElement {
+    use nd_view_model::{DiffKind, MessageBlock};
+    match block {
+        MessageBlock::Markdown(text) => TextView::markdown(SharedString::from(id), text)
+            .selectable(true)
+            .on_link_click(|url, _, _, cx| {
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    cx.open_url(url);
+                }
+            })
+            .style(TextViewStyle {
+                paragraph_gap: rems(t.spacing.medium / t.typography.body),
+                heading_base_font_size: px(t.typography.title),
+                code_block: StyleRefinement::default()
+                    .bg(rgba(t.colors.background))
+                    .p(px(t.spacing.small))
+                    .rounded(px(t.radius))
+                    .font_family(t.typography.mono_family.clone())
+                    .text_size(px(t.typography.body)),
+                ..Default::default()
+            })
+            .into_any_element(),
+        MessageBlock::Plain(text) => div().child(text).into_any_element(),
+        MessageBlock::Diff(lines) => div()
+            .id(SharedString::from(id))
+            .overflow_x_scroll()
+            .flex()
+            .flex_col()
+            .bg(rgba(t.colors.background))
+            .p(px(t.spacing.small))
+            .rounded(px(t.radius))
+            .font_family(t.typography.mono_family.clone())
+            .text_size(px(t.typography.body))
+            .children(lines.into_iter().map(|line| {
+                let color = match line.kind {
+                    DiffKind::Added => t.colors.diff_added,
+                    DiffKind::Removed => t.colors.diff_removed,
+                    DiffKind::Hunk => t.colors.accent,
+                    DiffKind::Header | DiffKind::Notice => t.colors.muted,
+                    DiffKind::Context => t.colors.foreground,
+                };
+                div()
+                    .flex()
+                    .gap(px(t.spacing.small))
+                    .text_color(rgba(color))
+                    .whitespace_nowrap()
+                    .child(format!(
+                        "{:>5} {:>5}",
+                        line.old.map(|n| n.to_string()).unwrap_or_default(),
+                        line.new.map(|n| n.to_string()).unwrap_or_default()
+                    ))
+                    .child(line.text)
+            }))
+            .into_any_element(),
     }
 }

@@ -92,6 +92,8 @@ pub enum Issuer {
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
     pub id: String,
     pub text: String,
     pub intent: Intent,

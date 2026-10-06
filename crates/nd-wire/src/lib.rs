@@ -233,3 +233,45 @@ impl Command {
         )
     }
 }
+/// 附件正文经鉴权 HTTP GET/PUT，消息和草稿只携带内容寻址引用。
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct Attachment {
+    pub blob: String,
+    pub name: String,
+    pub media_type: String,
+    pub size: u64,
+}
+
+impl Attachment {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.blob.len() != 64
+            || !self
+                .blob
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("附件需要小写 SHA-256 内容散列".into());
+        }
+        if self.name.is_empty() || self.name.len() > 255 || self.name.chars().any(char::is_control)
+        {
+            return Err("附件名称为空、过长或含控制字符".into());
+        }
+        if !matches!(
+            self.media_type.as_str(),
+            "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp"
+                | "text/plain"
+                | "application/pdf"
+        ) {
+            return Err("不支持此附件类型".into());
+        }
+        if self.size == 0 || self.size > 5 * 1024 * 1024 {
+            return Err("单个附件须为 1 字节至 5 MiB".into());
+        }
+        Ok(())
+    }
+}

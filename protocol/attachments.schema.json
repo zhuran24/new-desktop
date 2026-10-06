@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Array_of_Attachment",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/Attachment"
+  },
+  "$defs": {
+    "Attachment": {
+      "description": "附件正文经鉴权 HTTP GET/PUT，消息和草稿只携带内容寻址引用。",
+      "type": "object",
+      "properties": {
+        "blob": {
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "blob",
+        "name",
+        "media_type",
+        "size"
+      ]
+    }
+  }
+}
