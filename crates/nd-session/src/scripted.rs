@@ -21,6 +21,7 @@ pub enum Reply {
     Ok,
     Fail(String),
     Unknown(String),
+    Lost(String),
     Hold,
 }
 
@@ -121,6 +122,29 @@ impl ScriptedAdapter {
     }
     pub fn live(&self) -> HashMap<CarrierId, RunId> {
         self.inner.lock().unwrap().live.clone()
+    }
+    /// 后端取得新证据，更新已报 Unknown 的票；可重复报告，执行器负责幂等。
+    pub fn clarify(&self, ticket: &Ticket, outcome: Outcome) {
+        let updated = {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .results
+                .get_mut(ticket)
+                .map(|(session, carrier, facts)| {
+                    let f = fact(
+                        &format!("clarified:{ticket}"),
+                        FactBody::Clarified {
+                            ticket: ticket.clone(),
+                            outcome,
+                        },
+                    );
+                    facts.push(f.clone());
+                    (session.clone(), carrier.clone(), f)
+                })
+        };
+        if let Some((session, carrier, f)) = updated {
+            self.deliver(&session, &carrier, vec![f]);
+        }
     }
     pub fn held(&self) -> Vec<(Ticket, Act)> {
         self.inner
@@ -296,6 +320,9 @@ impl ScriptedAdapter {
                 }
                 facts
             }
+            (_, Reply::Lost(evidence)) => vec![done(Outcome::Refused {
+                refusal: Refusal::Lost { evidence },
+            })],
             (_, Reply::Fail(why)) => vec![done(Outcome::failed(why))],
             (_, Reply::Unknown(why)) => vec![done(Outcome::Unknown { evidence: why })],
         };
@@ -340,6 +367,12 @@ impl BackendAdapter for ScriptedAdapter {
                 );
             }
         }
+        let recovered: std::collections::HashSet<_> = part
+            .carriers
+            .iter()
+            .map(|c| c.carrier.clone())
+            .chain(part.pending.iter().map(|p| p.act.carrier().clone()))
+            .collect();
         for pending in part.pending {
             let ticket = pending.issued.ticket.clone();
             let (seen, result, held) = {
@@ -376,6 +409,13 @@ impl BackendAdapter for ScriptedAdapter {
                     }
                 },
             }
+        }
+        for carrier in recovered {
+            self.deliver(
+                &part.session,
+                &carrier,
+                vec![fact("recovered", FactBody::Recovered)],
+            );
         }
     }
     fn act(&self, issued: Issued, act: Act) -> Admit {

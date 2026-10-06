@@ -244,15 +244,28 @@ pub struct Projection {
     next_seq: u64,
 }
 impl Projection {
-    /// 从显示缓存恢复（只有完整的条目落库）。
+    /// 从显示缓存恢复；检查点同时保存仍在生成中的累积正文。
     pub fn restore(items: Vec<(u64, Item)>) -> Self {
         let next_seq = items.iter().map(|(s, _)| *s).max().unwrap_or(0);
+        let streaming = items
+            .iter()
+            .filter(|(_, i)| i.data["complete"] == false)
+            .map(|(_, i)| {
+                (
+                    i.id.clone(),
+                    i.data["text"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
         Self {
             items: items
                 .into_iter()
-                .map(|(seq, item)| (item.id.clone(), (seq, item, true)))
+                .map(|(seq, item)| {
+                    let complete = item.data["complete"] != false;
+                    (item.id.clone(), (seq, item, complete))
+                })
                 .collect(),
-            streaming: BTreeMap::new(),
+            streaming,
             next_seq,
         }
     }

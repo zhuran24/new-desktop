@@ -20,11 +20,11 @@ use nd_store::{Store, Tx};
 use nd_wire::{Command, CommandReply, Item, Receipt};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -50,6 +50,7 @@ pub(crate) enum Input {
 pub(crate) struct Shared {
     pub feed: Mutex<Feed>,
     pub watchers: AtomicUsize,
+    pub adopted: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -96,6 +97,7 @@ pub(crate) struct Executor {
     idle_since: Option<Instant>,
     /// 新建的会话在第一次提交之后才交端口 adopt（之前收件地址无处可交）。
     adopt_pending: bool,
+    recovering: BTreeSet<nd_backend::CarrierId>,
 }
 
 const CRASH: &str = "nd-session: simulated crash";
@@ -137,6 +139,18 @@ impl Executor {
                 draft: core.draft.clone(),
             });
         }
+        let recovering = core
+            .carriers
+            .values()
+            .filter(|c| c.run.is_some())
+            .map(|c| c.id.clone())
+            .chain(
+                core.outbox
+                    .values()
+                    .chain(core.uncertain.values())
+                    .map(|r| r.act.carrier().clone()),
+            )
+            .collect();
         let this = Self {
             id,
             write_gen,
@@ -149,6 +163,7 @@ impl Executor {
             local: VecDeque::new(),
             idle_since: None,
             adopt_pending: false,
+            recovering,
         };
         if born {
             this.adopt();
@@ -161,7 +176,15 @@ impl Executor {
     }
 
     /// 本实例的流：纪元随实例换，快照从显示缓存起。
-    pub fn install_feed(&self) {
+    pub fn install_feed(&mut self) {
+        self.shared
+            .adopted
+            .store(self.recovering.is_empty(), Ordering::Release);
+        if self.born {
+            let mut data = header(&self.core);
+            data["recovering"] = json!(self.recovering());
+            self.projection.apply(&Shown::Header { data });
+        }
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -192,7 +215,8 @@ impl Executor {
             .core
             .outbox
             .values()
-            .filter(|r| r.outcome.is_none())
+            .chain(self.core.uncertain.values())
+            .filter(|r| r.outcome.is_none() || matches!(r.outcome, Some(Outcome::Unknown { .. })))
             .map(|r| PendingTicket {
                 issued: r.issued.clone(),
                 act: r.act.clone(),
@@ -213,6 +237,11 @@ impl Executor {
             },
             |c| kinds.get(c).cloned(),
         );
+    }
+
+    fn recovering(&self) -> bool {
+        !self.recovering.is_empty()
+            || self.deps.claims.recovery().ok() != Some(nd_claims::Recovery::Ready)
     }
 
     fn fault(&self, point: Fault) -> bool {
@@ -244,8 +273,14 @@ impl Executor {
         }
         // 外部条件变了，但没有在等它的操作或消息：不开事务。
         if let Input::Kick = input
+            && self.recovering.is_empty()
             && self.core.ops.is_empty()
             && self.core.messages.values().all(|m| m.ticket.is_some())
+            && self
+                .projection
+                .items()
+                .iter()
+                .any(|i| i.id == "header" && i.data["recovering"] == false)
         {
             return Flow::Continue;
         }
@@ -259,6 +294,7 @@ impl Executor {
         let mut fx = Effects::default();
         let mut live = vec![];
         let store = self.deps.store.clone();
+        let recovering_before = self.recovering.clone();
         let result = store.write(|tx| {
             if self.born && state::write_gen(tx, &self.id)? != Some(self.write_gen) {
                 return Err(aborted(FENCED));
@@ -278,6 +314,7 @@ impl Executor {
             Err(nd_store::Error::Aborted(why)) if why == CRASH => return Flow::Died,
             Err(e) => {
                 // 事务回滚：内存状态按库里的重新读回，不留半截改动。
+                self.recovering = recovering_before;
                 self.reload();
                 if let Some(reply) = reply {
                     let _ = reply.send(CommandReply::Unavailable {
@@ -328,6 +365,9 @@ impl Executor {
     }
 
     fn after_commit(&mut self, fx: Effects, live: Vec<Live>) {
+        self.shared
+            .adopted
+            .store(self.recovering.is_empty(), Ordering::Release);
         if std::mem::take(&mut self.adopt_pending) {
             // 新会话：只登记收件地址；这个事务里签发的票随后照常交出，不算恢复对账。
             self.deps.backends.adopt(
@@ -384,8 +424,12 @@ impl Executor {
         match work {
             Work::Command(command) => {
                 let keep = self.deps.config.receipt_keep_ms;
-                let reply =
-                    nd_ledger::execute(tx, &command, keep, |tx| self.command(tx, &command, fx))?;
+                let reply = nd_ledger::execute(tx, &command, keep, |tx| {
+                    if self.recovering() {
+                        return Err(aborted("守护进程恢复中，命令未受理"));
+                    }
+                    self.command(tx, &command, fx)
+                })?;
                 Ok(Some(reply))
             }
             Work::Batch(batch) => {
@@ -398,7 +442,8 @@ impl Executor {
             }
             Work::Kick => Ok(None),
             Work::Tick => {
-                if self.idle_due()
+                if !self.recovering()
+                    && self.idle_due()
                     && self.core.ops.is_empty()
                     && let Some(carrier) = self.core.current.clone()
                 {
@@ -417,6 +462,7 @@ impl Executor {
     ) -> nd_store::Result<Receipt> {
         match command.name.as_str() {
             "session.create" => self.create(tx, command, fx),
+            "session.resend" => self.resend(tx, command, fx),
             "session.draft.update" => {
                 let (Ok(args), Ok(expected)) = (
                     serde_json::from_value::<nd_wire::DraftUpdate>(command.args.clone()),
@@ -586,6 +632,46 @@ impl Executor {
         })
     }
 
+    fn resend(
+        &mut self,
+        tx: &mut Tx<'_>,
+        command: &Command,
+        fx: &mut Effects,
+    ) -> nd_store::Result<Receipt> {
+        let Some(id) = command.args["message"].as_str() else {
+            return Ok(rejected("invalid", json!({"need":["message"]})));
+        };
+        let Some(msg) = self.core.undelivered.get(id).cloned() else {
+            return Ok(rejected(
+                "precondition",
+                json!({"message":id,"reason":"尚未证实未送达，或已重发"}),
+            ));
+        };
+        let mut send = command.clone();
+        // 重发只重放已确认未送达的原消息，不消费界面当前草稿。
+        send.expect = json!({});
+        send.args =
+            json!({"text":msg.text,"intent":intent_name(msg.intent),"attachments":msg.attachments});
+        let receipt = self.send(tx, &send)?;
+        if matches!(receipt, Receipt::Done { .. }) {
+            self.core.undelivered.remove(id);
+            self.show(
+                tx,
+                fx,
+                Shown::Prompt {
+                    id: id.into(),
+                    text: msg.text,
+                    attachments: msg.attachments,
+                    intent: intent_name(msg.intent).into(),
+                    state: "resent".into(),
+                    native: None,
+                    reason: Some(format!("已由消息 {} 重发", command.id)),
+                },
+            )?;
+        }
+        Ok(receipt)
+    }
+
     fn send(&mut self, tx: &mut Tx<'_>, command: &Command) -> nd_store::Result<Receipt> {
         let status = self.core.meta().status;
         if status == Status::Withdrawn {
@@ -671,13 +757,32 @@ impl Executor {
         tx: &mut Tx<'_>,
         batch: Batch,
         fx: &mut Effects,
-        live: &mut Vec<Live>,
+        _live: &mut Vec<Live>,
     ) -> nd_store::Result<()> {
         if !self.born || !self.core.carriers.contains_key(&batch.carrier) {
             return Ok(());
         }
         for fact in batch.facts {
             match fact.body {
+                FactBody::Recovered => {
+                    self.recovering.remove(&batch.carrier);
+                }
+                FactBody::Clarified { ticket, outcome } => {
+                    if matches!(
+                        outcome,
+                        Outcome::Ok {
+                            done: Done::Landed { .. }
+                        } | Outcome::Refused {
+                            refusal: Refusal::Lost { .. }
+                        }
+                    ) && let Some(mut row) = self.core.uncertain.remove(&ticket)
+                    {
+                        row.outcome = None;
+                        self.core.outbox.insert(ticket.clone(), row);
+                        // 原操作若已收场，仅更新原消息证据，不能重新进入正向流程。
+                        self.record_outcome(tx, fx, &ticket, outcome)?;
+                    }
+                }
                 FactBody::Done { ticket, outcome } => {
                     self.record_outcome(tx, fx, &ticket, outcome)?
                 }
@@ -786,7 +891,15 @@ impl Executor {
                 },
             ));
         }
-        live.extend(batch.live);
+        // 检查点会越过本批及此前纯增量：同时保存累积条目，再允许看守回收这些行。
+        for Live::Delta { item, kind, text } in batch.live {
+            self.show(tx, fx, Shown::Delta { item, kind, text })?;
+        }
+        for (seq, item) in self.projection.items_with_seq() {
+            if item.data["complete"] == false {
+                state::put_item(tx, &self.id, &item, seq)?;
+            }
+        }
         Ok(())
     }
 
@@ -874,6 +987,7 @@ impl Executor {
                     done: Done::Landed { native },
                 } => ("landed", Some(native.clone()), None),
                 Outcome::Unknown { .. } => ("unknown", None, Some(outcome.reason())),
+                other if !other.possibly_applied() => ("not_delivered", None, Some(other.reason())),
                 other => ("failed", None, Some(other.reason())),
             };
             self.show(
@@ -889,6 +1003,22 @@ impl Executor {
                     reason,
                 },
             )?;
+        }
+        if let (Act::Send { msg, .. }, Some(display)) = (&row.act, &row.display)
+            && !outcome.possibly_applied()
+            && !matches!(
+                outcome,
+                Outcome::Refused {
+                    refusal: Refusal::Withheld
+                }
+            )
+        {
+            self.core.undelivered.insert(display.clone(), msg.clone());
+        }
+        if matches!(outcome, Outcome::Unknown { .. }) {
+            let mut uncertain = row.clone();
+            uncertain.outcome = Some(outcome.clone());
+            self.core.uncertain.insert(ticket.clone(), uncertain);
         }
         self.core.outbox.remove(ticket);
         match row.issuer {
@@ -930,9 +1060,6 @@ impl Executor {
                     }) = record.entries.get_mut(&key)
                 {
                     *ticket = None;
-                }
-                if retry {
-                    self.issue_op_act(tx, fx, &mut record, &key)?;
                 }
                 self.core.ops.insert(op, record);
             }
@@ -1022,6 +1149,9 @@ impl Executor {
     /// 引擎保证 G2：每个开事务的输入之后重跑所有进行中的操作，直到没有新的步；
     /// 发送台随之重排（新票、代持、按需拉起）。
     fn settle_all(&mut self, tx: &mut Tx<'_>, fx: &mut Effects) -> nd_store::Result<()> {
+        if self.recovering() {
+            return Ok(());
+        }
         for _ in 0..64 {
             let mut progress = false;
             let mut ids: Vec<String> = self.core.ops.keys().cloned().collect();
@@ -1764,7 +1894,8 @@ impl Executor {
                 draft: self.core.draft.clone(),
             },
         )?;
-        let header = header(&self.core);
+        let mut header = header(&self.core);
+        header["recovering"] = json!(self.recovering());
         self.show(tx, fx, Shown::Header { data: header })?;
         let lineage = &self.core.lineage;
         let rounds: Vec<_> = lineage

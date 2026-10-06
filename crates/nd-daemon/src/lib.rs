@@ -539,16 +539,22 @@ async fn assemble_sessions(
         },
     )?;
     sessions.recover()?;
-    // 两层恢复：身份已知 → 第一次注册表扫描完成；之后放行不再回 Recovering。
-    tokio::task::spawn_blocking(move || -> nd_store::Result<()> {
-        claims.observe(nd_claims::Observed::Recovered)?;
-        // 扫描失败（半文件、读不了）时登记停在 Checking，由它自己的线程按时重扫；不挡守护进程起来。
-        if let Err(e) = claims.refresh() {
-            eprintln!("CLI 注册表第一次扫描没完成：{e}");
+    // 监听可先提供快照与收据；新操作在来源追平、身份已知、首轮扫描完成之前回 unavailable。
+    let recovering_sessions = sessions.clone();
+    tokio::spawn(async move {
+        while !recovering_sessions.adopted() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        Ok(())
-    })
-    .await??;
+        let _ = tokio::task::spawn_blocking(move || -> nd_store::Result<()> {
+            claims.observe(nd_claims::Observed::Recovered)?;
+            // 扫描失败仍停在 Checking，独占登记自己的线程继续重扫。
+            if let Err(e) = claims.refresh() {
+                eprintln!("CLI 注册表第一次扫描没完成：{e}");
+            }
+            Ok(())
+        })
+        .await;
+    });
     Ok(sessions)
 }
 
