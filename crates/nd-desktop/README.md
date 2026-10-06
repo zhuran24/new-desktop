@@ -1,51 +1,58 @@
-# 桌面界面外壳
+# 桌面聊天界面
 
-GPUI 原生窗口，依赖锁定为 `gpui-pre 0.3.7` 和 gpui-kit Git 提交 `4c7f1350331562436df868c55ac33bebc4c6406c`。桌面 crate 属于 workspace，但不在 `default-members` 中。没有使用 ime-lab 的观测补丁。
+日期：2026-10-06。状态：Claude 会话创建、侧栏、流式 Markdown/代码块和界面冷启动恢复已实现。真实输入法、上屏延迟、空闲 CPU 与真模型对话保留为人工验收。
 
-当前显示 `global` 流的快照及未知条目的后备文字。底部提供产品输入框；会话发送和历史视图由后续能力组件接入。输入框接口、测试和离线真机验收见 [桌面输入框](COMPOSER.md)。
+依赖锁定为 `gpui-pre 0.3.7` 和 gpui-kit Git 提交 `4c7f1350331562436df868c55ac33bebc4c6406c`。桌面 crate 属于 workspace，位于 `default-members` 之外；没有使用 ime-lab 观测补丁。
 
-## 构建与运行
+## 构建与使用
 
-在自己的工作树内执行；构建资源约定见实施资料 `research/impl/BUILD.md`。
+在自己的工作树内执行；构建资源照实施资料 `research/impl/BUILD.md`。
 
 ```sh
-export CARGO_TARGET_DIR=/mnt/wd_external/nd-build/target/ticket-7
+export CARGO_TARGET_DIR=/mnt/wd_external/nd-build/target/ticket-14
 export CARGO_BUILD_JOBS=6
 systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
   cargo build -p nd-desktop --locked
-"$CARGO_TARGET_DIR/debug/nd-desktop"
+"$CARGO_TARGET_DIR/debug/nd-desktop" --socket /path/to/nd.sock --state /path/to/ui.json
 ```
 
-默认连接 `$XDG_RUNTIME_DIR/new-desktop/nd.sock`；每设备视图状态位于 `$XDG_STATE_HOME/new-desktop/ui.json`，未设 XDG_STATE_HOME 时使用 `~/.local/state/new-desktop/ui.json`。可用 `--socket PATH --state PATH` 连接隔离实例；`--quit-after SECONDS` 用于窗口冒烟。第二个使用同一状态文件的界面会被写锁拒绝，独立窗口应使用不同的状态文件。
+守护进程的 Claude 和看守配置见[守护进程说明](../nd-daemon/README.md#会话与-claude-后端)。桌面不负责启动或停止守护进程。
 
-界面只连接守护进程，不负责拉起或停止它。网络不可达时后台重试；冷启动不使用磁盘游标，每次先订阅完整快照。内存副本仍在的短断线使用 `SyncReplica` 的恢复规则，纪元变化时取新快照。关窗只交还连接。
+1. 点击「新建会话」，填写守护进程可见的工作目录绝对路径。
+2. 点击「获取后端模型列表」，选择 CLI 返回的可用模型。修改目录后旧列表失效，需要重新获取；目录不存在、后端未配置或查询失败时提示原因并禁止创建，不填入猜测的模型。
+3. 在下方输入首条消息，Enter 或发送按钮提交。等待明确受理时保留正文；新建成功自动选中会话。侧栏显示准备中、可对话、部分完成，以及撤掉会话的一次性失败提示。
+4. 点击侧栏切换会话，继续输入消息。正文按 `data.seq` 排列；增量和完整块共用身份，完整块替换累计文字。Markdown 支持未闭合的流式代码围栏；未知条目保留后备文字。停在底部时跟随新输出，上滚阅读时保持位置。
 
-## 能力视图接口
+Enter 组词保护和 Shift/Alt+Enter 换行复用产品输入框，见 [COMPOSER.md](COMPOSER.md)。当前发送使用默认意图 `fold`；三种意图、撤回与停止回合的交互归 #18。部分完成的创建保留原因，当前禁止继续发送，未决处置入口归 #33。内存草稿按会话保留，持久草稿归 #16；长历史分页、虚拟化与滚动锚点归 #20。
 
-- `nd-view-model::Slots<T>`：`Sidebar`、`Item(kind)`、`Header`、`RightPanel`、`Settings`、`CommandPalette`。`register` 返回守卫，Drop 同步撤销；外壳等内核变化通知后重绘，不轮询。每帧按顺序和能力名取槽位；同类条目有多个渲染器时取第一个。
-- `Desktop::slots` 的值类型是 `Renderer`：`Rc<dyn Fn(&Presentation, &mut Window, &mut App) -> AnyElement>`。`Presentation` 含当前快照、视图状态、主题及可选条目。未知种类没有渲染器时显示 `fallback.title/text`。
-- 可选组件使用 `Desktop::configure_component(name, contributions, enabled, cx)`。启用状态写入 `ViewState.components`；卸下撤销全部槽位，名称冲突返回错误并撤销本次部分登记。直接登记的组件自己持有守卫。内置 `overview` 组件提供空会话提示和“本机”徽章。
-- `Desktop::update_view_state` 修改窗口/分栏、选中会话、滚动锚点、会话树看法、活动面板等呈现偏好，并通知后台保存。`active_panel="settings"/"commands"` 时呈现对应槽位。这些偏好不改变守护进程事实。
-- `Desktop::set_theme` 应用完整主题变量并同步 Kit/Base 主题。外壳渲染的颜色、字体、字号、间距、圆角、边框、阴影都来自 `nd-view-model::Theme`；分栏宽度是用户的视图状态。#23 可从主题文件构造 Theme；文件监视、坏主题回退、跟随系统由 #23 实现。
+默认 socket 为 `$XDG_RUNTIME_DIR/new-desktop/nd.sock`。设备偏好位于 `$XDG_STATE_HOME/new-desktop/ui.json`，未设时为 `~/.local/state/new-desktop/ui.json`。`--socket`、`--state` 可连接隔离实例；`--quit-after` 用于冒烟。不同窗口应使用不同状态文件，文件锁保证每份偏好只有一个写入者。偏好不包含快照、纪元、游标或消息正文。
 
-`nd-ui-core::ReplicaFeed` 在专用 Tokio 线程驱动现有 `SyncReplica`，通过容量为 1 的队列送完整累计快照，供 GPUI 等任意 executor 等待。队列满时等待，不丢弃事实；守护进程因背压断开后仍经副本规则恢复。Drop 请求停止；`close().await` 等到尽力发送 Bye 并退出。现在外壳订阅 global；后续多流和命令队列应扩展这个同步层，继续复用 `SyncReplica::command/receipt/get`，不能在能力视图实现另一套协议或正文重发。
+## 接口与寿命
 
-状态文件持有独立锁，原子替换 JSON；写入在单独后台线程串行进行，只合并最新偏好。损坏文件在窗口底部显示提示并使用默认值。文件不保存快照、纪元或游标。
+- `nd-ui-core::ReplicaFeed`：专用 Tokio 线程驱动 `SyncReplica`；容量为 1 的通道传完整累计快照，满了就等待。外壳分别订阅 `global` 和选中会话的 `session/<id>`；切走会话即撤回旧订阅。冷启动必须取快照；已有副本的短断线由同步副本按游标恢复。关闭界面不结束后端。
+- `nd-ui-core::CommandClient`：容量为 8 的请求队列、独立 Tokio 线程；`models` 和 `command` 可在任意 executor 等待。所有命令复用 `SyncReplica::command` 的收据与断线规则；没有界面私有协议。模型查询不阻塞流式接收。
+- `nd-view-model::{sidebar, conversation}`：从公开快照生成显示数据；简单的完整投影保留作以后优化的差分基准。`Draft` 用修订号保护受理后的清空；新编辑、不同会话和未提交组词不能被旧收据清掉。
+- `Desktop::{begin_create, select_session}`：切换视图、草稿及订阅。会话选择应使用此入口；`update_view_state` 用于其他设备偏好。`composer()` 返回已接好发送者的输入框，不应重复订阅发送。
+- `Desktop::slots` 的 `Renderer` 接收 `Presentation{snapshot,state,theme,item}`。会话条目的快照为会话流；外壳槽位为 global。`Sidebar`、`Item(kind)`、`Header`、`RightPanel`、`Settings`、`CommandPalette` 保留，条目渲染器优先于内置 Markdown/后备文本。
+- 可选组件用 `configure_component(name, contributions, enabled, cx)`，卸下全部撤销；内置 `overview` 只提供「本机」徽章。聊天是常驻外壳能力。本单不新增会话结构操作，创建与发送沿用 #13 的引擎和崩溃矩阵。
+- `set_theme` 同时投影应用与 Kit/Base 主题。颜色、字体、字号、间距、圆角、边框都取主题变量。主题文件加载和错误回退由 #23 实现。
+
+## 模型目录
+
+新增 nd-wire 请求 `models{id,backend,cwd}`，返回 `Reply.value: Model[]`。`Model{value,label,description,disabled}` 的 Rust 定义在 `nd-wire`，Schema 为 `protocol/models.schema.json`；`value` 必须原样用于创建，不能把 label 当模型 ID。首次创建前就可查询，无需现有会话。
+
+守护进程经 `Sessions → Backends → BackendAdapter::models` 查询。Claude 适配在目标目录启动短命辅助进程，使用固定启动环境和两个 mod；等待 hello 后仅发送 initialize，读取 `models[]`/`unavailable_models[]`。辅助进程在守护进程 cgroup 内，报 Up/Gone，查询结束确认退出并撤回 mod 登记；不发提示、不走看守、不写产品会话。关闭查询连接不打断清理。完整账号/额度和通用辅助进程管理归 #30 及辅助进程相关工单。
 
 ## 自动验证
 
 ```sh
 systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
   cargo test --workspace --locked
-systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
-  cargo test -p nd-daemon --features scenarios --test desktop --locked
-systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
-  cargo build -p nd-desktop -p nd-daemon --features nd-desktop/scenarios --locked
-python crates/nd-desktop/tests/native_smoke.py \
-  --bin-dir "$CARGO_TARGET_DIR/debug" \
-  --output /mnt/wd_external/nd-build/tmp/ticket-7/native
+bash scripts/test-scenarios.sh
 ```
 
-主接缝测试使用真守护进程、SQLite、UDS、systemd 和断网沙盒。原生冒烟另起私有 D-Bus 和虚拟 KWin，运行真 GPUI 窗口；比较渲染时的快照与独立 ndctl 查询，杀界面、重启守护进程，检查 Wayland 缓冲提交并保存明暗截图。所有 HOME/XDG/CLI 配置都隔离，单元以 `nd-test-` 开头，运行后清理。需要本机 KWin、Spectacle、bwrap 和 `/dev/dri`；它不会向日常桌面发送输入。
+`nd-daemon/tests/sessions.rs` 的 #14 场景通过真实守护进程、CLI 2.1.289、两个 mod、看守、systemd 与 SQLite 验证模型目录、流式冷启动和第二轮对话。`native_chat_window_creates_and_recovers_during_streaming_markdown` 另起私有 D-Bus/虚拟 KWin，通过真实 GPUI 创建表单和 Composer 提交消息，流式代码块期间 SIGKILL 界面并重开，保存明暗截图和实际 Wayland 缓冲提交证据。
 
-`scenarios` 仅测试构建启用，提供渲染快照观测 stdout；生产构建不输出会话数据。该冒烟不证明真实输入法、端到端输入延迟、空闲 CPU 或真模型对话。
+脚本自动构建 scenarios 版桌面并设置 `ND_TEST_DESKTOP`。可设 `ND_NATIVE_OUTPUT=/mnt/wd_external/nd-build/tmp/ticket-14/native` 保留截图和清理记录。测试需要 KWin、Spectacle、bwrap、systemd 用户实例及 `/dev/dri`，不操作 owner 的显示会话。每场景断网、临时 HOME/CLAUDE_CONFIG_DIR/XDG、独立限额 slice；模型只访问离线伪端点。
+
+`scenarios` 下的 stdout 副本观测和 `--scenario-create` 仅用于上述隔离测试；生产构建没有自动输入入口、不打印对话。原生冒烟不能证明豆包/Rime、真实上屏性能、静止 CPU 或真模型服务。

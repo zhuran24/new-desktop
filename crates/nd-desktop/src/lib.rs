@@ -1,5 +1,7 @@
 //! GPUI 适配层。能力视图经 Slots 登记，领域事实只来自 nd-wire。
+mod chat;
 pub mod composer;
+use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
 use nd_view_model::{Contribution, Slot, Slots, Theme, ThemeMode, ViewState};
@@ -15,6 +17,21 @@ pub struct Presentation<'a> {
 }
 
 pub struct Desktop {
+    socket: PathBuf,
+    client: nd_ui_core::CommandClient,
+    session_snapshot: Option<Snapshot>,
+    session_feed: Option<Task<()>>,
+    scroll: ScrollHandle,
+    directory: Entity<InputState>,
+    models: Vec<nd_wire::Model>,
+    model: Option<String>,
+    model_cwd: Option<String>,
+    model_generation: u64,
+    model_loading: bool,
+    creating: bool,
+    sending: bool,
+    drafts: std::collections::BTreeMap<Option<String>, nd_view_model::Draft>,
+    subscriptions: Vec<Subscription>,
     composer: Entity<composer::Composer>,
     state: ViewState,
     theme: Theme,
@@ -28,6 +45,8 @@ pub struct Desktop {
     _bounds: Subscription,
     #[cfg(feature = "scenarios")]
     last_report: Option<Snapshot>,
+    #[cfg(feature = "scenarios")]
+    last_session_report: Option<Snapshot>,
 }
 impl Desktop {
     pub fn new(
@@ -38,7 +57,8 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> std::io::Result<Self> {
-        let mut feed = ReplicaFeed::start(socket, "global")?;
+        let mut feed = ReplicaFeed::start(&socket, "global")?;
+        let client = nd_ui_core::CommandClient::start(&socket)?;
         let task = cx.spawn(async move |weak, cx| {
             while let Some(update) = feed.recv().await {
                 if weak
@@ -53,6 +73,7 @@ impl Desktop {
                                 this.status = format!("正在连接守护进程：{error}");
                             }
                         }
+                        this.refresh_send(cx);
                         cx.notify();
                     })
                     .is_err()
@@ -69,30 +90,17 @@ impl Desktop {
             this.save.send_replace(this.state.clone());
         });
         let mut slots = Slots::<Renderer>::default();
-        let overview: Vec<Contribution<Renderer>> = vec![
-            Contribution {
-                slot: Slot::Sidebar,
-                order: 0,
-                value: Rc::new(|p, _, _| {
-                    div()
-                        .p(px(p.theme.spacing.small))
-                        .text_color(rgba(p.theme.colors.muted))
-                        .child("暂无会话")
-                        .into_any_element()
-                }),
-            },
-            Contribution {
-                slot: Slot::Header,
-                order: 0,
-                value: Rc::new(|p, _, _| {
-                    div()
-                        .text_size(px(p.theme.typography.small))
-                        .text_color(rgba(p.theme.colors.muted))
-                        .child("本机")
-                        .into_any_element()
-                }),
-            },
-        ];
+        let overview: Vec<Contribution<Renderer>> = vec![Contribution {
+            slot: Slot::Header,
+            order: 0,
+            value: Rc::new(|p, _, _| {
+                div()
+                    .text_size(px(p.theme.typography.small))
+                    .text_color(rgba(p.theme.colors.muted))
+                    .child("本机")
+                    .into_any_element()
+            }),
+        }];
         slots
             .configure(
                 "overview",
@@ -116,7 +124,23 @@ impl Desktop {
         let theme = Theme::builtin(state.theme);
         apply_theme(&theme, cx);
         let composer = cx.new(|cx| composer::Composer::new(theme.clone(), window, cx));
-        Ok(Self {
+        let directory = cx.new(|cx| InputState::new(window, cx).placeholder("工作目录的绝对路径"));
+        let mut this = Self {
+            socket,
+            client,
+            session_snapshot: None,
+            session_feed: None,
+            scroll: ScrollHandle::new(),
+            directory,
+            models: vec![],
+            model: None,
+            model_cwd: None,
+            model_generation: 0,
+            model_loading: false,
+            creating: state.selected_session.is_none(),
+            sending: false,
+            drafts: Default::default(),
+            subscriptions: vec![],
             composer,
             state,
             theme,
@@ -130,12 +154,16 @@ impl Desktop {
             _bounds: bounds,
             #[cfg(feature = "scenarios")]
             last_report: None,
-        })
+            #[cfg(feature = "scenarios")]
+            last_session_report: None,
+        };
+        this.connect_chat(window, cx);
+        Ok(this)
     }
     pub fn state(&self) -> &ViewState {
         &self.state
     }
-    /// #14 订阅输入意图并接入同步副本；只在会话准入成立时启用发送。
+    /// 产品输入框；其动作已经接入同步副本，不应再登记一个发送者。
     pub fn composer(&self) -> &Entity<composer::Composer> {
         &self.composer
     }
@@ -230,7 +258,13 @@ impl Render for Desktop {
             }
             self.last_report = self.snapshot.clone();
         }
-        let theme = &self.theme;
+        #[cfg(feature = "scenarios")]
+        if self.session_snapshot != self.last_session_report {
+            if let Some(snapshot) = &self.session_snapshot {
+                println!("{}", serde_json::json!({"rendered_session": snapshot}));
+            }
+            self.last_session_report = self.session_snapshot.clone();
+        }
         let header = self.render_slots(Slot::Header, window, cx);
         let sidebar = self.render_slots(Slot::Sidebar, window, cx);
         let mut right = self.render_slots(Slot::RightPanel, window, cx);
@@ -239,46 +273,9 @@ impl Render for Desktop {
             Some("commands") => right.extend(self.render_slots(Slot::CommandPalette, window, cx)),
             _ => {}
         }
-        let mut items = Vec::new();
-        if let Some(snapshot) = &self.snapshot {
-            for item in nd_view_model::project(snapshot, &self.state).items {
-                let renderers = self.slots.values(&Slot::Item(item.kind.clone()));
-                if let Some(render) = renderers.first() {
-                    items.push(render(
-                        &Presentation {
-                            snapshot: Some(snapshot),
-                            state: &self.state,
-                            theme,
-                            item: Some(&item),
-                        },
-                        window,
-                        cx,
-                    ));
-                } else {
-                    items.push(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(theme.spacing.small))
-                            .p(px(theme.spacing.medium))
-                            .bg(rgba(theme.colors.surface))
-                            .border(px(theme.border_width))
-                            .border_color(rgba(theme.colors.border))
-                            .rounded(px(theme.radius))
-                            .shadow(vec![BoxShadow {
-                                inset: theme.shadow.inset,
-                                color: rgba(theme.shadow.color).into(),
-                                offset: point(px(theme.shadow.offset_x), px(theme.shadow.offset_y)),
-                                blur_radius: px(theme.shadow.blur),
-                                spread_radius: px(theme.shadow.spread),
-                            }])
-                            .child(div().text_size(px(theme.typography.body)).child(item.title))
-                            .child(div().text_color(rgba(theme.colors.muted)).child(item.text))
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
+        let chat_sidebar = self.chat_sidebar(cx);
+        let chat_content = self.chat_content(window, cx);
+        let theme = &self.theme;
         div()
             .size_full()
             .flex()
@@ -332,7 +329,10 @@ impl Render for Desktop {
                             .p(px(theme.spacing.medium))
                             .border_r(px(theme.border_width))
                             .border_color(rgba(theme.colors.border))
+                            .id("session-list")
+                            .overflow_y_scroll()
                             .child("会话")
+                            .child(chat_sidebar)
                             .children(sidebar),
                     )
                     .child(
@@ -344,6 +344,7 @@ impl Render for Desktop {
                             .child(
                                 div()
                                     .id("content")
+                                    .track_scroll(&self.scroll)
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_y_scroll()
@@ -351,7 +352,7 @@ impl Render for Desktop {
                                     .flex_col()
                                     .p(px(theme.spacing.large))
                                     .gap(px(theme.spacing.medium))
-                                    .children(items),
+                                    .child(chat_content),
                             )
                             .child(
                                 div()

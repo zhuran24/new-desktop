@@ -453,6 +453,10 @@ pub struct PendingTicket {
 
 /// 真端口。生产：Claude 适配；测试：脚本化适配器。
 pub trait BackendAdapter: Send + Sync {
+    /// 会话外的只读查询；外部进程的生命周期关在适配器里。
+    fn models(&self, _cwd: std::path::PathBuf) -> ModelQuery<'_> {
+        Box::pin(async { Err("这个后端没有提供模型列表".into()) })
+    }
     fn kind(&self) -> BackendKind;
     /// `act` 之前每个会话调一次；之后适配器对账未结票、从检查点接着读。
     fn adopt(&self, part: AdoptPart);
@@ -464,6 +468,10 @@ pub trait BackendAdapter: Send + Sync {
     fn release(&self, _session: &SessionId) {}
 }
 
+pub type ModelQuery<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<nd_wire::Model>, String>> + Send + 'a>,
+>;
+
 /// 会话执行器看到的全部后端：按后端种类路由到适配器。具体类型，只有一份实现。
 #[derive(Clone, Default)]
 pub struct Backends {
@@ -473,6 +481,18 @@ fn kind_key(kind: &BackendKind) -> String {
     format!("{kind:?}")
 }
 impl Backends {
+    pub async fn models(
+        &self,
+        backend: &str,
+        cwd: std::path::PathBuf,
+    ) -> Result<Vec<nd_wire::Model>, String> {
+        let kind = match backend {
+            "claude" => BackendKind::Claude,
+            "codex" => BackendKind::Codex,
+            _ => return Err("没有这个后端".into()),
+        };
+        self.get(&kind).ok_or("后端未配置")?.models(cwd).await
+    }
     pub fn new() -> Self {
         Self::default()
     }

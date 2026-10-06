@@ -8,8 +8,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut socket = None;
     let mut state_path = None;
     let mut seconds = None::<u64>;
+    #[cfg(feature = "scenarios")]
+    let mut scenario_create = None::<serde_json::Value>;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            #[cfg(feature = "scenarios")]
+            "--scenario-create" => {
+                scenario_create = Some(serde_json::from_str(
+                    &args.next().ok_or("missing scenario")?,
+                )?)
+            }
             "--socket" => socket = Some(PathBuf::from(args.next().ok_or("--socket needs a path")?)),
             "--state" => {
                 state_path = Some(PathBuf::from(args.next().ok_or("--state needs a path")?))
@@ -83,8 +91,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gpui_kit::open_window(options, cx, move |window, cx| {
                 window.set_window_title("New Desktop");
                 cx.new(|cx| {
-                    Desktop::new(socket, state, save, warning, window, cx)
-                        .expect("start nd-wire worker")
+                    let desktop = Desktop::new(socket, state, save, warning, window, cx)
+                        .expect("start nd-wire worker");
+                    #[cfg(feature = "scenarios")]
+                    if let Some(plan) = scenario_create {
+                        Desktop::scenario_create(plan, window, cx);
+                    }
+                    desktop
                 })
             })
             .expect("open New Desktop window");

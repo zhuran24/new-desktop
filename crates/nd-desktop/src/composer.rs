@@ -188,7 +188,7 @@ impl Render for Composer {
                             .child(if self.send_enabled {
                                 "发送"
                             } else {
-                                "选择会话后发送"
+                                "暂不可发送"
                             }),
                     ),
             )

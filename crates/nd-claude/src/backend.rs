@@ -66,6 +66,7 @@ struct Inner {
     config: ClaudeBackendConfig,
     inboxes: Mutex<HashMap<SessionId, Inbox>>,
     carriers: Mutex<HashMap<CarrierId, Slot>>,
+    model_query: tokio::sync::Mutex<()>,
 }
 
 pub struct ClaudeBackend {
@@ -105,6 +106,7 @@ impl ClaudeBackend {
                 config,
                 inboxes: Mutex::new(HashMap::new()),
                 carriers: Mutex::new(HashMap::new()),
+                model_query: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -905,6 +907,20 @@ impl Actor {
 }
 
 impl BackendAdapter for ClaudeBackend {
+    fn models(&self, cwd: std::path::PathBuf) -> nd_backend::ModelQuery<'_> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            // 请求连接消失也继续完成有界的查询和清理，不能留下辅助进程。
+            tokio::spawn(async move {
+                let _guard = inner.model_query.lock().await;
+                crate::models::query(&inner.claude, &inner.claims, inner.generation, cwd)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        })
+    }
     fn kind(&self) -> BackendKind {
         BackendKind::Claude
     }

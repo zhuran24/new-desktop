@@ -221,6 +221,200 @@ fn request_text(body: &Value) -> String {
 }
 
 #[tokio::test]
+async fn new_session_models_come_from_the_backend_before_any_conversation() {
+    let fx = Fixture::start("nd14-models", 3_600_000).await;
+    let mut ui = fx.ui().await;
+    let models = ui.models("claude", "/sandbox/project").await.unwrap();
+    assert!(
+        !models.is_empty(),
+        "initialize must advertise selectable models"
+    );
+    assert!(models.iter().any(|m| m.value == "haiku" && !m.disabled));
+    assert!(models.iter().all(|m| !m.label.is_empty()));
+    assert!(
+        ui.get("sessions", Default::default())
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        fx.scenario.endpoint().requests().is_empty(),
+        "listing models must not prompt"
+    );
+    assert!(ui.models("claude", "/missing-directory").await.is_err());
+    assert!(
+        ui.models("not-installed", "/sandbox/project")
+            .await
+            .is_err()
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversation() {
+    use nd_ui_core::{CommandClient, FeedUpdate, ReplicaFeed};
+    let fx = Fixture::start("nd14-cold", 3_600_000).await;
+    let client = CommandClient::start(fx.socket()).unwrap();
+    let models = client
+        .models("claude".into(), "/sandbox/project".into())
+        .await
+        .unwrap();
+    let model = models.iter().find(|m| m.value == "haiku").unwrap();
+    let answer = "# 中文回答\n\n```rust\nfn main() { println!(\"你好\"); }\n```\n流式尾巴";
+    fx.scenario.endpoint().enqueue(
+        Route::new(None, "claude-haiku-4-5-20251001"),
+        ModelReply::streaming_text(answer, 1, 90),
+    );
+    let reply = client
+        .command(Command {
+            id: "desktop-create".into(),
+            device: "desktop".into(),
+            name: "session.create".into(),
+            args: json!({"cwd":"/sandbox/project", "model":model.value, "text":"请写代码"}),
+            expect: json!({}),
+        })
+        .await
+        .unwrap();
+    let CommandReply::Receipt {
+        receipt: Receipt::Accepted {
+            stream: Some(stream),
+            ..
+        },
+    } = reply
+    else {
+        panic!("{reply:?}")
+    };
+    let mut feed = ReplicaFeed::start(fx.socket(), &stream).unwrap();
+    let partial = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(FeedUpdate::Snapshot(s)) = feed.recv().await
+                && s.items.iter().any(|i| {
+                    i.kind == "text"
+                        && i.data["complete"] == false
+                        && !i.data["text"].as_str().unwrap().is_empty()
+                })
+            {
+                break s;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "{e}: requests={:?}",
+            fx.scenario
+                .endpoint()
+                .requests()
+                .iter()
+                .map(|r| &r.route)
+                .collect::<Vec<_>>()
+        )
+    });
+    let block = partial.items.iter().find(|i| i.kind == "text").unwrap();
+    let identity = header(&partial)["process"]["run"].clone();
+    // 丢掉全部界面副本与命令连接；新实例只能靠冷快照恢复累积内容。
+    drop(feed);
+    drop(client);
+    let mut reopened = ReplicaFeed::start(fx.socket(), &stream).unwrap();
+    let Some(FeedUpdate::Snapshot(cold)) = reopened.recv().await else {
+        panic!("cold snapshot missing")
+    };
+    let resumed = cold.items.iter().find(|i| i.id == block.id).unwrap();
+    assert!(
+        resumed.data["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(block.data["text"].as_str().unwrap())
+    );
+    assert_eq!(header(&cold)["process"]["run"], identity);
+    let session = stream.trim_start_matches("session/");
+    let finished = fx
+        .wait(session, "complete Markdown", |s| texts(s) == [answer])
+        .await;
+    assert_eq!(
+        finished.items.iter().filter(|i| i.id == block.id).count(),
+        1
+    );
+    assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+    let client = CommandClient::start(fx.socket()).unwrap();
+    fx.scenario.endpoint().enqueue(
+        Route::new(None, "claude-haiku-4-5-20251001"),
+        ModelReply::text("继续回答"),
+    );
+    let sent = client
+        .command(Command {
+            id: "desktop-send".into(),
+            device: "desktop".into(),
+            name: "session.send".into(),
+            args: json!({"session":session,"text":"继续"}),
+            expect: json!({}),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        sent,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    fx.wait(session, "second turn", |s| {
+        texts(s).contains(&"继续回答".to_owned())
+    })
+    .await;
+    let requests = fx.scenario.endpoint().requests();
+    assert_eq!(requests.len(), 2);
+    assert!(request_text(&requests[1].body).contains("请写代码"));
+    reopened.close().await;
+    drop(client);
+    fx.close();
+}
+
+#[tokio::test]
+async fn native_chat_window_creates_and_recovers_during_streaming_markdown() {
+    let fx = Fixture::start("nd14-window", 3_600_000).await;
+    let answer = "# 中文回答\n\n一段 **Markdown**。\n\n```rust\nfn main() { println!(\"你好\"); }\n```\n\n结束。";
+    fx.scenario.endpoint().enqueue(
+        Route::new(None, "claude-haiku-4-5-20251001"),
+        ModelReply::streaming_text(answer, 1, 100),
+    );
+    let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
+    let output = std::env::var_os("ND_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-chat"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
+        .arg("--desktop")
+        .arg(desktop)
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let verdict: Value =
+        serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap();
+    assert_eq!(verdict["pass"], true);
+    assert_eq!(
+        fx.scenario.endpoint().requests().len(),
+        1,
+        "reopening the UI must not prompt again"
+    );
+    let session = verdict["session"].as_str().unwrap();
+    let done = fx.peek(session).await;
+    assert_eq!(texts(&done), [answer]);
+    assert!(header(&done)["process"]["alive"].as_bool().unwrap());
+    fx.close();
+}
+
+#[tokio::test]
 async fn ndctl_creates_a_session_and_streams_the_reply() {
     let fx = Fixture::start("nd13-ndctl", 3_600_000).await;
     let endpoint = fx.scenario.endpoint();

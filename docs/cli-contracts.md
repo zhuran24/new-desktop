@@ -122,6 +122,17 @@
 
 本单没有写 CLI 原生存储。新增的结构操作（新建、按需拉起、闲置回收）的崩溃矩阵行在 [会话组件说明](../crates/nd-session/README.md#引擎崩溃矩阵)。场景构建另有一个故障点：守护进程运行目录下的 `backend-fault.json`（`{"contains":"<标记>"}`）让含标记的那条消息写出前把后端进程停住（SIGSTOP），只在 `scenarios` 构建里读，用一次就删。
 
+## 桌面新建前的模型目录（#14）
+
+适用固定 CLI 2.1.289，二进制指纹同 #13。入口 `scripts/test-scenarios.sh`；实现位于 `nd-claude/src/models.rs`，协议与验证见 [桌面说明](../crates/nd-desktop/README.md)。
+
+| 依赖 | 出处 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|
+| UI-MODELS：没有会话时，在目标工作目录运行 CLI，只 initialize 即可取得 `models[]` 的 value/displayName/description/disabled 及可选 unavailable_models；查询不产生模型请求 | `research/impl/cli-protocol.md` §initialize 回应（模型目录，S:L291/L517）；本版本真 CLI 实跑 | `new_session_models_come_from_the_backend_before_any_conversation`：取列表、零模型请求、零产品会话、拒绝无效目录/后端；`native_chat_window_creates_and_recovers_during_streaming_markdown` 用返回的 haiku 选项创建 | 查询失败时显示原因并禁用创建；不填硬编码模型列表。修正候选适配后重新跑关卡 |
+| UI-MODEL-HELPER：同一固定启动模板加 `--no-session-persistence` 可用于短命目录查询；两个 hello 后 initialize，退出确认后报告 Gone 和撤回 mod 登记 | 父规格「进程／辅助进程」；CLI 2.1.289 的本次实际运行 | 同上模型目录场景；场景结束清理所有独立单元和临时根。未据此关闭第 7 步 R12-X3/X6 的通用辅助进程问题 | 禁用目录查询并显示错误；不换用 owner 包装 CLI，不降成直接读取凭据或猜模型 |
+
+本单没有写 CLI 原生存储，没有新增结构/派发操作；辅助查询不发送人类提示。`haiku` 在此固定版本的离线场景解析为 `claude-haiku-4-5-20251001`，这是伪端点的版本夹具，产品不硬编码该映射。界面流式恢复依赖沿用 CONV-STREAM，不另造一套 CLI 解码。
+
 ## 谱系与轮索引（#15）
 
 固定 Claude Code 2.1.289 与 SHA-256 同 #5。规格依据为 `GLOSSARY.md`「段」「轮」、ADR 0008/0010/0013、`research/round12/DESIGN.md` §2.1.9/§2.2.3，以及 `research/protocol.md` §5.2。验证记录见 [ticket-15](verification/ticket-15.md)。

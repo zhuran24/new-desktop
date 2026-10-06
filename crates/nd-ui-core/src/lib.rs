@@ -1,4 +1,6 @@
 //! 无 GPUI 依赖的 nd-wire 连接与同步副本。
+mod client;
+pub use client::CommandClient;
 use futures::{SinkExt, StreamExt};
 use nd_wire::{PROTOCOL_VERSION, Request, Response, Snapshot};
 use std::{
@@ -100,6 +102,16 @@ impl SyncReplica {
             id,
             res: res.into(),
             page,
+        })
+        .await?;
+        Ok(serde_json::from_value(self.reply(id).await?)?)
+    }
+    pub async fn models(&mut self, backend: &str, cwd: &str) -> Result<Vec<nd_wire::Model>> {
+        let id = self.request_id()?;
+        self.send(Request::Models {
+            id,
+            backend: backend.into(),
+            cwd: cwd.into(),
         })
         .await?;
         Ok(serde_json::from_value(self.reply(id).await?)?)

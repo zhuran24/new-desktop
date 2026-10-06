@@ -4,12 +4,12 @@
 
 ## 接入
 
-`Desktop::composer()` 返回外壳底部的 `Entity<Composer>`。会话能力持有 `subscribe_in` 返回的订阅，处理 `ComposerEvent::Action(Submit { text })` 和 `Escape`；业务操作只走 `nd-ui-core` 同步副本与 nd-wire。外壳当前没有会话发送能力，默认禁用发送，仍可编辑。输入框本身没有后端通道。
+`Desktop::composer()` 返回外壳底部的 `Entity<Composer>`。外壳已经订阅 `ComposerEvent::Action(Submit { text })`，经 `CommandClient` 和同步副本提交创建或发送命令；其他能力不能再登记第二个发送者。输入框本身没有后端通道。新建表单取得有效模型，或所选会话的快照允许发送时才启用发送；等待收据时仍可编辑。
 
 - `Composer::set_send_enabled` 由会话能力根据准入更新；默认 false。按钮、命令面板都调用 `submit`，不能自行读取正文并绕过组词保护。
 - `Composer::snapshot(window, cx)` 直接读取编辑器正文、焦点、marked range 与发送准入。`Changed` 供草稿组件观察编辑和焦点变化；它不是完整的 IME 生命周期通知，发送或 Esc 必须重新采样。
 - `editor()` 提供真正的 `TextareaState`，供平台输入、附件粘贴、草稿恢复、选择区操作。Kit `set_selected_range` 的单位为 UTF-8 字节；`EntityInputHandler` 的 range 为 UTF-16，不能混用。
-- 提交动作保留正文，不代表后端受理。#14/#16 需在同步副本的受理/草稿归属规则明确后清空；若异步期间用户已经编辑，不能用旧收据清掉新内容；交付不明不重发正文。
+- 提交动作保留正文，不代表后端受理。外壳只在明确受理后清理对应会话、对应修订的草稿；新编辑或正在组词时不清空。交付不明保留正文，不自动重投。内存草稿随会话切换保留；持久草稿由 #16 接入。
 - Esc 取消组词时删除 marked range、结束标记，并消费按键；不会向会话再发一个 Esc。非组词时发出中立 `Escape`，#18 负责具体会话动作。长按同一个键只处理一次，释放后才处理下一次。
 - 只对所属窗口里聚焦的输入框安装前置按键保护。订阅由实体持有，实体释放即撤回。父容器不应另装绕过此入口的 Enter/Esc 发送器。
 - `set_theme` 更新输入框的应用主题；外壳 `set_theme` 同时更新 Kit/Base 的字体、光标和选择区等颜色。视图不读 CLI 数据或解析 stdout。

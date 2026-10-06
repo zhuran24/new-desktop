@@ -3,7 +3,9 @@ mod state;
 pub use state::{ViewState, ViewStateFile, WindowState};
 mod slots;
 pub use slots::{Contribution, Slot, SlotGuard, Slots};
+mod chat;
 mod theme;
+pub use chat::*;
 pub use theme::{Colors, Shadow, Spacing, Theme, ThemeMode, Typography};
 
 #[derive(Clone, Debug, PartialEq)]

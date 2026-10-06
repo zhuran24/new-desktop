@@ -1,6 +1,6 @@
 # New Desktop
 
-Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 Codex app-server。当前代码包含组件内核、本机守护进程、同步流与持久命令收据、配置与存储底座、Claude 记录解析及对话转换库、看守进程、独占登记，以及第一条 Claude 对话（会话名册与持久操作引擎、Claude 适配、`ndctl new/send`）；桌面界面的对话区等由后续工单接入。
+Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI；Codex app-server 的适配在后续工单接入。当前可经 GPUI 桌面或 `ndctl new/send` 新建 Claude 会话和流式对话。桌面提供目录输入、后端模型列表、侧栏状态、Markdown/代码块和界面重开恢复。底座包含组件内核、同步流与持久命令收据、配置与存储、记录解析与转换、看守进程、独占登记和持久操作引擎。
 
 领域用语见 [GLOSSARY.md](GLOSSARY.md)，架构决定见 [docs/adr](docs/adr/)。
 
@@ -15,6 +15,8 @@ Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 
 | `crates/nd-config` | 分节监视、修订冲突检查、原子配置写入 |
 | `crates/nd-store` | SQLite 事务、只读池、SHA-256 附件及引用 |
 | `crates/nd-ui-core` | 无 GPUI 依赖的连接、同步副本、幂等命令与收据查询 |
+| [`crates/nd-desktop`](crates/nd-desktop/README.md) | GPUI 外壳、创建表单、侧栏、流式聊天与输入框接线 |
+| `crates/nd-view-model`、`crates/nd-composer` | 不依赖 GPUI 的视图投影、主题、设备偏好和输入框状态机 |
 | `crates/nd-daemon` | 守护进程、UDS HTTP/WebSocket、可选组件和 ndctl |
 | [`crates/nd-claude-records`](crates/nd-claude-records/README.md) | Claude 主记录选链、字节偏移索引、历史分页；只读纯库 |
 | [`crates/nd-convert`](crates/nd-convert/README.md) | Claude/Codex 经中间条目互转、损失清单与中立设置换算；纯库 |
@@ -26,9 +28,9 @@ Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 
 | [`mods/`](mods/README.md) | 带进每个 Claude 后端进程的钩子 mod 与动作 mod（TypeScript） |
 | `ime-lab/variants/*` | 独立实验工作区，不参与产品的 workspace 测试 |
 
-工作区按实现逐步增加 crate。`default-members` 显式列出无需 GPUI 的成员；后续 `nd-desktop` 加入 `members`，保持在 `default-members` 之外。同步副本 `nd-ui-core` 已提供；视图模型 `nd-view-model`、输入框状态机 `nd-composer` 各自作为不依赖 GPUI 的库接入。
+`nd-desktop` 在 workspace 的 `members` 内、`default-members` 外；不带 `--workspace` 的日常检查无需编译 GPUI。
 
-GPUI 版本集中预留为 `gpui-pre =0.3.7`、gpui-kit Git 提交 `4c7f1350331562436df868c55ac33bebc4c6406c`。当前没有界面 crate，Cargo 不把未使用的 workspace 依赖写进锁文件；接入 `nd-desktop` 时继承 Kit 依赖并更新锁文件，核对同一依赖树没有其他 GPUI 线。产品不使用 ime-lab 的本地观测补丁。
+GPUI 固定为 `gpui-pre =0.3.7`、gpui-kit Git 提交 `4c7f1350331562436df868c55ac33bebc4c6406c`，已锁入 Cargo.lock。产品不使用 ime-lab 的本地观测补丁。
 
 ## 构建与检查
 

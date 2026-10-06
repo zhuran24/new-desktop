@@ -9,6 +9,7 @@ pub mod channel;
 pub mod convo;
 pub mod fixture;
 pub mod launch;
+mod models;
 pub mod protocol;
 pub mod run;
 

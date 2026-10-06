@@ -171,3 +171,9 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
 GitHub 容器作业执行普通测试与 Schema 比对；真实 systemd 场景由具备上述条件的 Linux 席位运行。场景底座当前位于 `nd-daemon/tests/support`，#5 可在保留隔离与清理约定的前提下迁入通用 testkit。
 
 命令场景在 `tests/commands.rs`：去重与散列冲突、无效/过期前置条件、墓碑重启、三个提交窗口崩溃、未受理退避、慢连接和正常连接保序、ndctl 提交与查询、冲突回应丢失、并发设备、组件卸载和 JSON 键顺序。所有断言经同步副本、真实进程、事件、快照和收据完成，不读内部表。原有 `tests/read_stream.rs` 继续验证只读流与隔离。
+
+## 桌面模型目录查询
+
+nd-wire 的 `models{id,backend,cwd}` 是只读查询，返回 `Reply.value` 中的 `Model[]`，类型与 Schema 由 `nd-wire` 生成。`SyncReplica::models` 和 `CommandClient::models` 是界面公共入口。目录须为已存在的绝对路径；当前只安装 Claude 适配，未安装后端返回错误。此查询不创建会话、不发送提示、不占全局引擎锁。
+
+Claude 适配在守护进程 cgroup 内直接拉起短命辅助进程并报告 Up/Gone，查询时使用 `[claude]` 的固定 CLI、mod 与环境。隔离测试的守护进程沙盒也只读挂入钉住的 `/cli`，无须改用假进程。协议、桌面流程与实测范围见[桌面说明](../nd-desktop/README.md)。
