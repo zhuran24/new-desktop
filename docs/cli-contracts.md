@@ -1,6 +1,18 @@
 # CLI 与 Codex 契约清单
 
-日期：2026-10-06。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#8 的只读记录契约已实现并通过离线验收；#9 的转换契约见下方对应小节。
+日期：2026-10-06。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#5 的离线端点和 #8 的只读记录契约已通过真 CLI 离线验收；#9 的转换契约区分格式回归与后续真实后端验证。
+
+## 离线场景端点与真 CLI（#5）
+
+适用版本：固定 `/mnt/wd_external/nd-build/cli/claude-2.1.289`，SHA-256 `a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348`。测试入口为 `scripts/test-scenarios.sh`，实现与范围见 [nd-testkit](../crates/nd-testkit/README.md)。
+
+| 依赖 | 出处 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|
+| `ANTHROPIC_BASE_URL` 和假 key 可让固定 CLI 只访问本地 Messages 端点，SSE 回答产生成功 result | 父规格「测试决定／主接缝」；`research/round9/verify/mock_base.py` 的消息 SSE；本版本实跑 | `pinned_real_claude_receives_held_streaming_reply_without_network_or_credentials`：实际请求被扣住、放出后 result 为预定文字、总请求为 1 | 离线场景失败，修正对应版本的端点契约；不改连真服务、不读取 owner 认证、不换假 CLI |
+| API 按正文 model 与 `x-claude-code-agent-id` 路由；缺 agent 头为主对话 | 2.1.289 二进制内嵌 JS 字节偏移 206526432（`J?.agentId` 设置头）；R12 §3.2；主对话已实跑 | `replies_route_by_agent_and_model_and_unplanned_requests_fail_closed` 在端点 HTTP 边界验证精确路由；真 CLI 场景验证主对话。真实子代理 id 的生产/时序仍由后续子代理场景验证 | 未知组合返回 409 并保留请求，不回缺省成功；升级若改请求头，先修夹具再恢复子代理场景 |
+| SSE `tool_use` / `input_json_delta` 能触发真 Bash，结果出现在下一次模型请求 | `research/round9/verify/mock_base.py` 的工具 SSE；父规格 FIFO 控时约定；本版本实跑 | `real_claude_executes_scripted_tool_and_reports_fifo_result_to_endpoint`：真实 Bash 阻塞 FIFO，放行后实际 tool_result 带回指定文字 | 离线场景失败，保留 CLI 输出与请求检查契约；不直接伪造 tool_result 或代写 CLI 记录 |
+
+本条目不写 CLI 原生存储、不新增产品结构/派发操作；命令故障点沿用 #4，后端操作的引擎崩溃矩阵随实际操作工单增加。以上验证全在断网临时环境中完成，不代表真模型服务或产品看守保活验证。
 
 ## Claude 记录解析（#8）
 

@@ -699,6 +699,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nd-testkit"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nd-ui-core",
+ "nd-wire",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nd-ui-core"
 version = "0.1.0"
 dependencies = [

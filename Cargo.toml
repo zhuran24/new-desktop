@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert"]
-default-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert"]
+members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-testkit"]
+default-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-testkit"]
 exclude = ["ime-lab/variants/main", "ime-lab/variants/v070"]
 
 [workspace.package]
