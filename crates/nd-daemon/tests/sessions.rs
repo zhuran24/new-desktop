@@ -314,7 +314,8 @@ async fn draft_two_devices_preserve_the_loser_and_publish_it_to_both() {
         .endpoint()
         .enqueue(fx.main(), ModelReply::text("ready"));
     let session = fx.create("draft-pair", "/sandbox/project", "hello").await;
-    fx.wait(&session, "first turn", |s| !texts(s).is_empty())
+    let first = fx
+        .wait(&session, "first turn", |s| !texts(s).is_empty())
         .await;
     let stream = format!("session/{session}");
     let mut a = fx.ui().await;
@@ -352,6 +353,9 @@ async fn draft_two_devices_preserve_the_loser_and_publish_it_to_both() {
     let mut changed = cb.clone();
     changed.args["text"] = json!("同 id 改内容");
     assert_eq!(b.command(&changed).await.unwrap(), CommandReply::Conflict);
+    // 暂停真实 CLI，保证两台界面都在恢复窗口内订阅，不靠调度碰巧复现。
+    let pid = cli_pid(&fx, &first).await;
+    signal(pid, rustix::process::Signal::STOP);
     fx.scenario.restart_daemon().unwrap();
     assert_eq!(draft(&fx.peek(&session).await), d);
     // 取回落败稿仍是一次带版本的普通编辑，成功后两台通过事件同步。
@@ -363,18 +367,48 @@ async fn draft_two_devices_preserve_the_loser_and_publish_it_to_both() {
         saved[0]["text"].as_str().unwrap(),
     );
     let mut watcher = fx.ui().await;
-    watcher.subscribe(&stream).await.unwrap();
-    fx.ui().await.command(&restore).await.unwrap();
-    let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+    let mut other_watcher = fx.ui().await;
+    for reader in [&mut watcher, &mut other_watcher] {
+        let cold = reader.subscribe(&stream).await.unwrap();
+        assert_ne!(cold.epoch, sa.epoch, "restart starts a new epoch");
+        assert_eq!(header(&cold)["recovering"], true);
+        assert_eq!(draft(&cold), d, "both devices recover the saved drafts");
+    }
+    signal(pid, rustix::process::Signal::CONT);
+    let restored = fx.ui().await.command(&restore).await.unwrap();
+    assert!(matches!(
+        restored,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    for reader in [&mut watcher, &mut other_watcher] {
+        // next() 返回任意事件应用后的完整副本。恢复头部可以先变化，
+        // 此时草稿仍是版本 1；按业务条件等待，不能假定下一次就是草稿编辑。
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = reader.next().await.unwrap();
+                if draft(&snapshot)["version"] == 2 {
+                    break snapshot;
+                }
+                assert_eq!(draft(&snapshot), d, "recovery cannot change saved drafts");
+            }
+        })
         .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(draft(&event)["version"], 2);
-    assert_eq!(draft(&event)["text"], saved[0]["text"]);
+        .expect("both subscribers must receive the restored draft");
+        assert_eq!(draft(&event)["text"], saved[0]["text"]);
+        assert_eq!(
+            draft(&event)["saved"],
+            d["saved"],
+            "recovery keeps the saved original"
+        );
+    }
+    assert_eq!(fx.ui().await.command(&restore).await.unwrap(), restored);
+    assert_eq!(draft(&fx.peek(&session).await)["version"], 2);
     assert_eq!(
-        draft(&event)["saved"],
-        d["saved"],
-        "recovery keeps the saved original"
+        fx.scenario.endpoint().requests().len(),
+        1,
+        "draft recovery never prompts the model"
     );
     fx.close();
 }
@@ -808,6 +842,61 @@ async fn cli_pid(fx: &Fixture, snapshot: &Snapshot) -> i32 {
 
 fn signal(pid: i32, signal: rustix::process::Signal) {
     rustix::process::kill_process(rustix::process::Pid::from_raw(pid).unwrap(), signal).unwrap();
+}
+
+#[tokio::test]
+async fn restart_keeps_a_written_message_pending_until_its_original_echo() {
+    let fx = Fixture::start("nd19-written", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("第一轮"));
+    let session = fx.create("nd19-create", "/sandbox/project", "开始").await;
+    let first = fx
+        .wait(&session, "first answer", |s| texts(s) == ["第一轮"])
+        .await;
+    let pid = cli_pid(&fx, &first).await;
+    signal(pid, rustix::process::Signal::STOP);
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("第二轮"));
+    fx.send("nd19-send", &session, "只送一次").await;
+    let written = fx
+        .wait(&session, "written", |s| {
+            prompt(s, "只送一次").is_some_and(|p| p.data["state"] == "written")
+        })
+        .await;
+    let native = prompt(&written, "只送一次").unwrap().data["native"].clone();
+    // 给已提交检查点的确认时间，确保测试覆盖流水回收后的恢复。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fx.scenario.restart_daemon().unwrap();
+    let mut ui = fx.ui().await;
+    ui.subscribe(&format!("session/{session}")).await.unwrap();
+    signal(pid, rustix::process::Signal::CONT);
+    let done = fx
+        .wait(&session, "original echo", |s| {
+            prompt(s, "只送一次").is_some_and(|p| p.data["state"] == "landed")
+        })
+        .await;
+    assert_eq!(prompt(&done, "只送一次").unwrap().data["native"], native);
+    assert_eq!(cli_pid(&fx, &done).await, pid);
+    fx.wait(&session, "second answer", |s| {
+        texts(s) == ["第一轮", "第二轮"]
+    })
+    .await;
+    let bs = header(&done)["process"]["backend_session"]
+        .as_str()
+        .unwrap();
+    let inputs: Vec<Value> = fx
+        .transcript(bs)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|v: &Value| {
+            v["type"] == "user" && v["message"]["content"].to_string().contains("只送一次")
+        })
+        .collect();
+    assert_eq!(inputs.len(), 1, "no duplicated native input: {inputs:?}");
+    assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+    fx.close();
 }
 
 async fn listed(fx: &Fixture, session: &str) -> Option<Item> {
@@ -1430,6 +1519,447 @@ async fn a_running_round_keeps_its_identity_when_the_daemon_restarts() {
         lineage(&running)["rounds"][0]["positions"]
     );
     assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+    fx.close();
+}
+
+#[tokio::test]
+async fn recovering_commands_have_no_receipt_and_the_replica_retries_the_same_id() {
+    let fx = Fixture::start("nd19-gate", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("就绪"));
+    let session = fx.create("gate-create", "/sandbox/project", "开始").await;
+    let first = fx.wait(&session, "ready", |s| texts(s) == ["就绪"]).await;
+    let pid = cli_pid(&fx, &first).await;
+    signal(pid, rustix::process::Signal::STOP); // 两个 mod 暂时不能重新 hello。
+    fx.scenario.restart_daemon().unwrap();
+    let mut ui = fx.ui().await;
+    // 新建会话也受守护进程恢复闸门约束，不能绕过正在恢复的会话。
+    let create = Command {
+        id: "create-during-gate".into(),
+        device: "test".into(),
+        name: "session.create".into(),
+        args: json!({"cwd":"/sandbox/project","text":"恢复期不能新建","model":MODEL}),
+        expect: json!({}),
+    };
+    let mut other = fx.ui().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), other.command(&create))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fx.ui().await.receipt(&create.id).await.unwrap(),
+        nd_wire::ReceiptLookup::Missing
+    );
+    let client = nd_ui_core::CommandClient::start(fx.socket()).unwrap();
+    let abandoned = Command {
+        id: "cancelled-during-gate".into(),
+        device: "test".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"界面已经取消的请求"}),
+        expect: json!({}),
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), client.command(abandoned))
+            .await
+            .is_err()
+    );
+    drop(client);
+    let command = Command {
+        id: "same-id-during-recovery".into(),
+        device: "test".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"恢复后发送"}),
+        expect: json!({}),
+    };
+    let task_command = command.clone();
+    let task = tokio::spawn(async move { ui.command(&task_command).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(
+        fx.ui().await.receipt(&command.id).await.unwrap(),
+        nd_wire::ReceiptLookup::Missing
+    );
+    assert!(
+        !task.is_finished(),
+        "recovery retries must outlast the previous five attempts"
+    );
+    assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("恢复后的回答"));
+    signal(pid, rustix::process::Signal::CONT);
+    let reply = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        reply,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    assert_eq!(fx.ui().await.command(&command).await.unwrap(), reply);
+    fx.wait(&session, "one resumed input", |s| {
+        texts(s) == ["就绪", "恢复后的回答"]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(
+        fx.ui()
+            .await
+            .receipt("cancelled-during-gate")
+            .await
+            .unwrap(),
+        nd_wire::ReceiptLookup::Missing
+    );
+    assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+    fx.close();
+}
+
+#[tokio::test]
+async fn streaming_survives_kill_and_service_restart_with_a_checkpoint_mid_block() {
+    for kill in [true, false] {
+        let fx = Fixture::start(
+            if kill {
+                "nd19-stream-kill"
+            } else {
+                "nd19-stream-restart"
+            },
+            3_600_000,
+        )
+        .await;
+        let answer: String = (0..100).map(|n| format!("{n:03}·")).collect();
+        fx.scenario
+            .endpoint()
+            .enqueue(fx.main(), ModelReply::streaming_text(&answer, 1, 30));
+        fx.scenario
+            .endpoint()
+            .enqueue(fx.main(), ModelReply::text("接着聊"));
+        let session = fx
+            .create("stream-create", "/sandbox/project", "长回复")
+            .await;
+        let partial = fx
+            .wait(&session, "partial answer", |s| {
+                s.items.iter().any(|i| {
+                    i.kind == "text"
+                        && i.data["complete"] == false
+                        && i.data["text"].as_str().unwrap().len() > 20
+                })
+            })
+            .await;
+        let block = partial.items.iter().find(|i| i.kind == "text").unwrap();
+        let pid = cli_pid(&fx, &partial).await;
+        // 在流式块中制造持久事实：第二条输入已写出但排在当前回合之后。
+        fx.command(
+            "stream-queued",
+            "session.send",
+            json!({"session":session,"text":"下一轮","intent":"after_turn"}),
+        )
+        .await;
+        fx.wait(&session, "queued input checkpoint", |s| {
+            prompt(s, "下一轮").is_some_and(|i| i.data["state"] == "written")
+        })
+        .await;
+        let mut ui = fx.ui().await;
+        ui.subscribe(&format!("session/{session}")).await.unwrap();
+        if kill {
+            fx.scenario.kill_daemon().unwrap();
+        } else {
+            fx.scenario.restart_daemon().unwrap();
+        }
+        let resumed = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let s = ui.next().await.unwrap();
+                if s.epoch != partial.epoch
+                    && header(&s)["recovering"] == false
+                    && s.items.iter().any(|i| {
+                        i.id == block.id
+                            && i.data["complete"] == false
+                            && i.data["text"].as_str().unwrap().len() > 25
+                    })
+                {
+                    break s;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let text = resumed
+            .items
+            .iter()
+            .find(|i| i.id == block.id)
+            .unwrap()
+            .data["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.starts_with(block.data["text"].as_str().unwrap()),
+            "lost streamed prefix after restart: {text}"
+        );
+        // 最后一个 delta 已可含完整正文，但 assistant 完整块和 result 还可能在途。
+        // 等公开的完成事实齐全，再核对两轮恰好各一次。
+        let done = fx
+            .wait(&session, "both replies and round results completed", |s| {
+                texts(s) == [answer.clone(), "接着聊".into()]
+                    && s.items
+                        .iter()
+                        .filter(|i| i.kind == "text")
+                        .all(|i| i.data["complete"] == true)
+                    && s.items.iter().filter(|i| i.kind == "turn").count() >= 2
+                    && header(s)["process"]["turn_running"] == false
+            })
+            .await;
+        assert_eq!(cli_pid(&fx, &done).await, pid);
+        assert_eq!(done.items.iter().filter(|i| i.id == block.id).count(), 1);
+        assert_eq!(done.items.iter().filter(|i| i.kind == "turn").count(), 2);
+        assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+        fx.close();
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_input() {
+    for action in ["unknown_after_write", "crash_after_write"] {
+        let fx = Fixture::start("nd19-write-window", 3_600_000).await;
+        fx.scenario
+            .endpoint()
+            .enqueue(fx.main(), ModelReply::text("第一轮"));
+        let session = fx.create("window-create", "/sandbox/project", "开始").await;
+        let first = fx.wait(&session, "ready", |s| texts(s) == ["第一轮"]).await;
+        let pid = cli_pid(&fx, &first).await;
+        signal(pid, rustix::process::Signal::STOP);
+        std::fs::write(
+            fx.scenario.root().join("runtime/delivery-fault.json"),
+            json!({"contains":"写后窗口","action":action}).to_string(),
+        )
+        .unwrap();
+        fx.scenario
+            .endpoint()
+            .enqueue(fx.main(), ModelReply::text("已收到"));
+        let reply = fx
+            .command(
+                "window-send",
+                "session.send",
+                json!({"session":session,"text":"写后窗口"}),
+            )
+            .await;
+        assert!(matches!(
+            reply,
+            CommandReply::Receipt { .. } | CommandReply::DeliveryUnknown
+        ));
+        if action == "unknown_after_write" {
+            fx.wait(&session, "unknown delivery", |s| {
+                prompt(s, "写后窗口").is_some_and(|i| i.data["state"] == "unknown")
+            })
+            .await;
+            let refused = fx
+                .command(
+                    "no-blind-resend",
+                    "session.resend",
+                    json!({"session":session,"message":"window-send"}),
+                )
+                .await;
+            assert!(matches!(
+                refused,
+                CommandReply::Receipt {
+                    receipt: Receipt::Rejected { .. }
+                }
+            ));
+            fx.scenario.restart_daemon().unwrap();
+        }
+        let mut ui = fx.ui().await;
+        signal(pid, rustix::process::Signal::CONT);
+        let done = fx
+            .wait(&session, "original delivery clarified", |s| {
+                texts(s) == ["第一轮", "已收到"]
+                    && prompt(s, "写后窗口").is_some_and(|i| i.data["state"] == "landed")
+            })
+            .await;
+        assert_eq!(cli_pid(&fx, &done).await, pid);
+        assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+        assert!(matches!(
+            ui.receipt("window-send").await.unwrap(),
+            nd_wire::ReceiptLookup::Found { .. }
+        ));
+        assert!(
+            !fx.scenario
+                .root()
+                .join("runtime/delivery-fault.json")
+                .exists(),
+            "fault really fired"
+        );
+        fx.close();
+    }
+}
+
+#[tokio::test]
+async fn missing_input_journal_is_unknown_not_permission_to_write_again() {
+    let fx = Fixture::start("nd19-missing-spool", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("第一轮"));
+    let session = fx
+        .create("missing-create", "/sandbox/project", "开始")
+        .await;
+    let first = fx.wait(&session, "ready", |s| texts(s) == ["第一轮"]).await;
+    let pid = cli_pid(&fx, &first).await;
+    signal(pid, rustix::process::Signal::STOP);
+    let fault = fx.scenario.root().join("runtime/delivery-fault.json");
+    std::fs::write(
+        &fault,
+        json!({"contains":"流水暂不可读","action":"pause_after_write"}).to_string(),
+    )
+    .unwrap();
+    let mut ui = fx.ui().await;
+    let cmd = Command {
+        id: "missing-send".into(),
+        device: "test".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"流水暂不可读"}),
+        expect: json!({}),
+    };
+    let send = tokio::spawn(async move { ui.command(&cmd).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fault.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let run = header(&first)["process"]["run"].as_str().unwrap();
+    let directory = fx.scenario.root().join("runtime/runs").join(run);
+    let spool = directory.join("spool");
+    let saved = directory.join("spool.saved");
+    std::fs::rename(&spool, &saved).unwrap();
+    std::fs::create_dir(&spool).unwrap();
+    fx.scenario.kill_daemon().unwrap();
+    fx.ui().await;
+    let unknown = fx
+        .wait(&session, "missing evidence stays unknown", |s| {
+            prompt(s, "流水暂不可读").is_some_and(|i| i.data["state"] == "unknown")
+        })
+        .await;
+    assert_eq!(cli_pid(&fx, &unknown).await, pid);
+    assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+    // 恢复真实流水；原管道中的输入仍在，CLI 应只消费一次。
+    for entry in std::fs::read_dir(&saved).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::rename(entry.path(), spool.join(entry.file_name())).unwrap();
+    }
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("原消息到了"));
+    signal(pid, rustix::process::Signal::CONT);
+    fx.wait(&session, "original echo clarifies", |s| {
+        texts(s) == ["第一轮", "原消息到了"]
+            && prompt(s, "流水暂不可读").is_some_and(|i| i.data["state"] == "landed")
+    })
+    .await;
+    assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+    let _ = send.await;
+    fx.close();
+}
+
+#[tokio::test]
+async fn recovery_confirms_an_unwritten_unknown_and_nd_wire_resends_only_on_request() {
+    let fx = Fixture::start("nd19-lost", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("就绪"));
+    let session = fx.create("lost-create", "/sandbox/project", "开始").await;
+    fx.wait(&session, "ready", |s| texts(s) == ["就绪"]).await;
+    std::fs::write(
+        fx.scenario.root().join("runtime/delivery-fault.json"),
+        json!({"contains":"","action":"unknown_without_write"}).to_string(),
+    )
+    .unwrap();
+    let png = include_bytes!("fixtures/pixel.png");
+    let blob = fx.ui().await.put_blob(png).await.unwrap();
+    let attachments =
+        json!([{"blob":blob,"name":"重发.png","media_type":"image/png","size":png.len()}]);
+    let original = Command {
+        id: "lost-send".into(),
+        device: "test".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"","attachments":attachments}),
+        expect: json!({}),
+    };
+    let receipt = fx.ui().await.command(&original).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fx.wait(&session, "unknown", |s| {
+            prompt(s, "").is_some_and(|i| i.data["state"] == "unknown")
+        }),
+    )
+    .await
+    .unwrap();
+    fx.scenario.restart_daemon().unwrap();
+    fx.wait(&session, "confirmed absent input", |s| {
+        prompt(s, "").is_some_and(|i| i.data["state"] == "not_delivered")
+    })
+    .await;
+    assert_eq!(
+        fx.scenario.endpoint().requests().len(),
+        1,
+        "confirmed loss must not auto resend"
+    );
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("重发收到了"));
+    // 即使当前草稿恰好与原消息相同，重发也不能把它当成本次发送的草稿清掉。
+    let mut draft_command = edit_draft("lost-current-draft", "test", &session, 0, "");
+    draft_command.args["attachments"] = attachments.clone();
+    fx.ui().await.command(&draft_command).await.unwrap();
+    let before_resend = fx.peek(&session).await;
+    let resend = Command {
+        id: "lost-resend".into(),
+        device: "test".into(),
+        name: "session.resend".into(),
+        args: json!({"session":session,"message":"lost-send"}),
+        expect: json!({"draft_version":1}),
+    };
+    let first = fx.ui().await.command(&resend).await.unwrap();
+    assert!(matches!(
+        first,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    assert_eq!(fx.ui().await.command(&resend).await.unwrap(), first);
+    let done = fx
+        .wait(&session, "resend done", |s| {
+            texts(s) == ["就绪", "重发收到了"]
+        })
+        .await;
+    assert_eq!(fx.ui().await.command(&original).await.unwrap(), receipt);
+    assert_eq!(
+        draft(&done),
+        draft(&before_resend),
+        "resend does not consume the current draft"
+    );
+    for id in ["lost-send", "lost-resend"] {
+        let item = done.items.iter().find(|i| i.data["message"] == id).unwrap();
+        assert_eq!(
+            item.data["attachments"], attachments,
+            "both messages retain their attachments"
+        );
+    }
+    let requests = fx.scenario.endpoint().requests();
+    assert_eq!(requests.len(), 2);
+    let image = requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .find(|b| b["type"] == "image")
+        .expect("explicit resend must deliver the original image");
+    assert_eq!(image["source"]["media_type"], "image/png");
+    assert_eq!(
+        image["source"]["data"],
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9l8AAAAASUVORK5CYII="
+    );
+    assert_eq!(fx.ui().await.get_blob(&blob).await.unwrap(), png);
     fx.close();
 }
 

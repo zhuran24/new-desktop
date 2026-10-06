@@ -98,9 +98,15 @@ impl CommandClient {
                                 let _ = done
                                     .send(ui.receipt(&command_id).await.map_err(|e| e.to_string()));
                             }
-                            Work::Command(command, done) => {
-                                let _ = done
-                                    .send(ui.command(&command).await.map_err(|e| e.to_string()));
+                            Work::Command(command, mut done) => {
+                                // 界面取消等待后停止未受理命令的退避循环；已受理的效果不撤销。
+                                tokio::select! {
+                                    biased;
+                                    _ = done.closed() => {},
+                                    result = ui.command(&command) => {
+                                        let _ = done.send(result.map_err(|e| e.to_string()));
+                                    }
+                                }
                             }
                             Work::Models(backend, cwd, done) => {
                                 let result = tokio::time::timeout(
