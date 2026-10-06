@@ -211,6 +211,15 @@ fn recorded_human_rounds_keep_their_user_uuids_and_final_assistant_anchor() {
     assert_eq!(ended.len(), 2);
     assert_eq!(ended[0].1, &["8bbb9518-5d44-435a-af28-c83760afc30e"]);
     assert_eq!(ended[1].1, &["c2dcd113-067a-49d8-a5f4-706d4940060d"]);
+    // 固定录制里第一轮先有 tool_use，再有最终文字；分叉锚点必须取后者。
+    assert_eq!(
+        ended[0].3.as_deref(),
+        Some("ffbbd37c-4d80-4b4b-9ed4-c28d7457003e")
+    );
+    assert_eq!(
+        ended[1].3.as_deref(),
+        Some("6c873027-9260-4dba-b7b4-1584cb741aca")
+    );
     assert_ne!(ended[0].0, ended[1].0);
     for end in ended {
         assert!(end.3.is_some());

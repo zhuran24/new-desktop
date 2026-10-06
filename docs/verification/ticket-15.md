@@ -1,6 +1,6 @@
 # #15 谱系验证记录
 
-日期：2026-10-06。状态：单项验证通过，等待最终集成检查。实现和接口见 [会话组件说明](../../crates/nd-session/README.md#谱系与轮导航)。本记录只证明纯函数及隔离真 CLI 的谱系行为，不证明回退、换后端等后续结构操作已经实现。
+日期：2026-10-06。状态：全部自动验收通过。实现和接口见 [会话组件说明](../../crates/nd-session/README.md#谱系与轮导航)。本记录只证明纯函数及隔离真 CLI 的谱系行为，不证明回退、换后端等后续结构操作已经实现。
 
 ## 验收与证据
 
@@ -43,3 +43,17 @@ cargo fmt --all -- --check
 ## owner_checklist
 
 本工单无必须由 owner 完成的验收。纯函数、真 CLI 断网协议和守护进程恢复均可自动复验。真机输入法、界面延迟/CPU、真模型对话及真实服务验证属于各自工单，本单不将其列为已通过。
+
+## 最终集成检查
+
+基线 `v1=21d766c73dc77dc47bb69b09436492cb0e8cbc3f`，交付前在 `ticket/15` 执行 `git merge v1`，无需冲突处理。`Cargo.lock` 没有变化，没有新增第三方依赖。
+
+| 检查 | 结果 | 日志 |
+|---|---|---|
+| `cargo test --workspace --locked` | 157 passed、0 failed、1 ignored（既有 #8 手动真 CLI 现场项） | `workspace-final.log` |
+| `scripts/test-scenarios.sh` | 81 passed、0 failed、1 ignored（既有 #6 手动 OOM 项） | `scenarios-final.log` |
+| 全工作区、全部 targets、三个 scenarios 特性的 clippy，`-D warnings` | PASS | `clippy-final.log` |
+| 格式、差异空白、交付文档本地链接 | PASS | `cargo fmt --all -- --check`、`git diff --check`、链接核对 |
+| 清理 | 本席位的场景服务和临时目录均已清理；检查时其他席位有运行中的测试实例，保持其运行 | 测试 close/Drop 及 systemd 单元归属核对 |
+
+谱系纯函数 11 项，其中随机前缀测试运行 512 组；会话主接缝共 12 项，包含本单新增的 3 项及补强的创建失败场景。记录夹具的最终 assistant UUID 有独立字面值断言，第一轮明确取工具调用之后的最终文字行。
