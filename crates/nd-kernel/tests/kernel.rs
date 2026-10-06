@@ -369,14 +369,34 @@ fn waiting_deadline_starts_at_first_reconcile_and_restarts_after_dependency_loss
 
 #[test]
 fn registry_changes_wake_the_driver_without_polling_or_a_lost_wakeup() {
+    use futures::task::{ArcWake, waker};
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Context,
+    };
+    struct Wakes(AtomicUsize);
+    impl ArcWake for Wakes {
+        fn wake_by_ref(arc: &Arc<Self>) {
+            arc.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     let kernel = Kernel::new();
     let scope = kernel.scope();
     let before = kernel.revision();
     let mut changes = Box::pin(kernel.changed_since(before));
-    assert!(changes.as_mut().now_or_never().is_none());
+    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+    let waker = waker(wakes.clone());
+    assert!(
+        changes
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
     let guard = kernel
         .provide(Key::<u32>::new(scope, "wake"), Arc::new(7))
         .unwrap();
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
     let after = block_on(changes);
     assert!(after > before);
     // 变化先于第一次 poll 发生，也不能丢。
