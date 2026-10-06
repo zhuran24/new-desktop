@@ -1,3 +1,4 @@
+#![allow(dead_code)] // 共用夹具，各场景文件只使用自己需要的入口。
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -22,21 +23,27 @@ fn checked(args: &[&str]) {
 
 impl Daemon {
     pub async fn start() -> Self {
-        Self::launch(false).await
+        Self::launch(false, "").await
     }
     pub async fn start_default_paths() -> Self {
-        Self::launch(true).await
+        Self::launch(true, "").await
     }
-    async fn launch(default_paths: bool) -> Self {
+    pub async fn configured(config: &str) -> Self {
+        Self::launch(false, config).await
+    }
+    async fn launch(default_paths: bool, config: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         for name in [
             "home", "claude", "config", "data", "state", "cache", "runtime",
         ] {
             std::fs::create_dir(dir.path().join(name)).unwrap();
         }
+        if !config.is_empty() {
+            std::fs::write(dir.path().join("config.toml"), config).unwrap();
+        }
         let id = uuid::Uuid::new_v4().simple();
-        let unit = format!("nd-test-ticket3-{id}.service");
-        let slice = format!("nd-test-ticket3{id}.slice");
+        let unit = format!("nd-test-ticket4-{id}.service");
+        let slice = format!("nd-test-ticket4{id}.slice");
         let socket = dir.path().join(if default_paths {
             "runtime/new-desktop/nd.sock"
         } else {
@@ -67,6 +74,8 @@ impl Daemon {
             &this.slice,
             "--property",
             "Restart=on-failure",
+            "--property",
+            "LimitCORE=0",
             "--property",
             "RestartSec=100ms",
             "--property",

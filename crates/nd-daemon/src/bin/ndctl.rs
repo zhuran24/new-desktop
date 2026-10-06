@@ -15,12 +15,35 @@ async fn main() -> nd_ui_core::Result<()> {
             first,
         )
     };
-    let stream = args.next().unwrap_or("global".into());
+    let argument = args.next();
     let operation = operation.as_deref().unwrap_or("get");
-    if !matches!(operation, "get" | "watch" | "page") || args.next().is_some() {
-        return Err("usage: ndctl [--socket PATH] get|watch|page [global|resource]".into());
+    if !matches!(operation, "get" | "watch" | "page" | "command" | "receipt")
+        || args.next().is_some()
+    {
+        return Err("usage: ndctl [--socket PATH] get|watch|page [resource] | command JSON | receipt COMMAND_ID".into());
     }
     let mut replica = SyncReplica::connect(socket).await?;
+    if operation == "command" {
+        let command =
+            serde_json::from_str::<nd_wire::Command>(&argument.ok_or("missing command JSON")?)?;
+        println!(
+            "{}",
+            serde_json::to_string(&replica.command(&command).await?)?
+        );
+        return Ok(());
+    }
+    if operation == "receipt" {
+        println!(
+            "{}",
+            serde_json::to_string(
+                &replica
+                    .receipt(&argument.ok_or("missing command id")?)
+                    .await?
+            )?
+        );
+        return Ok(());
+    }
+    let stream = argument.unwrap_or("global".into());
     if operation == "page" {
         println!(
             "{}",

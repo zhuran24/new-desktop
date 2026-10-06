@@ -120,7 +120,7 @@ impl SyncReplica {
         }
     }
     /// 仅有无副作用的诊断命令；此编号是 RPC 关联号，不是持久命令 id。
-    pub async fn command(&mut self, name: &str) -> Result<serde_json::Value> {
+    pub async fn query(&mut self, name: &str) -> Result<serde_json::Value> {
         let id = self.request_id()?;
         self.send(Request::Command {
             id,
@@ -128,6 +128,119 @@ impl SyncReplica {
         })
         .await?;
         self.reply(id).await
+    }
+    /// 正文只送一次。传输中断只查收据；查不到返回交付不明。
+    pub async fn command(&mut self, command: &nd_wire::Command) -> Result<nd_wire::CommandReply> {
+        for attempt in 0..5 {
+            match self.command_once(command).await {
+                Ok(nd_wire::CommandReply::Unavailable { .. }) if attempt < 4 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                }
+                Ok(result) => return Ok(result),
+                Err(_) => {
+                    return Ok(
+                        match self
+                            .receipt_matching(&command.id, Some(command.content_hash()))
+                            .await
+                        {
+                            Ok(nd_wire::ReceiptLookup::Found { receipt }) => {
+                                nd_wire::CommandReply::Receipt { receipt }
+                            }
+                            Ok(nd_wire::ReceiptLookup::Conflict) => nd_wire::CommandReply::Conflict,
+                            Ok(nd_wire::ReceiptLookup::Expired) => nd_wire::CommandReply::Expired,
+                            _ => nd_wire::CommandReply::DeliveryUnknown,
+                        },
+                    );
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn command_once(&mut self, command: &nd_wire::Command) -> Result<nd_wire::CommandReply> {
+        let id = self.request_id()?;
+        self.send(Request::Execute {
+            id,
+            command: command.clone(),
+        })
+        .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match self.receive().await? {
+                    Response::CommandReply { id: got, result } if got == id => return Ok(result),
+                    Response::Bye { .. } => return Err("nd-wire disconnected".into()),
+                    response => {
+                        self.apply(response);
+                    }
+                }
+            }
+        })
+        .await?
+    }
+    /// 查询可以安全重试，但 Missing 不能变成重发正文。
+    pub async fn receipt(&mut self, command_id: &str) -> Result<nd_wire::ReceiptLookup> {
+        self.receipt_matching(command_id, None).await
+    }
+    async fn receipt_matching(
+        &mut self,
+        command_id: &str,
+        content_hash: Option<String>,
+    ) -> Result<nd_wire::ReceiptLookup> {
+        match self.receipt_once(command_id, content_hash.clone()).await {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                self.reconnect().await?;
+                self.receipt_once(command_id, content_hash).await
+            }
+        }
+    }
+    async fn receipt_once(
+        &mut self,
+        command_id: &str,
+        content_hash: Option<String>,
+    ) -> Result<nd_wire::ReceiptLookup> {
+        let id = self.request_id()?;
+        self.send(Request::Receipt {
+            id,
+            command_id: command_id.into(),
+            content_hash,
+        })
+        .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match self.receive().await? {
+                    Response::ReceiptReply { id: got, result } if got == id => return Ok(result),
+                    Response::Bye { .. } => return Err("nd-wire disconnected".into()),
+                    response => {
+                        self.apply(response);
+                    }
+                }
+            }
+        })
+        .await?
+    }
+    async fn reconnect(&mut self) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(mut fresh) = Self::connect(&self.path).await {
+                    for (stream, snapshot) in &self.replicas {
+                        fresh
+                            .send(Request::Subscribe {
+                                stream: stream.clone(),
+                                since: Some(nd_wire::Cursor {
+                                    epoch: snapshot.epoch.clone(),
+                                    seq: snapshot.cursor,
+                                }),
+                            })
+                            .await?;
+                    }
+                    self.socket = fresh.socket;
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await?
     }
     /// 驱动事件和自动重连。取消等待安全；副本只由快照和事件修改。
     pub async fn next(&mut self) -> Result<Snapshot> {

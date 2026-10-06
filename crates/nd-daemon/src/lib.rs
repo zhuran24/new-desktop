@@ -1,4 +1,7 @@
 //! New Desktop 守护进程及 nd-wire 入口。
+pub mod commands;
+#[cfg(feature = "scenarios")]
+mod faults;
 mod local;
 use axum::{
     Router,
@@ -9,10 +12,9 @@ use axum::{
     response::Response,
     routing::get,
 };
+use futures::{SinkExt, StreamExt};
 use nd_config::{Config, FileSource, Section};
-use nd_kernel::{
-    ComponentSpec, ConfigChange, Kernel, Key, Lifecycle, Registration, RegistrationKind,
-};
+use nd_kernel::{ComponentSpec, ConfigChange, Kernel, Key, Registration, RegistrationKind};
 use nd_wire::{
     Event, Fallback, Item, PROTOCOL_VERSION, Request, Response as WireResponse, Snapshot,
 };
@@ -33,36 +35,18 @@ pub trait NamespaceProvider: Send + Sync {
     fn names(&self) -> BTreeMap<String, u32>;
     fn snapshot(&self) -> Vec<Item>;
     fn command(&self, name: &str) -> std::result::Result<Value, String>;
+    /// 在命令账本的同一事务内核对业务前置条件并施加效果，不得做外部 I/O。
+    fn execute(
+        &self,
+        tx: &mut nd_store::Tx<'_>,
+        command: &nd_wire::Command,
+    ) -> nd_store::Result<nd_wire::Receipt>;
     fn page(&self, request: &nd_wire::PageReq) -> std::result::Result<nd_wire::Page, String> {
         page_items(self.snapshot(), request)
     }
 }
-struct Diagnostics;
-impl Lifecycle for Diagnostics {}
-impl NamespaceProvider for Diagnostics {
-    fn names(&self) -> BTreeMap<String, u32> {
-        BTreeMap::from([("diagnostics".into(), 1)])
-    }
-    fn snapshot(&self) -> Vec<Item> {
-        vec![Item {
-            id: "diagnostics".into(),
-            namespace: "diagnostics".into(),
-            kind: "status".into(),
-            data: json!({"commands":["diagnostics.inspect"]}),
-            fallback: Fallback {
-                title: "诊断".into(),
-                text: "可选诊断组件已启用".into(),
-            },
-        }]
-    }
-    fn command(&self, name: &str) -> std::result::Result<Value, String> {
-        if name == "diagnostics.inspect" {
-            Ok(json!({"status":"ready"}))
-        } else {
-            Err("not_found".into())
-        }
-    }
-}
+mod diagnostics;
+use diagnostics::Diagnostics;
 #[derive(Clone, Deserialize)]
 struct DiagnosticsConfig {
     enabled: bool,
@@ -78,6 +62,21 @@ struct StorageConfig {
 impl Section for StorageConfig {
     const NAME: &'static str = "storage";
 }
+#[derive(Clone, Deserialize)]
+struct CommandsConfig {
+    receipt_keep_ms: u64,
+}
+impl Section for CommandsConfig {
+    const NAME: &'static str = "commands";
+}
+#[derive(Clone, Deserialize)]
+struct WireConfig {
+    send_queue: usize,
+    send_timeout_ms: u64,
+}
+impl Section for WireConfig {
+    const NAME: &'static str = "wire";
+}
 fn validate_config(value: &Value) -> nd_config::Result<()> {
     serde_json::from_value::<DiagnosticsConfig>(value["diagnostics"].clone())
         .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
@@ -91,10 +90,26 @@ fn validate_config(value: &Value) -> nd_config::Result<()> {
             "附件清理间隔须为 1..86400 秒，宽限期须不超过一年".into(),
         ));
     }
+    let wire: WireConfig = serde_json::from_value(value["wire"].clone())
+        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
+    if !(1..=4096).contains(&wire.send_queue) || !(1..=60000).contains(&wire.send_timeout_ms) {
+        return Err(nd_config::Error::Invalid(
+            "发送队列须为1..4096，超时须为1..60000ms".into(),
+        ));
+    }
+    let commands: CommandsConfig = serde_json::from_value(value["commands"].clone())
+        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
+    if commands.receipt_keep_ms == 0 || commands.receipt_keep_ms > 31536000000 {
+        return Err(nd_config::Error::Invalid("收据保留期须为 1ms..1年".into()));
+    }
     Ok(())
 }
 struct Engine {
     blobs: Arc<nd_store::Blobs>,
+    store: Arc<nd_store::Store>,
+    config: Arc<Config>,
+    #[cfg(feature = "scenarios")]
+    fault_root: PathBuf,
     scope: nd_kernel::ScopeId,
     kernel: Kernel,
     diagnostics: nd_kernel::Dep<dyn NamespaceProvider>,
@@ -105,7 +120,19 @@ struct Engine {
     config_error: Option<String>,
 }
 impl Engine {
-    async fn open(config: &Config, blobs: Arc<nd_store::Blobs>) -> Result<Self> {
+    async fn open(
+        config: Arc<Config>,
+        blobs: Arc<nd_store::Blobs>,
+        store: Arc<nd_store::Store>,
+        _root: &Path,
+    ) -> Result<Self> {
+        store.write(|tx| {
+            commands::migrate(tx)?;
+            commands::expire(tx)?;
+            diagnostics::migrate(tx)?;
+            Ok(())
+        })?;
+        let diagnostics_store = store.clone();
         let mut kernel = Kernel::new();
         let scope = kernel.scope();
         let diagnostics = Key::<dyn NamespaceProvider>::new(scope, "diagnostics");
@@ -117,7 +144,9 @@ impl Engine {
             move |mount| {
                 mount.provide(
                     key.clone(),
-                    Arc::new(Diagnostics) as Arc<dyn NamespaceProvider>,
+                    Arc::new(Diagnostics {
+                        store: diagnostics_store.clone(),
+                    }) as Arc<dyn NamespaceProvider>,
                 )?;
                 mount.register(Registration::new(
                     scope,
@@ -129,13 +158,24 @@ impl Engine {
                     RegistrationKind::Subscription,
                     "diagnostics",
                 ))?;
-                Ok(Box::new(Diagnostics))
+                mount.register(Registration::new(
+                    scope,
+                    RegistrationKind::Command,
+                    "diagnostics.set_note",
+                ))?;
+                Ok(Box::new(Diagnostics {
+                    store: diagnostics_store.clone(),
+                }))
             },
         )?;
         let diagnostics = kernel.require(diagnostics);
         let (events, _) = broadcast::channel(128);
         let mut this = Self {
             blobs,
+            store,
+            config: config.clone(),
+            #[cfg(feature = "scenarios")]
+            fault_root: _root.to_owned(),
             scope,
             kernel,
             diagnostics,
@@ -150,8 +190,8 @@ impl Engine {
                 items: vec![],
             },
         };
-        this.configure(config).await?;
-        this.snapshot.items = this.items(config);
+        this.configure(&config).await?;
+        this.snapshot.items = this.items(&config);
         Ok(this)
     }
     async fn configure(&mut self, config: &Config) -> Result<()> {
@@ -218,6 +258,52 @@ impl Engine {
         self.diagnostics
             .with(|p| p.command(name))
             .unwrap_or(Err("not_found".into()))
+    }
+    fn execute(&mut self, command: &nd_wire::Command) -> nd_wire::CommandReply {
+        #[cfg(feature = "scenarios")]
+        let fault = faults::Fault::take(&self.fault_root, &command.id);
+        let result = self.store.write(|tx| {
+            let reply = commands::execute(
+                tx,
+                command,
+                self.config.snapshot().value["commands"]["receipt_keep_ms"]
+                    .as_u64()
+                    .unwrap(),
+                |tx| {
+                    let receipt = self
+                        .diagnostics
+                        .with(|p| p.execute(tx, command))
+                        .unwrap_or_else(|| {
+                            Ok(nd_wire::Receipt::Rejected {
+                                code: "not_found".into(),
+                                now: Value::Null,
+                            })
+                        })?;
+                    #[cfg(feature = "scenarios")]
+                    {
+                        fault.crash("after_effect");
+                        fault.unavailable("after_effect")?;
+                    }
+                    Ok(receipt)
+                },
+            )?;
+            #[cfg(feature = "scenarios")]
+            fault.crash("before_commit");
+            Ok(reply)
+        });
+        #[cfg(feature = "scenarios")]
+        if result.is_ok() {
+            fault.crash("after_commit");
+        }
+        match result {
+            Ok(result) => {
+                self.publish(&self.config.clone());
+                result
+            }
+            Err(e) => nd_wire::CommandReply::Unavailable {
+                reason: e.to_string(),
+            },
+        }
     }
 }
 
@@ -299,12 +385,17 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     let (_watcher, mut changes) = source.watch()?;
     let config = Arc::new(Config::open(
         source,
-        json!({"diagnostics":{"enabled":true},"storage":{"blob_grace_seconds":86400,"gc_interval_seconds":3600}}),
+        json!({"diagnostics":{"enabled":true},"commands":{"receipt_keep_ms":604800000},"wire":{"send_queue":128,"send_timeout_ms":5000},"storage":{"blob_grace_seconds":86400,"gc_interval_seconds":3600}}),
         validate_config,
     )?);
     let store = Arc::new(nd_store::Store::open(paths.data.join("state.sqlite"), 4)?);
-    let blobs = Arc::new(nd_store::Blobs::open(paths.data.join("blobs"), store)?);
-    let state = Arc::new(Mutex::new(Engine::open(&config, blobs.clone()).await?));
+    let blobs = Arc::new(nd_store::Blobs::open(
+        paths.data.join("blobs"),
+        store.clone(),
+    )?);
+    let state = Arc::new(Mutex::new(
+        Engine::open(config.clone(), blobs.clone(), store.clone(), &paths.data).await?,
+    ));
     let mut storage_config = config.section::<StorageConfig>()?;
     let collector = tokio::spawn(async move {
         while let Ok(current) = storage_config.get() {
@@ -316,6 +407,13 @@ pub async fn run_at(paths: Paths) -> Result<()> {
                 },
                 changed = storage_config.changed() => { if changed.is_err() { break; } },
             }
+        }
+    });
+    let receipts_gc = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let store = store.clone();
+            let _ = tokio::task::spawn_blocking(move || store.write(commands::expire)).await;
         }
     });
     let listener = local.listen()?;
@@ -371,6 +469,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     .await?;
     monitor.abort();
     collector.abort();
+    receipts_gc.abort();
     let mut engine = state.lock().await;
     let scope = engine.scope;
     engine
@@ -383,30 +482,60 @@ async fn upgrade(ws: WebSocketUpgrade, State(state): State<Arc<Mutex<Engine>>>) 
     ws.max_message_size(1024 * 1024)
         .on_upgrade(move |socket| serve(socket, state))
 }
-async fn send(socket: &mut WebSocket, response: WireResponse) -> bool {
-    let text = serde_json::to_string(&response).expect("wire serialization");
-    matches!(
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            socket.send(Message::Text(text.into()))
-        )
-        .await,
-        Ok(Ok(()))
-    )
+fn enqueue(queue: &tokio::sync::mpsc::Sender<WireResponse>, response: WireResponse) -> bool {
+    queue.try_send(response).is_ok()
 }
-async fn serve(mut socket: WebSocket, state: Arc<Mutex<Engine>>) {
+async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
+    let config = state
+        .lock()
+        .await
+        .config
+        .section::<WireConfig>()
+        .unwrap()
+        .get()
+        .unwrap()
+        .value;
+    let (mut sink, mut incoming) = socket.split();
+    let (outgoing, mut queued) = tokio::sync::mpsc::channel::<WireResponse>(config.send_queue);
+    let (close, mut closing) = tokio::sync::oneshot::channel::<()>();
+    let mut writer = tokio::spawn(async move {
+        loop {
+            let response = tokio::select! {
+                biased;
+                _ = &mut closing => {
+                    // 队列溢出时 Bye 尽力而为，不能等慢接收者释放资源。
+                    let _ = tokio::time::timeout(Duration::from_millis(config.send_timeout_ms),
+                        sink.send(Message::Text(serde_json::to_string(&WireResponse::Bye { resume: true }).unwrap().into()))).await;
+                    break;
+                },
+                response = queued.recv() => match response { Some(response) => response, None => break },
+            };
+            let text = serde_json::to_string(&response).expect("wire serialization");
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(config.send_timeout_ms),
+                    sink.send(Message::Text(text.into()))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+        }
+    });
     let mut greeted = false;
     let mut subscribed = false;
     let mut events = state.lock().await.events.subscribe();
     loop {
         tokio::select! {
-            frame = socket.recv() => {
+            _ = &mut writer => return,
+            frame = incoming.next() => {
                 let Some(Ok(frame)) = frame else { break; };
                 let Message::Text(text) = frame else { if matches!(frame, Message::Close(_)) { break; } else { continue; } };
                 let Ok(req) = serde_json::from_str::<Request>(&text) else { break; };
                 let mut replay = vec![];
                 let response = {
-                    let engine = state.lock().await;
+                    let mut engine = state.lock().await;
                     match req {
                         Request::Hello { version: PROTOCOL_VERSION, namespaces } => {
                             greeted = true;
@@ -422,7 +551,7 @@ async fn serve(mut socket: WebSocket, state: Arc<Mutex<Engine>>) {
                             events = engine.events.subscribe();
                             subscribed = true;
                             let earliest = engine.history.front().map_or(engine.snapshot.cursor, |event| event.cursor - 1);
-                            if let Some(since) = since.filter(|c| c.epoch == engine.snapshot.epoch && c.seq >= earliest && c.seq <= engine.snapshot.cursor) {
+                            if let Some(since) = since.filter(|c| c.epoch == engine.snapshot.epoch && c.seq >= earliest && c.seq <= engine.snapshot.cursor && engine.snapshot.cursor - c.seq < config.send_queue as u64) {
                                 replay = engine.history.iter().filter(|event| event.cursor > since.seq).cloned().collect();
                                 WireResponse::Resumed { stream, epoch: engine.snapshot.epoch.clone(), cursor: engine.snapshot.cursor }
                             } else { WireResponse::Snapshot { snapshot: engine.snapshot.clone() } }
@@ -444,21 +573,26 @@ async fn serve(mut socket: WebSocket, state: Arc<Mutex<Engine>>) {
                             Ok(value) => WireResponse::Reply { id, value, error: None },
                             Err(error) => WireResponse::Reply { id, value: Value::Null, error: Some(error) },
                         },
+                        Request::Execute { id, command } if greeted => WireResponse::CommandReply { id, result: engine.execute(&command) },
+                        Request::Receipt { id, command_id, content_hash } if greeted => WireResponse::ReceiptReply { id,
+                            result: commands::lookup(&engine.store, &command_id, content_hash.as_deref()).unwrap_or_else(|e| nd_wire::ReceiptLookup::Unavailable { reason: e.to_string() }) },
                         Request::Bye => break,
                         _ => WireResponse::Error { code: "unsupported".into(), message: "请求、流或版本不支持".into() },
                     }
                 };
                 for event in replay {
-                    if !send(&mut socket, WireResponse::Event { event }).await { return; }
+                    if !enqueue(&outgoing, WireResponse::Event { event }) { let _ = close.send(()); let _ = writer.await; return; }
                 }
-                if !send(&mut socket, response).await { break; }
+                if !enqueue(&outgoing, response) { break; }
             },
             event = events.recv(), if subscribed => match event {
-                Ok(event) => if !send(&mut socket, WireResponse::Event { event }).await { break; },
-                Err(_) => { let _ = send(&mut socket, WireResponse::Bye { resume: true }).await; break; }
+                Ok(event) => if !enqueue(&outgoing, WireResponse::Event { event }) { break; },
+                Err(_) => break
             }
         }
     }
+    let _ = close.send(());
+    let _ = writer.await;
 }
 
 async fn get_blob(
