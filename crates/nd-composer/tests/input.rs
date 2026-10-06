@@ -177,3 +177,17 @@ fn unfocused_disabled_blank_and_held_keys_do_not_offer_a_submission() {
         }]
     );
 }
+
+#[test]
+fn an_attachment_only_draft_can_submit_but_never_during_composition() {
+    let mut state = ready("");
+    state.has_attachments = true;
+    assert_eq!(
+        step(state.clone(), InputEvent::Submit).1,
+        [ComposerAction::Submit {
+            text: String::new()
+        }]
+    );
+    state.composing = true;
+    assert!(step(state, InputEvent::Submit).1.is_empty());
+}

@@ -3,6 +3,7 @@
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ComposerState {
     pub text: String,
+    pub has_attachments: bool,
     pub composing: bool,
     pub focused: bool,
     pub send_enabled: bool,
@@ -53,7 +54,10 @@ pub enum ComposerAction {
 
 pub fn step(mut state: ComposerState, event: InputEvent) -> (ComposerState, Vec<ComposerAction>) {
     let submit = |state: &ComposerState| {
-        if state.send_enabled && !state.composing && !state.text.trim().is_empty() {
+        if state.send_enabled
+            && !state.composing
+            && (!state.text.trim().is_empty() || state.has_attachments)
+        {
             vec![ComposerAction::Submit {
                 text: state.text.clone(),
             }]

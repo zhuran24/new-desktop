@@ -22,6 +22,10 @@ impl Desktop {
             draft.edit(current.text);
         }
         draft.observe(remote, current.composing || self.sending);
+        let attachments = draft.attachments().to_vec();
+        for a in attachments {
+            self.load_attachment_image(&a, cx);
+        }
         self.restore_draft(window, cx);
     }
 
@@ -144,10 +148,9 @@ impl Desktop {
         let Some(session) = self.draft_key() else {
             return;
         };
-        self.drafts
-            .entry(Some(session.clone()))
-            .or_default()
-            .edit(saved.text);
+        let draft = self.drafts.entry(Some(session.clone())).or_default();
+        draft.edit(saved.text);
+        draft.replace_attachments(saved.attachments);
         self.queued_send = None;
         self.restore_draft(window, cx);
         self.persist_draft(session, window, cx);
@@ -210,6 +213,12 @@ impl Desktop {
                     .rounded(px(t.radius))
                     .child("另存的草稿")
                     .child(saved.text)
+                    .children(
+                        saved
+                            .attachments
+                            .iter()
+                            .map(|a| div().child(format!("📎 {}", a.name))),
+                    )
                     .child(
                         div()
                             .id(SharedString::from(format!("restore/{id}")))
@@ -227,6 +236,7 @@ impl Desktop {
     #[cfg(feature = "scenarios")]
     pub fn scenario_draft(plan: serde_json::Value, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |weak, cx| {
+            let mut drop_stage = 0;
             for _ in 0..400 {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(50))
@@ -235,6 +245,38 @@ impl Desktop {
                     .update_in(cx, |this, window, cx| {
                         if this.session_snapshot.is_none() {
                             return false;
+                        }
+                        if let Some(file) = plan["file"].as_str() {
+                            if drop_stage < 2 {
+                                let size = window.viewport_size();
+                                let position = point(
+                                    size.width / 2.,
+                                    size.height - px(this.theme.spacing.large * 3.),
+                                );
+                                let event = if drop_stage == 0 {
+                                    FileDropEvent::Entered {
+                                        position,
+                                        paths: ExternalPaths(
+                                            [std::path::PathBuf::from(file)].into_iter().collect(),
+                                        ),
+                                    }
+                                } else {
+                                    FileDropEvent::Submit { position }
+                                };
+                                window.defer(cx, move |window, cx| {
+                                    window.dispatch_event(PlatformInput::FileDrop(event), cx);
+                                });
+                                drop_stage += 1;
+                                return false;
+                            }
+                            if this.uploading > 0
+                                || this
+                                    .drafts
+                                    .get(&this.draft_key())
+                                    .is_none_or(|d| d.attachments().len() != 1)
+                            {
+                                return false;
+                            }
                         }
                         if let Some(id) = plan["restore"].as_str() {
                             this.restore_saved_draft(id, window, cx);

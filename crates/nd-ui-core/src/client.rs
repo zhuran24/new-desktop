@@ -1,10 +1,15 @@
 //! GPUI 等非 Tokio executor 的命令入口。网络仅在专用线程上运行。
-use crate::SyncReplica;
+use crate::{AttachmentSource, SyncReplica};
 use nd_wire::{Command, CommandReply, Model, ReceiptLookup};
 use std::{io, path::Path, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 enum Work {
+    Upload(
+        AttachmentSource,
+        oneshot::Sender<Result<nd_wire::Attachment, String>>,
+    ),
+    Blob(String, oneshot::Sender<Result<Vec<u8>, String>>),
     Command(Command, oneshot::Sender<Result<CommandReply, String>>),
     Models(String, String, oneshot::Sender<Result<Vec<Model>, String>>),
     Receipt(String, oneshot::Sender<Result<ReceiptLookup, String>>),
@@ -38,6 +43,12 @@ impl CommandClient {
                                     _ => "连接守护进程超时".into(),
                                 };
                                 match work {
+                                    Work::Upload(_, done) => {
+                                        let _ = done.send(Err(why));
+                                    }
+                                    Work::Blob(_, done) => {
+                                        let _ = done.send(Err(why));
+                                    }
                                     Work::Command(_, done) => {
                                         let _ = done.send(Err(why));
                                     }
@@ -52,6 +63,19 @@ impl CommandClient {
                             }
                         };
                         match work {
+                            Work::Upload(source, done) => {
+                                let result = async {
+                                    let (attachment, bytes) = source.read().await?;
+                                    ui.put_blob(&bytes).await.map_err(|e| e.to_string())?;
+                                    Ok(attachment)
+                                }
+                                .await;
+                                let _ = done.send(result);
+                            }
+                            Work::Blob(blob, done) => {
+                                let _ =
+                                    done.send(ui.get_blob(&blob).await.map_err(|e| e.to_string()));
+                            }
                             Work::Receipt(command_id, done) => {
                                 let _ = done
                                     .send(ui.receipt(&command_id).await.map_err(|e| e.to_string()));
@@ -76,6 +100,20 @@ impl CommandClient {
                 })
             })?;
         Ok(Self { tx })
+    }
+    pub async fn upload(&self, source: AttachmentSource) -> Result<nd_wire::Attachment, String> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .try_send(Work::Upload(source, done))
+            .map_err(|_| "上传队列已满或连接已关闭".to_owned())?;
+        result.await.map_err(|_| "上传已取消".to_owned())?
+    }
+    pub async fn blob(&self, blob: String) -> Result<Vec<u8>, String> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .try_send(Work::Blob(blob, done))
+            .map_err(|_| "下载队列已满或连接已关闭".to_owned())?;
+        result.await.map_err(|_| "下载已取消".to_owned())?
     }
     pub async fn command(&self, command: Command) -> Result<CommandReply, String> {
         let (done, result) = oneshot::channel();

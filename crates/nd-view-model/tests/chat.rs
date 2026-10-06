@@ -273,3 +273,22 @@ fn completed_creation_is_out_of_the_chat_and_partial_failure_stays_explained() {
     assert_eq!(view.messages[0].title, "新建会话");
     assert_eq!(view.messages[0].text, "首条消息交付不明");
 }
+
+#[test]
+fn attachment_edits_participate_in_draft_receipt_revision() {
+    let mut draft = nd_view_model::Draft::default();
+    let a = nd_wire::Attachment {
+        blob: "a".repeat(64),
+        name: "图.png".into(),
+        media_type: "image/png".into(),
+        size: 42,
+    };
+    draft.attach(a.clone());
+    let submitted = draft.revision();
+    draft.detach(0);
+    assert!(!draft.accept(submitted));
+    draft.attach(a.clone());
+    assert_eq!(draft.attachments(), &[a]);
+    assert!(draft.accept(draft.revision()));
+    assert!(draft.attachments().is_empty());
+}

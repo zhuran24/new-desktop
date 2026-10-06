@@ -9,6 +9,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 会话持久草稿；光标、选区和输入法组词不在此协议中。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Draft {
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     pub version: u64,
     pub text: String,
     pub device: String,
@@ -19,6 +21,8 @@ pub struct Draft {
 /// 版本比较落败的原文；id 是原编辑命令的 id，重试不重复另存。
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SavedDraft {
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     pub id: String,
     pub base_version: u64,
     pub text: String,
@@ -35,6 +39,8 @@ pub struct DraftUpdated {
 /// `session.draft.update` 的参数；前置版本放在 Command.expect。
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct DraftUpdate {
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     pub session: String,
     pub text: String,
 }
@@ -269,5 +275,47 @@ impl Command {
                 serde_json::to_vec(&sorted(serde_json::to_value(self).unwrap())).unwrap()
             )
         )
+    }
+}
+/// 附件正文经鉴权 HTTP GET/PUT，消息和草稿只携带内容寻址引用。
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct Attachment {
+    pub blob: String,
+    pub name: String,
+    pub media_type: String,
+    pub size: u64,
+}
+
+impl Attachment {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.blob.len() != 64
+            || !self
+                .blob
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("附件需要小写 SHA-256 内容散列".into());
+        }
+        if self.name.is_empty() || self.name.len() > 255 || self.name.chars().any(char::is_control)
+        {
+            return Err("附件名称为空、过长或含控制字符".into());
+        }
+        if !matches!(
+            self.media_type.as_str(),
+            "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp"
+                | "text/plain"
+                | "application/pdf"
+        ) {
+            return Err("不支持此附件类型".into());
+        }
+        if self.size == 0 || self.size > 5 * 1024 * 1024 {
+            return Err("单个附件须为 1 字节至 5 MiB".into());
+        }
+        Ok(())
     }
 }

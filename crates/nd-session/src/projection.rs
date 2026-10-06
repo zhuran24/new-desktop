@@ -26,6 +26,8 @@ pub enum Shown {
         data: Value,
     },
     Prompt {
+        #[serde(default)]
+        attachments: Vec<nd_wire::Attachment>,
         id: String,
         text: String,
         intent: String,
@@ -125,6 +127,7 @@ impl Shown {
                 ),
             ),
             Shown::Prompt {
+                attachments,
                 id,
                 text,
                 intent,
@@ -133,7 +136,7 @@ impl Shown {
                 reason,
             } => (
                 "prompt",
-                json!({"message":id,"text":text,"intent":intent,"state":state,"native":native,"reason":reason}),
+                json!({"message":id,"text":text,"attachments":attachments,"intent":intent,"state":state,"native":native,"reason":reason}),
                 "你".to_owned(),
                 format!("{}［{state}］", shorten(text)),
             ),

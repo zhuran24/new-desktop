@@ -143,3 +143,16 @@
 | LINEAGE-ANCHOR | 带原 UUID 的 user 回显对应 CLI JSONL 中同 UUID 的 user 行；最终主对话 `assistant.uuid` 对应 JSONL 的 assistant 行，和 API `message.id` 分开。工具调用中的多次模型请求仍为一轮 | CONV-ECHO/CONV-TURN；本版本主接缝读 CLI 自己写出的记录实测 | `human_rounds_map_to_cli_uuids_and_survive_restart` 同时核 user 与最终 assistant 行；默认录制回归包括真实 Bash 工具往返；纯函数测试防止迟到早期输出改写终结锚点 | 没有可核的原生位置就不给后续操作锚点；不写 CLI 记录补造位置 |
 
 本单没有编号待验证项，不验证 Codex `clientId` 回显 V3。没有写 CLI 原生存储，没有新增可选组件或结构/派发操作；图与索引均由守护进程通过 nd-wire 提供。回合进行中重启的测试只证明谱系身份与映射持久，不代替 #19 的全部流式恢复验收。
+
+## 附件输入（#17）
+
+固定 CLI 2.1.289，字节指纹同 #13。协议依据：`research/protocol.md` §3.3、`research/impl/INDEX.md` #17，以及本单真实产品主接缝请求。详细验证与平台退路见 [ticket-17](verification/ticket-17.md)。
+
+| 编号 | 依赖 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|
+| ATTACH-IMAGE | stream-json user.content 的 image/source{type:base64,media_type,data} 接受 PNG/JPEG/GIF/WebP；图片原字节进实际模型请求 | `attachments_reach_the_model_and_remain_in_the_conversation`、`jpeg_gif_and_webp_attachments_reach_the_model_with_their_original_bytes` | 不发送伪路径或静默丢图；受影响候选不放行，保留当前钉版 |
+| ATTACH-FILE | PDF 以 document/source{type:base64,media_type:application/pdf,data} 输入；普通 UTF-8 文件以标注名称的 text 块输入；可以没有额外正文 | `files_without_caption_reach_the_model_and_survive_restart_and_collection`：实际请求正文、PDF 原字节、纯附件创建/发送和重启后引用 | 非 UTF-8 或未支持的二进制格式明确拒绝，要求转换文件；候选改变 PDF 支持则不放行 |
+| DIFF-EDIT | Claude 的 Edit 工具块保留 name 和 input.file_path/old_string/new_string，供片段 diff 使用（出处：CLI 工具声明与本单实际 Read → Edit 往返） | `real_edit_tool_exposes_the_replaced_text_for_diff_display`；纯视图测试核片段行号与内容 | 缺少字段时保留原工具条目后备文字，不猜文件内容 |
+| ATTACH-SIZE | 大于旧看守单行界限的消息仍能经固定 CLI 到模型；正常回显照常结票 | `a_multi_megabyte_attachment_is_not_lost_at_the_watchdog_frame_boundary`：2,400,000 字节全文；原生粘贴场景核对多个内容块 | 编码后超过看守单行界限时在写前明确失败，正文及引用保留；不把确定未写出算成 Unknown |
+
+没有写 CLI 原生记录。新建与发送继续使用原动作、UUID 和收据契约，崩溃矩阵增加 `create-and-send/attachments` 和 `create/attachments-open-fails`；上传正文只经 Blobs HTTP，持久动作只存引用。

@@ -69,6 +69,17 @@ impl Blobs {
         }
         Ok(bytes)
     }
+    /// 业务事务内核对引用；不读文件，不和清理器交错。
+    pub fn size(&self, tx: &Tx<'_>, id: &str) -> Result<Option<u64>> {
+        use crate::OptionalExtension;
+        Ok(tx
+            .query_row(
+                "SELECT size FROM nd_blobs WHERE id=?1 AND deleting=0",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
     pub fn hold(&self, tx: &mut Tx<'_>, id: &str, owner: &str) -> Result<()> {
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM nd_blobs WHERE id=?1 AND deleting=0)",
