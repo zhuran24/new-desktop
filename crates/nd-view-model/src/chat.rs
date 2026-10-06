@@ -72,8 +72,7 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
         .items
         .iter()
         .filter(|i| {
-            !matches!(i.kind.as_str(), "header" | "draft")
-                && !(i.kind == "op" && i.data["phase"] == "done")
+            !crate::history_control(&i.kind) && !(i.kind == "op" && i.data["phase"] == "done")
         })
         .collect();
     items.sort_by_key(|i| i.data["seq"].as_u64().unwrap_or(u64::MAX));

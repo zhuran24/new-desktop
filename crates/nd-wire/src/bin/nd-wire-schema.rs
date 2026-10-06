@@ -2,6 +2,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = std::path::PathBuf::from(std::env::args().nth(1).unwrap_or("protocol".into()));
     std::fs::create_dir_all(&directory)?;
     for (name, schema) in [
+        ("page.schema.json", schemars::schema_for!(nd_wire::Page)),
         ("draft.schema.json", schemars::schema_for!(nd_wire::Draft)),
         (
             "draft-update.schema.json",

@@ -173,12 +173,19 @@ pub enum Response {
 pub struct PageReq {
     pub before: Option<String>,
     pub limit: u32,
+    /// 按稳定轮 id 定位；与 before/after 互斥。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub around: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 impl Default for PageReq {
     fn default() -> Self {
         Self {
             before: None,
-            limit: 100,
+            limit: 60,
+            around: None,
+            after: None,
         }
     }
 }
@@ -186,6 +193,13 @@ impl Default for PageReq {
 pub struct Page {
     pub items: Vec<Item>,
     pub next: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    /// 本页和会话事件流的同一观察点；界面据此合并先到的更新。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<Cursor>,
 }
 
 /// id 在守护进程内全局唯一；device 是来源标识，本机权限仍由 socket uid 决定。

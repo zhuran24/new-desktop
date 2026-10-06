@@ -30,6 +30,8 @@ def inner():
         args = ['/nd-desktop', '--socket', socket, '--state', f'/sandbox/state/{device}.json', '--quit-after', '45']
         if create:
             args += ['--scenario-create', json.dumps({'cwd': '/sandbox/project', 'model': 'haiku', 'text': '请写代码'})]
+        if settings.get('history'):
+            args += ['--scenario-history', json.dumps({'round': settings['round']})]
         if draft is not None:
             args += ['--scenario-draft', json.dumps(draft)]
         process = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=dict(os.environ, WAYLAND_DEBUG='client'))
@@ -46,7 +48,7 @@ def inner():
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                value = event.get('rendered_editor' if settings.get('drafts') else 'rendered_session')
+                value = event.get('rendered_history' if settings.get('history') else ('rendered_editor' if settings.get('drafts') else 'rendered_session'))
                 if value is not None and predicate(value):
                     return value
             time.sleep(0.03)
@@ -64,6 +66,18 @@ def inner():
         assert result.returncode == 0, result.stderr.decode()
 
     try:
+        if settings.get('history'):
+            (Path('/sandbox/state') / 'ui.json').write_text(json.dumps({'selected_session': settings['session']}))
+            app = start('history')
+            value = wait('history', lambda s: s.get('anchor') is not None)
+            assert value['first'] == settings['text'], value
+            assert value['rounds'] == settings['rounds'], value
+            assert value['messages'] <= 60, value
+            assert any(settings['text'] in json.loads(line).get('history_preview', '') for line in (out / 'history.jsonl').read_text().splitlines()), 'hover must show round preview'
+            screenshot('history-dark')
+            assert re.search(r'wl_surface#\d+\.attach\(wl_buffer#', (out / 'history.log').read_text())
+            (out / 'result.json').write_text(json.dumps({'pass': True, 'history': value}))
+            return
         if settings.get('drafts'):
             for device in ['a', 'b']:
                 (Path('/sandbox/state') / f'{device}.json').write_text(json.dumps({'selected_session': settings['session']}))
@@ -143,7 +157,7 @@ def run(args):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None, 'session': args.session}))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None and not args.history, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds}))
         (work / 'dbus.conf').write_text('<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen><policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/></policy></busconfig>')
         (work / 'session.sh').write_text('#!/bin/sh\nexec /usr/bin/python /scenario.py --inner\n')
         (work / 'session.sh').chmod(0o700)
@@ -185,4 +199,8 @@ if __name__ == '__main__':
         parser.add_argument('--socket', required=True)
         parser.add_argument('--output', required=True)
         parser.add_argument('--session', help='run the draft editor scenario for this session')
+        parser.add_argument('--history', action='store_true')
+        parser.add_argument('--round')
+        parser.add_argument('--text')
+        parser.add_argument('--rounds', type=int)
         run(parser.parse_args())

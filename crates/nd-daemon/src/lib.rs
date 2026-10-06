@@ -408,12 +408,20 @@ fn page_items(
     items: Vec<Item>,
     request: &nd_wire::PageReq,
 ) -> std::result::Result<nd_wire::Page, String> {
-    if request.before.is_some() || request.limit == 0 || request.limit > 1000 {
+    if request.before.is_some()
+        || request.after.is_some()
+        || request.around.is_some()
+        || request.limit == 0
+        || request.limit > 1000
+    {
         return Err("invalid_page".into());
     }
     Ok(nd_wire::Page {
         items: items.into_iter().take(request.limit as usize).collect(),
         next: None,
+        newer: None,
+        anchor: None,
+        at: None,
     })
 }
 
@@ -735,6 +743,15 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                 let Ok(req) = serde_json::from_str::<Request>(&text) else { break; };
                 // 会话的命令与流不经全局锁：命令要等会话执行器提交，流各自转发。
                 let req = match req {
+                    Request::Get { id, res, page } if greeted && res.starts_with("session/") => {
+                        let session = res["session/".len()..].strip_suffix("/items").unwrap_or(&res["session/".len()..]);
+                        let response = match sessions.page(&nd_backend::SessionId(session.into()), &page) {
+                            Ok(page) => WireResponse::Reply { id, value: serde_json::to_value(page).unwrap(), error: None },
+                            Err(error) => WireResponse::Reply { id, value: Value::Null, error: Some(error) },
+                        };
+                        if !enqueue(&outgoing, response) { break; }
+                        continue;
+                    }
                     Request::Models { id, backend, cwd } if greeted => {
                         let response = match sessions.models(&backend, cwd.into()).await {
                             Ok(models) => WireResponse::Reply { id, value: serde_json::to_value(models).unwrap(), error: None },

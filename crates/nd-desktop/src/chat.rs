@@ -177,6 +177,7 @@ impl Desktop {
         self.creating = true;
         self.session_feed = None;
         self.session_snapshot = None;
+        self.history.clear();
         self.state.selected_session = None;
         self.save.send_replace(self.state.clone());
         self.restore_draft(window, cx);
@@ -197,6 +198,7 @@ impl Desktop {
         self.scroll = ScrollHandle::new();
         self.session_feed = None; // 丢掉接收任务即关闭订阅，不结束后端。
         self.session_snapshot = None;
+        self.history.clear();
         self.creating = false;
         self.state.selected_session = Some(session.clone());
         self.save.send_replace(self.state.clone());
@@ -216,12 +218,15 @@ impl Desktop {
                                 }
                                 match update {
                                     FeedUpdate::Snapshot(s) => {
-                                        if this.session_snapshot.is_none()
-                                            || this.scroll.max_offset().y + this.scroll.offset().y
-                                                <= px(this.theme.spacing.small)
+                                        if this.history.is_latest()
+                                            && (this.session_snapshot.is_none()
+                                                || this.scroll.max_offset().y
+                                                    + this.scroll.offset().y
+                                                    <= px(this.theme.spacing.small))
                                         {
                                             this.scroll.scroll_to_bottom();
                                         }
+                                        this.history.observe(s.clone());
                                         this.session_snapshot = Some(s);
                                         this.sync_draft(window, cx);
                                         this.persist_draft(session.clone(), window, cx);
@@ -521,7 +526,8 @@ impl Desktop {
                 .child("选择模型后，在下方输入第一条消息并发送。")
                 .into_any_element();
         }
-        let Some(snapshot) = &self.session_snapshot else {
+        let displayed = self.history.snapshot();
+        let Some(snapshot) = &displayed else {
             return div().child("正在读取会话…").into_any_element();
         };
         let view = conversation(snapshot);

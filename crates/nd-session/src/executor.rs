@@ -1663,7 +1663,7 @@ impl Executor {
                 value
             })
             .collect();
-        let data = json!({"current": lineage.current(), "rounds": rounds, "topology": lineage.topology(),
+        let data = json!({"current": lineage.current(), "rounds": rounds, "inactive_messages": lineage.inactive_messages(), "topology": lineage.topology(),
             "origin": lineage.origin(), "edges": lineage.edges(), "switches": lineage.switches(), "carriers": lineage.carriers(),
             "segments": lineage.topology().iter().map(|n| lineage.segment(&n.segment).unwrap()).collect::<Vec<_>>()});
         self.show(tx, fx, Shown::Lineage { data })?;
