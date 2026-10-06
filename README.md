@@ -1,6 +1,6 @@
 # New Desktop
 
-Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 Codex app-server。当前代码包含组件内核、本机守护进程、只读同步流、配置与存储底座、Claude 记录解析及对话转换库；后端会话和桌面外壳由后续工单接入。
+Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 Codex app-server。当前代码包含组件内核、本机守护进程、同步流与持久命令收据、配置与存储底座、Claude 记录解析及对话转换库；后端会话和桌面外壳由后续工单接入。
 
 领域用语见 [GLOSSARY.md](GLOSSARY.md)，架构决定见 [docs/adr](docs/adr/)。
 
@@ -14,7 +14,7 @@ Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 
 | `crates/nd-wire` | 协议 Rust 类型与 JSON Schema 生成器 |
 | `crates/nd-config` | 分节监视、修订冲突检查、原子配置写入 |
 | `crates/nd-store` | SQLite 事务、只读池、SHA-256 附件及引用 |
-| `crates/nd-ui-core` | 无 GPUI 依赖的连接、同步副本及读取接口 |
+| `crates/nd-ui-core` | 无 GPUI 依赖的连接、同步副本、幂等命令与收据查询 |
 | `crates/nd-daemon` | 守护进程、UDS HTTP/WebSocket、可选组件和 ndctl |
 | [`crates/nd-claude-records`](crates/nd-claude-records/README.md) | Claude 主记录选链、字节偏移索引、历史分页；只读纯库 |
 | [`crates/nd-convert`](crates/nd-convert/README.md) | Claude/Codex 经中间条目互转、损失清单与中立设置换算；纯库 |

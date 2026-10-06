@@ -59,7 +59,7 @@ async fn config_unloads_optional_namespace_and_command_without_losing_global() {
     let mut replica = SyncReplica::connect(&daemon.socket).await.unwrap();
     let initial = replica.subscribe("global").await.unwrap();
     assert!(initial.items.iter().any(|i| i.namespace == "diagnostics"));
-    assert!(replica.command("diagnostics.inspect").await.is_ok());
+    assert!(replica.query("diagnostics.inspect").await.is_ok());
     std::fs::write(
         daemon.root().join("config.toml"),
         "[diagnostics]\nenabled = false\n",
@@ -82,7 +82,7 @@ async fn config_unloads_optional_namespace_and_command_without_losing_global() {
     assert!(changed.cursor > initial.cursor);
     assert_eq!(changed.epoch, initial.epoch);
     assert!(changed.items.iter().any(|i| i.namespace == "system"));
-    assert!(replica.command("diagnostics.inspect").await.is_err());
+    assert!(replica.query("diagnostics.inspect").await.is_err());
     std::fs::write(
         daemon.root().join("config.toml"),
         "[diagnostics]\nenabled = true\n",
@@ -104,7 +104,7 @@ async fn config_unloads_optional_namespace_and_command_without_losing_global() {
     })
     .await
     .unwrap();
-    assert!(replica.command("diagnostics.inspect").await.is_ok());
+    assert!(replica.query("diagnostics.inspect").await.is_ok());
 }
 
 #[tokio::test]

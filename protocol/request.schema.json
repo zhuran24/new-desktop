@@ -107,6 +107,56 @@
     {
       "type": "object",
       "properties": {
+        "command": {
+          "$ref": "#/$defs/Command"
+        },
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "type": {
+          "type": "string",
+          "const": "execute"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "command"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "command_id": {
+          "type": "string"
+        },
+        "content_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "type": {
+          "type": "string",
+          "const": "receipt"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "command_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "type": {
           "type": "string",
           "const": "bye"
@@ -130,6 +180,30 @@
     }
   ],
   "$defs": {
+    "Command": {
+      "description": "id 在守护进程内全局唯一；device 是来源标识，本机权限仍由 socket uid 决定。",
+      "type": "object",
+      "properties": {
+        "args": true,
+        "device": {
+          "type": "string"
+        },
+        "expect": true,
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "device",
+        "name",
+        "args",
+        "expect"
+      ]
+    },
     "Cursor": {
       "type": "object",
       "properties": {

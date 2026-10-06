@@ -120,6 +120,50 @@
     {
       "type": "object",
       "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "result": {
+          "$ref": "#/$defs/CommandReply"
+        },
+        "type": {
+          "type": "string",
+          "const": "command_reply"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "result"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "result": {
+          "$ref": "#/$defs/ReceiptLookup"
+        },
+        "type": {
+          "type": "string",
+          "const": "receipt_reply"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "result"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "code": {
           "type": "string"
         },
@@ -167,6 +211,80 @@
     }
   ],
   "$defs": {
+    "CommandReply": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "$ref": "#/$defs/Receipt"
+            },
+            "status": {
+              "type": "string",
+              "const": "receipt"
+            }
+          },
+          "required": [
+            "status",
+            "receipt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "conflict"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "expired"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "description": "明确未受理、没有新收据，只有这一种情况可自动同 id 重试。",
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ]
+        },
+        {
+          "description": "仅同步副本产生：断线后查不到收据，不能自动重发正文。",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "delivery_unknown"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        }
+      ]
+    },
     "Event": {
       "type": "object",
       "properties": {
@@ -240,6 +358,145 @@
         "kind",
         "data",
         "fallback"
+      ]
+    },
+    "Receipt": {
+      "description": "提交时的永久结论，后续操作进度不能改写已签发的收据。",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "done"
+            },
+            "value": true
+          },
+          "required": [
+            "status",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "accepted"
+            }
+          },
+          "required": [
+            "status",
+            "op"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "now": true,
+            "status": {
+              "type": "string",
+              "const": "rejected"
+            }
+          },
+          "required": [
+            "status",
+            "code",
+            "now"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "now": true,
+            "status": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "status",
+            "now"
+          ]
+        }
+      ]
+    },
+    "ReceiptLookup": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "conflict"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "$ref": "#/$defs/Receipt"
+            },
+            "status": {
+              "type": "string",
+              "const": "found"
+            }
+          },
+          "required": [
+            "status",
+            "receipt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "missing"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "expired"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ]
+        }
       ]
     },
     "Snapshot": {
