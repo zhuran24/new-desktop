@@ -250,6 +250,19 @@
     "PageReq": {
       "type": "object",
       "properties": {
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "around": {
+          "description": "按稳定轮 id 定位；与 before/after 互斥。",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "before": {
           "type": [
             "string",
