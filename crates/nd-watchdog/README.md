@@ -46,6 +46,6 @@
 
 真实 2.1.289 Workflow 录制在 `../nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl`：六个顺序子代理、约 75 秒，场景范围截至 Workflow 成功完成，CLI 此时仍可继续输入。它证明录制/解码，不证明后续尚未实现的会话折叠或转接。
 
-运行 `scripts/test-scenarios.sh` 验真实服务、PID 连续性、每秒 1000 行下各 50 次 SIGKILL/restart、输入去重、溢出、退出清理、N7/V6。默认内存验证在 E 盘普通文件上制造可回收页缓存，断言 `memory.events.max > 0`、`memory.current <= memory.max`、`oom=oom_kill=0`。真实匿名内存 OOM 测试被 `#[ignore]`，会触发 KDE 桌面通知，只能显式手动跑：
+运行 `scripts/test-scenarios.sh` 验真实服务、PID 连续性、每秒 1000 行下各 50 次 SIGKILL/restart、输入去重、溢出、退出清理、N7/V6。默认内存验证在 E 盘普通文件上制造可回收页缓存，断言 `memory.events.max > 0`、`memory.current <= memory.max`、`oom=oom_kill=0`。真实匿名内存 OOM 测试被 `#[ignore]`，会触发 KDE 桌面通知，只能显式手动跑。
 
 手动命令和结果见 [验证记录](../../docs/verification/ticket-6.md)，CLI 行为与升级退路见 [CLI 契约清单](../../docs/cli-contracts.md)。
