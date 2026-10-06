@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+nd-composer.workspace = true
 gpui-kit.workspace = true
 nd-view-model.workspace = true
 nd-ui-core.workspace = true
@@ -13,8 +14,16 @@ nd-wire.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true
 
 [features]
 scenarios = []
+
+[[bin]]
+name = "nd-composer-lab"
+path = "src/bin/nd-composer-lab.rs"
+required-features = ["scenarios"]
