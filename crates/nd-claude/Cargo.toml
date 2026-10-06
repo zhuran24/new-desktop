@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 nd-mod-proto.workspace = true
+nd-backend.workspace = true
+nd-claims.workspace = true
 nd-runs.workspace = true
 nd-watchdog-proto.workspace = true
 serde.workspace = true

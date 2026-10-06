@@ -209,7 +209,14 @@ impl Scenario {
         ] {
             std::fs::create_dir(dir.path().join(name))?;
         }
-        std::fs::write(dir.path().join("config.toml"), options.config)?;
+        // `{root}` 换成本场景的根目录（宿主路径，守护进程在沙盒里同一路径可见）。
+        std::fs::write(
+            dir.path().join("config.toml"),
+            options.config.replace(
+                "{root}",
+                dir.path().to_str().ok_or("non-UTF8 scenario root")?,
+            ),
+        )?;
         std::fs::write(dir.path().join("sandbox.py"), include_str!("sandbox.py"))?;
         let id = uuid::Uuid::new_v4().simple();
         let slice = format!("nd-test-{}{id}.slice", options.name.replace('-', ""));

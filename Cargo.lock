@@ -4176,6 +4176,8 @@ name = "nd-claude"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "nd-backend",
+ "nd-claims",
  "nd-mod-proto",
  "nd-runs",
  "nd-testkit",
@@ -4233,11 +4235,16 @@ dependencies = [
  "axum",
  "fs2",
  "futures",
+ "nd-backend",
+ "nd-claims",
+ "nd-claude",
  "nd-config",
  "nd-kernel",
  "nd-ledger",
  "nd-runs",
+ "nd-session",
  "nd-store",
+ "nd-testkit",
  "nd-ui-core",
  "nd-watchdog-proto",
  "nd-wire",
@@ -4249,6 +4256,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
+ "toml 0.9.12+spec-1.1.0",
  "uuid",
 ]
 
