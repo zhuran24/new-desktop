@@ -1,0 +1,29 @@
+[package]
+name = "nd-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nd-ui-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+futures.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+nd-wire.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+
+[features]
+scenarios = []
+
+[lints]
+workspace = true
