@@ -104,6 +104,8 @@ pub struct Message {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Core {
+    #[serde(default)]
+    pub draft: nd_wire::Draft,
     pub meta: Option<Meta>,
     pub current: Option<CarrierId>,
     #[serde(default)]
@@ -121,6 +123,34 @@ impl Core {
     }
     pub fn current_carrier(&self) -> Option<&Carrier> {
         self.current.as_ref().and_then(|c| self.carriers.get(c))
+    }
+    /// 执行器事务内的编辑/回填入口；调用方用收据或操作账保证同 id 只落定一次。
+    /// 撤回、总结、回退可在处理其完成事实的同一事务内复用，不另发清稿命令。
+    pub fn update_draft(
+        &mut self,
+        id: &str,
+        device: &str,
+        base: u64,
+        text: String,
+    ) -> nd_wire::DraftUpdated {
+        let saved = if base != self.draft.version {
+            self.draft.saved.push(nd_wire::SavedDraft {
+                id: id.into(),
+                base_version: base,
+                text,
+                device: device.into(),
+            });
+            Some(id.into())
+        } else {
+            self.draft.version += 1;
+            self.draft.text = text;
+            self.draft.device = device.into();
+            None
+        };
+        nd_wire::DraftUpdated {
+            draft: self.draft.clone(),
+            saved,
+        }
     }
 }
 

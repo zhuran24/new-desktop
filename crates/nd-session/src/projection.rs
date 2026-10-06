@@ -16,6 +16,9 @@ pub const NAMESPACE: &str = "session";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "shown", rename_all = "snake_case")]
 pub enum Shown {
+    Draft {
+        draft: nd_wire::Draft,
+    },
     Lineage {
         data: Value,
     },
@@ -81,6 +84,7 @@ impl Shown {
     /// 条目 id；增量与它的完整条目同 id。
     pub fn id(&self) -> String {
         match self {
+            Shown::Draft { .. } => "draft".into(),
             Shown::Lineage { .. } => "lineage".into(),
             Shown::Header { .. } => "header".into(),
             Shown::Prompt { id, .. } => format!("prompt/{id}"),
@@ -98,6 +102,12 @@ impl Shown {
     fn render(&self, seq: u64, accumulated: Option<&str>) -> Item {
         let id = self.id();
         let (kind, mut data, title, text) = match self {
+            Shown::Draft { draft } => (
+                "draft",
+                serde_json::to_value(draft).expect("draft value"),
+                "草稿".to_owned(),
+                shorten(&draft.text),
+            ),
             Shown::Lineage { data } => (
                 "lineage",
                 data.clone(),

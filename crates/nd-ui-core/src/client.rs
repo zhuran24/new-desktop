@@ -1,12 +1,13 @@
 //! GPUI 等非 Tokio executor 的命令入口。网络仅在专用线程上运行。
 use crate::SyncReplica;
-use nd_wire::{Command, CommandReply, Model};
+use nd_wire::{Command, CommandReply, Model, ReceiptLookup};
 use std::{io, path::Path, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 enum Work {
     Command(Command, oneshot::Sender<Result<CommandReply, String>>),
     Models(String, String, oneshot::Sender<Result<Vec<Model>, String>>),
+    Receipt(String, oneshot::Sender<Result<ReceiptLookup, String>>),
 }
 #[derive(Clone)]
 pub struct CommandClient {
@@ -43,11 +44,18 @@ impl CommandClient {
                                     Work::Models(_, _, done) => {
                                         let _ = done.send(Err(why));
                                     }
+                                    Work::Receipt(_, done) => {
+                                        let _ = done.send(Err(why));
+                                    }
                                 }
                                 continue;
                             }
                         };
                         match work {
+                            Work::Receipt(command_id, done) => {
+                                let _ = done
+                                    .send(ui.receipt(&command_id).await.map_err(|e| e.to_string()));
+                            }
                             Work::Command(command, done) => {
                                 let _ = done
                                     .send(ui.command(&command).await.map_err(|e| e.to_string()));
@@ -77,6 +85,14 @@ impl CommandClient {
         result
             .await
             .map_err(|_| "命令连接已关闭；交付不明".to_owned())?
+    }
+    /// 恢复待确认命令时只读收据，不把 Missing 当作允许重发。
+    pub async fn receipt(&self, command_id: String) -> Result<ReceiptLookup, String> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .try_send(Work::Receipt(command_id, done))
+            .map_err(|_| "查询队列已满或连接已关闭".to_owned())?;
+        result.await.map_err(|_| "收据查询已取消".to_owned())?
     }
     pub async fn models(&self, backend: String, cwd: String) -> Result<Vec<Model>, String> {
         let (done, result) = oneshot::channel();
