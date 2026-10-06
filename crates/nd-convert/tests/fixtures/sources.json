@@ -1,0 +1,16 @@
+[
+  {
+    "fixture": "claude-exports.json",
+    "source": "/home/zhuran24/mytools/new-desktop/research/round9/verify/runs/e4-289-final/http.jsonl",
+    "source_sha256": "0ae7e0adbf68d3ceee15ebcfbd1722d6a57d1c99e113d86228214080c06c1cba",
+    "selection": "snapshot fields from JSONL lines 14, 33, 52, 65; no content normalization",
+    "fixture_sha256": "b740d2b9c1c7826da5a8f0cd0058787fc217a0615245cb7592ac0373c9e6cc34"
+  },
+  {
+    "fixture": "codex-turn.json",
+    "source": "/home/zhuran24/mytools/new-desktop/research/round7/convert/results/x1.json",
+    "source_sha256": "7ae3f451df77e733461c0f51faca645b56651af353decaca58f20ee83d1638cc",
+    "selection": "thread_read.thread.turns[0].items; no content normalization",
+    "fixture_sha256": "a5e51faf9edc28bdc8905252b44b7ebce73042105550905259ba5187f805c696"
+  }
+]
