@@ -8,6 +8,7 @@ impl Desktop {
     pub(crate) fn upload_attachments(
         &mut self,
         sources: Vec<AttachmentSource>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let key = self.draft_key();
@@ -27,14 +28,18 @@ impl Desktop {
         for source in sources {
             let client = self.client.clone();
             let key = key.clone();
-            cx.spawn(async move |weak, cx| {
+            cx.spawn_in(window, async move |weak, cx| {
                 let result = client.upload(source).await;
-                let _ = weak.update(cx, |this, cx| {
+                let _ = weak.update_in(cx, |this, window, cx| {
                     this.uploading -= 1;
                     match result {
                         Ok(a) => {
                             this.load_attachment_image(&a, cx);
-                            this.drafts.entry(key).or_default().attach(a);
+                            this.drafts.entry(key.clone()).or_default().attach(a);
+                            this.queued_send = None;
+                            if let Some(session) = key {
+                                this.persist_draft(session, window, cx);
+                            }
                         }
                         Err(e) => this.warning = Some(format!("附件上传失败：{e}")),
                     }
@@ -141,11 +146,15 @@ impl Desktop {
                             .id(("remove-attachment", index))
                             .cursor_pointer()
                             .child("移除")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.drafts
                                     .entry(this.draft_key())
                                     .or_default()
                                     .detach(index);
+                                this.queued_send = None;
+                                if let Some(session) = this.draft_key() {
+                                    this.persist_draft(session, window, cx);
+                                }
                                 this.refresh_send(cx);
                                 cx.notify();
                             })),

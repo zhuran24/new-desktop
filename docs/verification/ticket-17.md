@@ -4,7 +4,7 @@
 
 ## 产品行为
 
-- 桌面粘贴图片、粘贴文件或拖入文件后，经同步副本的鉴权 HTTP PUT 按 SHA-256 上传。草稿可移除附件；上传失败显示原因，上传完成前禁发。只有对应草稿修订的明确受理才清除正文和附件。纯附件消息可发送，组词时仍禁止发送。
+- 桌面粘贴图片、粘贴文件或拖入文件后，经同步副本的鉴权 HTTP PUT 按 SHA-256 上传。已有会话的草稿连同附件自动持久化；冲突另存也保留附件，草稿可移除附件；上传失败显示原因，上传完成前禁发。只有对应草稿修订的明确受理才清除正文和附件。纯附件消息可发送，组词时仍禁止发送。
 - 支持 PNG、JPEG、GIF、WebP、PDF 和 UTF-8 文本；按字节识别，不靠扩展名。每个附件 1 字节至 5 MiB，每条最多 8 个、总计最多 16 MiB。不支持的二进制文件须先转换为上述格式。
 - 消息只携带 `Attachment{blob,name,media_type,size}`。同一事务核对 blob 大小与可引用性、保留引用、落消息和收据；整条无效时不留部分引用。首条提示尚未进入发送步骤的新建失败释放引用；已有历史提示的失败或交付不明仍保留附件。
 - Claude 在事务外读取并核散列，以 image/document base64 内容块或标注文件名的 UTF-8 文本块发送。用户正文保持原样，既有 UUID、发送意图和对账语义保持。消息事件不带附件正文。只读 CLI 自己的回显和记录，不写 CLI 原生存储。
@@ -23,8 +23,9 @@
 | 主接缝 | `a_multi_megabyte_attachment_is_not_lost_at_the_watchdog_frame_boundary` | 2,400,000 字节文本经过看守和 CLI，模型收到完整正文 |
 | 主接缝 | `desktop_upload_reads_file_bytes_and_rejects_unsupported_or_missing_files` | 公共桌面命令入口读取真实文件；拒绝目录、缺失文件和不支持二进制 |
 | 主接缝 | `real_edit_tool_exposes_the_replaced_text_for_diff_display` | 真 CLI Read/ Edit 工具往返后，文件实际改变，快照提供完整替换片段 |
-| 原生窗口加主接缝 | `native_attachment_paste_drop_and_diff_rendering` | 私有 KWin/剪贴板；图片粘贴、文件粘贴和 GPUI 拖放事件产生三个真实上传；模型收到三份内容；流式期间杀界面，重开不重发；明暗截图 |
-| 引擎崩溃矩阵 | `attachment_create_and_send_recover_at_every_commit_point`、`attachment_creation_compensation_releases_unused_uploads_at_every_commit_point` | 新建与发送带附件；三种故障点遍历全部提交；快照、端口动作保留引用；原生步骤至多一次 |
+| 主接缝 | `draft_attachments_survive_conflicts_restart_and_transfer_to_the_sent_message` | 双设备竞争的当前稿/另存稿均保留附件；重启和清理后可读；发送同事务清稿并转为消息引用 |
+| 原生窗口加主接缝 | `native_attachment_paste_drop_and_diff_rendering` | 私有 KWin/剪贴板；图片粘贴、文件粘贴和 GPUI 拖放事件产生三个真实上传；模型收到三份内容；流式期间杀界面，重开不重发；明暗截图；未发送的附件草稿 SIGKILL 后在原生输入框恢复 |
+| 引擎崩溃矩阵 | `attachment_create_and_send_recover_at_every_commit_point`、`attachment_creation_compensation_releases_unused_uploads_at_every_commit_point`、`attached_draft_conflict_and_send_consumption_recover_at_every_commit_point` | 新建与发送带附件；三种故障点遍历全部提交；快照、端口动作保留引用；原生步骤至多一次 |
 | 纯计算 | `nd-view-model/tests/diff.rs`、`chat.rs`，`nd-composer/tests/input.rs` | 多 hunk/行号/Unicode/无末尾换行、围栏与工具替换、草稿修订、纯附件的组词守卫 |
 
 运行入口：`cargo test --workspace --locked` 和 `scripts/test-scenarios.sh`。所有 build/test/Clippy 使用 6 jobs、独立 12 GiB/零 swap scope，产物位于 E 盘 `target/ticket-17`。CLI 固定 `/mnt/wd_external/nd-build/cli/claude-2.1.289`；临时 HOME、CLAUDE_CONFIG_DIR、XDG、断网 bwrap 和 `nd-test-` 单元由场景运行器管理。默认套件不触发真实 OOM。
@@ -42,7 +43,7 @@
 
 ## 后续工单接口
 
-- #16 草稿：复用 `nd_wire::Attachment` 和 Draft 修订语义，草稿持久化/移除时在同一事务 `hold/release`。当前未发送附件只有上传宽限期（默认一天），重启界面不恢复内存草稿。过期引用发送会被拒绝，需重新上传。
+- #16 草稿已集成：`Draft`、`SavedDraft`、`DraftUpdate` 使用默认空的 `attachments` 字段。当前稿 owner 为 `draft/<会话 id>`，另存稿为 `draft-saved/<会话 id>/<编辑命令 id>`；替换、发送清稿和引用增减同事务。创建会话前尚无会话 id 的草稿仍只在内存中，未引用上传遵循默认一天宽限期。过期引用发送会被拒绝，需重新上传。
 - #35 回退、#50/#51 转换：字节由 Blobs 持有，引用随提示投影保存。不要把 base64 放进 nd-wire 事件或让转换依赖 GPUI 图片对象。保留或删除历史时，以 `message/<会话 id>/<命令 id>` 为引用所有者；初次创建使用创建命令 id，不使用提示显示 id。
 - #20：保留简单 diff 全量投影作差分基准；分页时按显示范围安排图片下载。#23：主题文件需要覆盖两个 diff 颜色变量。
 - 清理只能释放被删除业务对象自己的 owner 引用，不能按某个 UI 窗口消失来释放已发消息。

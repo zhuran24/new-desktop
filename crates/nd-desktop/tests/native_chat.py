@@ -21,15 +21,20 @@ def inner():
     socket = settings['socket']
     app = None
     handles = []
+    apps = []
 
-    def start(name, create=False):
+    def start(name, create=False, draft=None, device='ui'):
         stdout = (out / f'{name}.jsonl').open('w')
         stderr = (out / f'{name}.log').open('w')
         handles.extend([stdout, stderr])
-        args = ['/nd-desktop', '--socket', socket, '--state', '/sandbox/state/ui.json', '--quit-after', '45']
+        args = ['/nd-desktop', '--socket', socket, '--state', f'/sandbox/state/{device}.json', '--quit-after', '45']
         if create:
             args += ['--scenario-create', json.dumps({'cwd': '/sandbox/project', 'model': 'haiku', 'text': '请写代码', 'attachments': settings.get('attachments', False)})]
-        return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=dict(os.environ, WAYLAND_DEBUG='client'))
+        if draft is not None:
+            args += ['--scenario-draft', json.dumps(draft)]
+        process = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=dict(os.environ, WAYLAND_DEBUG='client'))
+        apps.append(process)
+        return process
 
     def wait(name, predicate, timeout=40):
         deadline = time.monotonic() + timeout
@@ -41,7 +46,7 @@ def inner():
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                value = event.get('rendered_session')
+                value = event.get('rendered_editor' if settings.get('drafts') else 'rendered_session')
                 if value is not None and predicate(value):
                     return value
             time.sleep(0.03)
@@ -60,6 +65,36 @@ def inner():
         assert result.returncode == 0, result.stderr.decode()
 
     try:
+        if settings.get('drafts'):
+            for device in ['a', 'b']:
+                (Path('/sandbox/state') / f'{device}.json').write_text(json.dumps({'selected_session': settings['session']}))
+            app = start('draft-a', draft={'text': 'A 的未发送草稿\n第二行 🦀'}, device='a')
+            wait('draft-a', lambda s: s['text'] == 'A 的未发送草稿\n第二行 🦀' and s['saved'])
+            app.kill()
+            assert app.wait(timeout=5) == -9
+            app = start('draft-reopened', device='a')
+            wait('draft-reopened', lambda s: s['text'] == 'A 的未发送草稿\n第二行 🦀' and s['saved'])
+            app = start('draft-b', draft={'text': 'B 接着修改'}, device='b')
+            wait('draft-b', lambda s: s['text'] == 'B 接着修改' and s['saved'])
+            wait('draft-reopened', lambda s: s['text'] == 'B 接着修改' and s['saved'])
+            screenshot('draft-two-windows')
+            app.terminate()
+            app.wait(timeout=5)
+            app = start('draft-recover', draft={'restore': 'native-loser'}, device='b')
+            wait('draft-recover', lambda s: s['text'] == '可找回的落败稿' and s['saved'])
+            wait('draft-reopened', lambda s: s['text'] == '可找回的落败稿' and s['saved'])
+            app.terminate()
+            app.wait(timeout=5)
+            app = start('draft-send', draft={'text': '原生发送清稿', 'send': True}, device='b')
+            # 输入、保存和受理可能在一次绘制前完成；不要求中间正文单独占一帧。
+            # 首帧未加载时 saved=false，已加载的原稿非空，因此这个空稿只能来自受理清稿。
+            wait('draft-send', lambda s: s['text'] == '' and s['saved'], timeout=10)
+            wait('draft-reopened', lambda s: s['text'] == '' and s['saved'])
+            (out / 'result.json').write_text(json.dumps({'pass': True, 'checks': [
+                'native editor saves without sending', 'SIGKILL and cold reopen restore composer text',
+                'two native windows follow the same daemon draft', 'saved conflict loads through the product recovery action',
+                'immediate native submit waits for save, then atomically clears both editors']}))
+            return
         app = start('creating', True)
         partial = wait('creating', lambda s: block(s) is not None and 'fn main' in block(s)['data']['text'] and block(s)['data']['complete'] is False)
         screenshot('streaming')
@@ -84,6 +119,18 @@ def inner():
         light = wait('light', lambda s: block(s) is not None and block(s)['data']['complete'] is True)
         assert block(light) == block(finished)
         screenshot('light')
+        if settings.get('attachments'):
+            app.terminate()
+            app.wait(timeout=5)
+            settings['drafts'] = True
+            app = start('attached-draft', draft={'text': '待发送的材料', 'file': '/sandbox/pasted.txt'})
+            saved = wait('attached-draft', lambda s: s['text'] == '待发送的材料' and s['saved'] and len(s.get('attachments', [])) == 1)
+            app.kill()
+            assert app.wait(timeout=5) == -9
+            app = start('attached-draft-reopened')
+            wait('attached-draft-reopened', lambda s: s['text'] == '待发送的材料' and s['saved'] and s.get('attachments') == saved['attachments'])
+            screenshot('attached-draft-reopened')
+            settings['drafts'] = False
         for name in ['creating', 'reopened', 'light']:
             assert re.search(r'wl_surface#\d+\.attach\(wl_buffer#', (out / f'{name}.log').read_text()), name
         (out / 'result.json').write_text(json.dumps({'pass': True, 'session': finished['stream'].removeprefix('session/'),
@@ -91,9 +138,10 @@ def inner():
             'checks': ['native create form and composer -> nd-wire -> real CLI', 'SIGKILL during Markdown; cold snapshot includes accumulated block',
                        'final block replaces partial with the same id', 'dark/light native frames and screenshots']}, ensure_ascii=False, indent=2))
     finally:
-        if app is not None and app.poll() is None:
-            app.kill()
-            app.wait(timeout=5)
+        for process in apps:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
         for handle in handles:
             handle.close()
 
@@ -108,7 +156,7 @@ def run(args):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'attachments': args.attachments}))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None, 'session': args.session, 'attachments': args.attachments}))
         if args.attachments:
             shutil.copy(Path(__file__).resolve().parents[2] / 'nd-daemon/tests/fixtures/preview.png', work / 'pixel.png')
             (work / 'pasted.txt').write_text('复制文件里的中文正文')
@@ -154,4 +202,5 @@ if __name__ == '__main__':
         parser.add_argument('--socket', required=True)
         parser.add_argument('--output', required=True)
         parser.add_argument('--attachments', action='store_true')
+        parser.add_argument('--session', help='run the draft editor scenario for this session')
         run(parser.parse_args())

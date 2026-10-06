@@ -130,7 +130,13 @@ impl Executor {
             Some((write_gen, core)) => (write_gen, core, true),
             None => (0, Core::default(), false),
         };
-        let projection = Projection::restore(state::items(&deps.store, &id)?);
+        let mut projection = Projection::restore(state::items(&deps.store, &id)?);
+        if born {
+            // 草稿是核心事实；即使旧版显示缓存没有它，冷启动也必须给出可编辑的版本。
+            projection.apply(&Shown::Draft {
+                draft: core.draft.clone(),
+            });
+        }
         let this = Self {
             id,
             write_gen,
@@ -411,6 +417,43 @@ impl Executor {
     ) -> nd_store::Result<Receipt> {
         match command.name.as_str() {
             "session.create" => self.create(tx, command, fx),
+            "session.draft.update" => {
+                let (Ok(args), Ok(expected)) = (
+                    serde_json::from_value::<nd_wire::DraftUpdate>(command.args.clone()),
+                    serde_json::from_value::<nd_wire::DraftExpected>(command.expect.clone()),
+                ) else {
+                    return Ok(rejected(
+                        "invalid",
+                        json!({"need":["text", "expect.draft_version"]}),
+                    ));
+                };
+                let attachments = match self.attachments(tx, command) {
+                    Ok(a) => a,
+                    Err(why) => return Ok(rejected("invalid_attachment", json!({"reason":why}))),
+                };
+                let owner = if expected.draft_version == self.core.draft.version {
+                    let owner = format!("draft/{}", self.id);
+                    for a in &self.core.draft.attachments {
+                        self.deps.blobs.release(tx, &a.blob, &owner)?;
+                    }
+                    owner
+                } else {
+                    format!("draft-saved/{}/{}", self.id, command.id)
+                };
+                for a in &attachments {
+                    self.deps.blobs.hold(tx, &a.blob, &owner)?;
+                }
+                let result = self.core.update_draft(
+                    &command.id,
+                    &command.device,
+                    expected.draft_version,
+                    args.text,
+                    attachments,
+                );
+                Ok(Receipt::Done {
+                    value: json!(result),
+                })
+            }
             "session.send" => {
                 if !self.born {
                     return Ok(rejected("not_found", Value::Null));
@@ -576,7 +619,7 @@ impl Executor {
         self.core.messages.insert(
             command.id.clone(),
             Message {
-                attachments,
+                attachments: attachments.clone(),
                 id: command.id.clone(),
                 text: text.to_owned(),
                 intent,
@@ -586,9 +629,24 @@ impl Executor {
                 arrival: self.core.arrivals,
             },
         );
+        // 发送与清稿同一事务；旧界面、不同正文和重试均不能清掉后来编辑的草稿。
+        if command.expect["draft_version"].as_u64() == Some(self.core.draft.version)
+            && self.core.draft.text == text
+            && self.core.draft.attachments == attachments
+        {
+            for a in &self.core.draft.attachments {
+                self.deps
+                    .blobs
+                    .release(tx, &a.blob, &format!("draft/{}", self.id))?;
+            }
+            self.core.draft.attachments.clear();
+            self.core.draft.version += 1;
+            self.core.draft.text.clear();
+            self.core.draft.device = command.device.clone();
+        }
         // Done 只表示进了发送台；代持、写出、回显看这条消息的状态。
         Ok(Receipt::Done {
-            value: json!({"message": command.id}),
+            value: json!({"message": command.id, "draft": self.core.draft}),
         })
     }
 
@@ -1699,6 +1757,13 @@ impl Executor {
     }
 
     fn persist(&mut self, tx: &Tx<'_>, fx: &mut Effects) -> nd_store::Result<()> {
+        self.show(
+            tx,
+            fx,
+            Shown::Draft {
+                draft: self.core.draft.clone(),
+            },
+        )?;
         let header = header(&self.core);
         self.show(tx, fx, Shown::Header { data: header })?;
         let lineage = &self.core.lineage;

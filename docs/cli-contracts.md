@@ -155,4 +155,4 @@
 | DIFF-EDIT | Claude 的 Edit 工具块保留 name 和 input.file_path/old_string/new_string，供片段 diff 使用（出处：CLI 工具声明与本单实际 Read → Edit 往返） | `real_edit_tool_exposes_the_replaced_text_for_diff_display`；纯视图测试核片段行号与内容 | 缺少字段时保留原工具条目后备文字，不猜文件内容 |
 | ATTACH-SIZE | 大于旧看守单行界限的消息仍能经固定 CLI 到模型；正常回显照常结票 | `a_multi_megabyte_attachment_is_not_lost_at_the_watchdog_frame_boundary`：2,400,000 字节全文；原生粘贴场景核对多个内容块 | 编码后超过看守单行界限时在写前明确失败，正文及引用保留；不把确定未写出算成 Unknown |
 
-没有写 CLI 原生记录。新建与发送继续使用原动作、UUID 和收据契约，崩溃矩阵增加 `create-and-send/attachments`；上传正文只经 Blobs HTTP，持久动作只存引用。
+没有写 CLI 原生记录。新建与发送继续使用原动作、UUID 和收据契约，崩溃矩阵增加 `create-and-send/attachments` 和 `create/attachments-open-fails`；上传正文只经 Blobs HTTP，持久动作只存引用。

@@ -216,6 +216,70 @@ fn create(id: &str, text: &str) -> nd_wire::Command {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn draft_conflict_and_send_consumption_recover_at_every_commit_point() {
+    let session = session_id_for("matrix-draft-create");
+    let update = |id: &str, version: u64, text: &str| nd_wire::Command {
+        id: id.into(),
+        device: id.into(),
+        name: "session.draft.update".into(),
+        args: json!({"session":session,"text":text}),
+        expect: json!({"draft_version":version}),
+    };
+    let send = nd_wire::Command {
+        id: "matrix-draft-send".into(),
+        device: "a".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"胜出的草稿"}),
+        expect: json!({"draft_version":1}),
+    };
+    matrix(Scenario {
+        name: "send/draft-conflict-consume-retry",
+        uploads: vec![],
+        script: vec![],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-draft-create", "你好"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: update("matrix-draft-a", 0, "胜出的草稿"),
+                until: |s| item(s, "draft").data["version"] == 1,
+            },
+            Step {
+                command: update("matrix-draft-b", 0, "落败稿"),
+                until: |s| {
+                    item(s, "draft").data["saved"]
+                        .as_array()
+                        .is_some_and(|a| a.len() == 1)
+                },
+            },
+            Step {
+                command: send.clone(),
+                until: |s| prompt(s, "胜出的草稿").is_some_and(|i| i.data["state"] == "landed"),
+            },
+            Step {
+                command: update("matrix-draft-new", 2, "后来编辑"),
+                until: |s| item(s, "draft").data["version"] == 3,
+            },
+            Step {
+                command: send,
+                until: |s| item(s, "draft").data["text"] == "后来编辑",
+            },
+        ],
+        check: |h, s| {
+            let d = &item(s, "draft").data;
+            assert_eq!(d["text"], "后来编辑");
+            assert_eq!(d["version"], 3);
+            assert_eq!(d["saved"].as_array().unwrap().len(), 1);
+            assert_eq!(d["saved"][0]["text"], "落败稿");
+            assert_eq!(applied_counts(h).get("send:胜出的草稿"), Some(&1));
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn create_reaches_active_or_is_compensated_at_every_commit_point() {
     matrix(Scenario {
         name: "create/ok",
@@ -358,6 +422,78 @@ async fn attachment_creation_compensation_releases_unused_uploads_at_every_commi
             assert!(h.adapter.applied().is_empty());
             let blobs = nd_store::Blobs::open(h.dir.path().join("blobs"), h.store.clone()).unwrap();
             assert_eq!(blobs.collect(Duration::ZERO).unwrap(), 1);
+        },
+    })
+    .await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_draft_conflict_and_send_consumption_recover_at_every_commit_point() {
+    use sha2::{Digest, Sha256};
+    let bytes = b"matrix draft attachment";
+    let attachments = json!([{"blob":format!("{:x}",Sha256::digest(bytes)),"name":"draft.txt","size":bytes.len(),"media_type":"text/plain"}]);
+    let session = session_id_for("matrix-draft-create");
+    let update = |id: &str, version: u64, text: &str| nd_wire::Command {
+        id: id.into(),
+        device: id.into(),
+        name: "session.draft.update".into(),
+        args: json!({"session":session,"text":text,"attachments":attachments}),
+        expect: json!({"draft_version":version}),
+    };
+    let send = nd_wire::Command {
+        id: "matrix-draft-send".into(),
+        device: "a".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"胜出的草稿","attachments":attachments}),
+        expect: json!({"draft_version":1}),
+    };
+    matrix(Scenario {
+        name: "send/attached-draft-conflict-consume-retry",
+        uploads: vec![bytes.to_vec()],
+        script: vec![],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-draft-create", "你好"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: update("matrix-draft-a", 0, "胜出的草稿"),
+                until: |s| item(s, "draft").data["version"] == 1,
+            },
+            Step {
+                command: update("matrix-draft-b", 0, "落败稿"),
+                until: |s| {
+                    item(s, "draft").data["saved"]
+                        .as_array()
+                        .is_some_and(|a| a.len() == 1)
+                },
+            },
+            Step {
+                command: send.clone(),
+                until: |s| prompt(s, "胜出的草稿").is_some_and(|i| i.data["state"] == "landed"),
+            },
+            Step {
+                command: update("matrix-draft-new", 2, "后来编辑"),
+                until: |s| item(s, "draft").data["version"] == 3,
+            },
+            Step {
+                command: send,
+                until: |s| item(s, "draft").data["text"] == "后来编辑",
+            },
+        ],
+        check: |h, s| {
+            let d = &item(s, "draft").data;
+            assert_eq!(d["attachments"][0]["name"], "draft.txt");
+            assert_eq!(d["saved"][0]["attachments"][0]["name"], "draft.txt");
+            assert_eq!(
+                prompt(s, "胜出的草稿").unwrap().data["attachments"][0]["name"],
+                "draft.txt"
+            );
+            assert_eq!(d["text"], "后来编辑");
+            assert_eq!(d["version"], 3);
+            assert_eq!(d["saved"].as_array().unwrap().len(), 1);
+            assert_eq!(d["saved"][0]["text"], "落败稿");
+            assert_eq!(applied_counts(h).get("send:胜出的草稿"), Some(&1));
         },
     })
     .await;
