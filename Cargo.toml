@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/nd-kernel"]
+default-members = ["crates/nd-kernel"]
+exclude = ["ime-lab/variants/main", "ime-lab/variants/v070"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zhuran24/new-desktop"
+
+[workspace.dependencies]
+nd-kernel = { path = "crates/nd-kernel" }
+futures = "0.3.31"
+proptest = "1.6"
+# 桌面 crate 加入时继承此版本，且不加入 default-members。
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "4c7f1350331562436df868c55ac33bebc4c6406c" }
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
