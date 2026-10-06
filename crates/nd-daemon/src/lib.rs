@@ -307,10 +307,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     let state = Arc::new(Mutex::new(Engine::open(&config, blobs.clone()).await?));
     let mut storage_config = config.section::<StorageConfig>()?;
     let collector = tokio::spawn(async move {
-        loop {
-            let Ok(current) = storage_config.get() else {
-                break;
-            };
+        while let Ok(current) = storage_config.get() {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(current.value.gc_interval_seconds)) => {
                     let blobs = blobs.clone();
