@@ -4,6 +4,8 @@ pub use state::{ViewState, ViewStateFile, WindowState};
 mod slots;
 pub use slots::{Contribution, Slot, SlotGuard, Slots};
 mod chat;
+mod history;
+pub use history::*;
 mod theme;
 mod theme_files;
 pub use chat::*;

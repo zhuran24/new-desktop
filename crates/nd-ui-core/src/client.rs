@@ -12,6 +12,11 @@ enum Work {
     Blob(String, oneshot::Sender<Result<Vec<u8>, String>>),
     Command(Command, oneshot::Sender<Result<CommandReply, String>>),
     Models(String, String, oneshot::Sender<Result<Vec<Model>, String>>),
+    Get(
+        String,
+        nd_wire::PageReq,
+        oneshot::Sender<Result<nd_wire::Page, String>>,
+    ),
     Receipt(String, oneshot::Sender<Result<ReceiptLookup, String>>),
 }
 #[derive(Clone)]
@@ -55,6 +60,9 @@ impl CommandClient {
                                     Work::Models(_, _, done) => {
                                         let _ = done.send(Err(why));
                                     }
+                                    Work::Get(_, _, done) => {
+                                        let _ = done.send(Err(why));
+                                    }
                                     Work::Receipt(_, done) => {
                                         let _ = done.send(Err(why));
                                     }
@@ -63,6 +71,16 @@ impl CommandClient {
                             }
                         };
                         match work {
+                            Work::Get(res, page, done) => {
+                                let result = tokio::time::timeout(
+                                    Duration::from_secs(15),
+                                    ui.get(&res, page),
+                                )
+                                .await
+                                .map_err(|_| "历史查询超时".to_owned())
+                                .and_then(|r| r.map_err(|e| e.to_string()));
+                                let _ = done.send(result);
+                            }
                             Work::Upload(source, done) => {
                                 let result = async {
                                     let (attachment, bytes) = source.read().await?;
@@ -106,6 +124,13 @@ impl CommandClient {
                 })
             })?;
         Ok(Self { tx })
+    }
+    pub async fn get(&self, res: String, page: nd_wire::PageReq) -> Result<nd_wire::Page, String> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .try_send(Work::Get(res, page, done))
+            .map_err(|_| "查询队列已满或连接已关闭".to_owned())?;
+        result.await.map_err(|_| "历史查询已取消".to_owned())?
     }
     pub async fn upload(&self, source: AttachmentSource) -> Result<nd_wire::Attachment, String> {
         let (done, result) = oneshot::channel();

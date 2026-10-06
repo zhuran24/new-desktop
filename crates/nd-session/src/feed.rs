@@ -1,7 +1,8 @@
 //! 一个会话流（`session/<id>`）的快照与事件：冷启动先给快照（带进行中条目的累积内容），
 //! 同纪元的短断线按游标补事件。事件只在内存里；增量不进缓冲，游标越过增量就重给快照。
+use crate::history::History;
 use nd_wire::{Cursor, Event, Item, Response, Snapshot};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use tokio::sync::broadcast;
 
 const KEEP_EVENTS: usize = 256;
@@ -10,7 +11,7 @@ pub struct Feed {
     stream: String,
     epoch: String,
     cursor: u64,
-    items: BTreeMap<String, (u64, Item)>,
+    items: History,
     history: VecDeque<Event>,
     /// 最近一次只含增量的事件的游标；比它旧的游标补不齐，只能重给快照。
     last_live: u64,
@@ -27,48 +28,63 @@ pub struct Start {
 impl Feed {
     pub fn new(stream: String, epoch: String, items: Vec<(u64, Item)>) -> Self {
         let (tx, _) = broadcast::channel(1024);
+        let mut history = History::new(stream.clone());
+        for (_, item) in items {
+            history.insert(item);
+        }
         Self {
             stream,
             epoch,
             cursor: 0,
-            items: items
-                .into_iter()
-                .map(|(s, i)| (i.id.clone(), (s, i)))
-                .collect(),
+            items: history,
             history: VecDeque::new(),
             last_live: 0,
             tx,
         }
     }
     pub fn snapshot(&self) -> Snapshot {
-        let mut items: Vec<_> = self.items.values().collect();
-        items.sort_by_key(|(seq, _)| *seq);
         Snapshot {
             stream: self.stream.clone(),
             epoch: self.epoch.clone(),
             cursor: self.cursor,
-            items: items.into_iter().map(|(_, i)| i.clone()).collect(),
+            items: self.items.snapshot(),
         }
+    }
+    pub fn page(&self, request: &nd_wire::PageReq) -> Result<nd_wire::Page, String> {
+        let mut page = self.items.page(request)?;
+        page.at = Some(Cursor {
+            epoch: self.epoch.clone(),
+            seq: self.cursor,
+        });
+        Ok(page)
     }
     /// 发一批变化；`live` 表示这批只有增量。
     pub fn publish(&mut self, upsert: Vec<(u64, Item)>, live: bool) {
         let upsert: Vec<(u64, Item)> = upsert
             .into_iter()
-            .filter(|(_, item)| self.items.get(&item.id).is_none_or(|(_, old)| old != item))
+            .filter(|(_, item)| self.items.get(&item.id).is_none_or(|old| old != item))
             .collect();
         if upsert.is_empty() {
             return;
         }
-        for (seq, item) in &upsert {
-            self.items.insert(item.id.clone(), (*seq, item.clone()));
+        let before = self.items.snapshot();
+        for (_, item) in &upsert {
+            self.items.insert(item.clone());
         }
+        let after = self.items.snapshot();
+        let remove = before
+            .iter()
+            .filter(|old| !after.iter().any(|i| i.id == old.id))
+            .map(|i| i.id.clone())
+            .collect();
+        let upsert = after.into_iter().filter(|i| !before.contains(i)).collect();
         self.cursor += 1;
         let event = Event {
             stream: self.stream.clone(),
             epoch: self.epoch.clone(),
             cursor: self.cursor,
-            upsert: upsert.into_iter().map(|(_, i)| i).collect(),
-            remove: vec![],
+            upsert,
+            remove,
         };
         if live {
             self.last_live = self.cursor;
