@@ -13,6 +13,7 @@ nd-kernel.workspace = true
 nd-wire.workspace = true
 nd-config.workspace = true
 nd-store.workspace = true
+nd-ledger.workspace = true
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

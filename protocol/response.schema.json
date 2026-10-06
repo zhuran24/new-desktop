@@ -378,6 +378,7 @@
           ]
         },
         {
+          "description": "起了一个要等的操作。`stream`：能看到它进度的流（例如新建会话的 `session/<id>`）；只加不改的可选字段。",
           "type": "object",
           "properties": {
             "op": {
@@ -386,6 +387,12 @@
             "status": {
               "type": "string",
               "const": "accepted"
+            },
+            "stream": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

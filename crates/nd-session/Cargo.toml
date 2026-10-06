@@ -1,0 +1,25 @@
+[package]
+name = "nd-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nd-backend.workspace = true
+nd-claims.workspace = true
+nd-ledger.workspace = true
+nd-store.workspace = true
+nd-wire.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

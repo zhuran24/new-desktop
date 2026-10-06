@@ -4146,6 +4146,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nd-backend"
+version = "0.1.0"
+dependencies = [
+ "nd-claims",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "nd-claims"
 version = "0.1.0"
 dependencies = [
@@ -4224,6 +4235,7 @@ dependencies = [
  "futures",
  "nd-config",
  "nd-kernel",
+ "nd-ledger",
  "nd-runs",
  "nd-store",
  "nd-ui-core",
@@ -4263,6 +4275,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nd-ledger"
+version = "0.1.0"
+dependencies = [
+ "nd-store",
+ "nd-wire",
+ "serde_json",
+]
+
+[[package]]
 name = "nd-mod-proto"
 version = "0.1.0"
 dependencies = [
@@ -4280,6 +4301,24 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "nd-session"
+version = "0.1.0"
+dependencies = [
+ "nd-backend",
+ "nd-claims",
+ "nd-ledger",
+ "nd-store",
+ "nd-wire",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

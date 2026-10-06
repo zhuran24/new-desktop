@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-view-model", "crates/nd-desktop", "crates/nd-composer", "crates/nd-testkit", "crates/nd-watchdog-proto", "crates/nd-watchdog", "crates/nd-runs", "crates/nd-claims", "crates/nd-mod-proto", "crates/nd-claude"]
-default-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-view-model", "crates/nd-composer", "crates/nd-testkit", "crates/nd-watchdog-proto", "crates/nd-watchdog", "crates/nd-runs", "crates/nd-claims", "crates/nd-mod-proto", "crates/nd-claude"]
+members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-view-model", "crates/nd-desktop", "crates/nd-composer", "crates/nd-testkit", "crates/nd-watchdog-proto", "crates/nd-watchdog", "crates/nd-runs", "crates/nd-claims", "crates/nd-mod-proto", "crates/nd-claude", "crates/nd-ledger", "crates/nd-backend", "crates/nd-session"]
+default-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-view-model", "crates/nd-composer", "crates/nd-testkit", "crates/nd-watchdog-proto", "crates/nd-watchdog", "crates/nd-runs", "crates/nd-claims", "crates/nd-mod-proto", "crates/nd-claude", "crates/nd-ledger", "crates/nd-backend", "crates/nd-session"]
 exclude = ["ime-lab/variants/main", "ime-lab/variants/v070"]
 
 [workspace.package]
@@ -19,6 +19,9 @@ nd-runs = { path = "crates/nd-runs" }
 nd-testkit = { path = "crates/nd-testkit" }
 nd-mod-proto = { path = "crates/nd-mod-proto" }
 nd-claude = { path = "crates/nd-claude" }
+nd-ledger = { path = "crates/nd-ledger" }
+nd-backend = { path = "crates/nd-backend" }
+nd-session = { path = "crates/nd-session" }
 nd-view-model = { path = "crates/nd-view-model" }
 nd-claude-records = { path = "crates/nd-claude-records" }
 nd-convert = { path = "crates/nd-convert" }
