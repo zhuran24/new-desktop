@@ -1,0 +1,83 @@
+diff --git a/crates/base/src/input/base/state.rs b/crates/base/src/input/base/state.rs
+index 722a78c0cd3f01a58c93409f90d79c15f4204973..542b2b6dde885b18b9f325ed4d82e0e1ea8d0a68 100644
+--- a/crates/base/src/input/base/state.rs
++++ b/crates/base/src/input/base/state.rs
+@@ -1132,6 +1132,13 @@ impl<M: InputModeKind> InputBaseState<M> {
+         cx.notify();
+     }
+ 
++    /// Whether an input method currently owns uncommitted text. Consumers that
++    /// implement their own Enter shortcut should defer submission until a later
++    /// key press after the composition has been committed.
++    pub fn is_composing(&self) -> bool {
++        self.ime_marked_range.is_some()
++    }
++
+     /// Set whether to show whitespace characters.
+     #[doc(hidden)]
+     pub fn show_whitespaces(mut self, show: bool) -> Self {
+@@ -1916,6 +1923,12 @@ impl<M: InputModeKind> InputBaseState<M> {
+             return;
+         }
+ 
++        // The same Enter press can confirm an IME candidate. It must not also
++        // insert a newline or emit PressEnter for the host to interpret as send.
++        if self.is_composing() {
++            return;
++        }
++
+         // Clear inline completion on enter (user chose not to accept it)
+         if M::has_inline_completion(self) {
+             M::clear_inline_completion(self, cx);
+@@ -6701,6 +6714,51 @@ mod tests {
+         });
+     }
+ 
++    /// Confirming an active IME candidate must not insert a newline.
++    #[gpui::test]
++    fn test_enter_confirms_composition_without_inserting_newline(cx: &mut TestAppContext) {
++        let input_view = InputView::build_textarea(cx, |state| state.default_value(""));
++        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
++        let input = input_view.input;
++
++        cx.update(|window, cx| {
++            input.update(cx, |state, cx| {
++                state.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
++                assert!(state.is_composing());
++                state.enter(
++                    &Enter {
++                        secondary: false,
++                        shift: false,
++                    },
++                    window,
++                    cx,
++                );
++                assert_eq!(state.value(), "ni");
++                state.enter(
++                    &Enter {
++                        secondary: true,
++                        shift: false,
++                    },
++                    window,
++                    cx,
++                );
++                assert_eq!(state.value(), "ni");
++
++                state.replace_text_in_range(None, "你", window, cx);
++                assert!(!state.is_composing());
++                state.enter(
++                    &Enter {
++                        secondary: false,
++                        shift: false,
++                    },
++                    window,
++                    cx,
++                );
++                assert_eq!(state.value(), "你\n");
++            });
++        });
++    }
++
+     /// An IME composition (marking then commit) undoes as a single unit.
+     #[gpui::test]
+     fn test_ime_composition_undoes_as_one_unit(cx: &mut TestAppContext) {

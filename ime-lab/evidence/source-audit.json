@@ -1,0 +1,19 @@
+{
+  "main": {
+    "reverse_observer_patch_exit": 0,
+    "mismatches": [],
+    "source": "/tmp/ime-lab-source-audit-fbsveb2j/gpui-kit-4c7f1350331562436df868c55ac33bebc4c6406c/crates/base",
+    "archive_deviations": [
+      "crates/base/src/lib.rs",
+      "crates/base/src/input/base/state.rs"
+    ],
+    "archive_extra": [
+      "crates/base/src/ime_lab_observer.rs"
+    ]
+  },
+  "v070": {
+    "reverse_observer_patch_exit": 0,
+    "mismatches": [],
+    "source": "/tmp/gpui-research-20261004/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/gpui-base-0.7.0"
+  }
+}

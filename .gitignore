@@ -1,0 +1,17 @@
+# 本地调研资料和大体积证据，只留在本机，不进公开仓库
+/research/
+
+# 输入法实验室：二进制、日志、自动测试截图、上游依赖的副本
+/ime-lab/bin/
+/ime-lab/logs/
+/ime-lab/autotest/
+/ime-lab/vendor/
+
+# 构建产物
+target/
+node_modules/
+__pycache__/
+*.node
+
+# 实施用的 git 工作树
+/.worktrees/

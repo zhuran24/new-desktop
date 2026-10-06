@@ -1,0 +1,3 @@
+exit_code=1
+error: patch failed: crates/base/src/input/base/state.rs:6701
+error: crates/base/src/input/base/state.rs: patch does not apply

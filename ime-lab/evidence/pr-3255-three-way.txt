@@ -1,0 +1,2 @@
+exit_code=0
+Applied patch to 'crates/base/src/input/base/state.rs' with conflicts.

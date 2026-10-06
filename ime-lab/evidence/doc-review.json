@@ -1,0 +1,16 @@
+{
+  "checked_at_utc": "2026-10-04T18:49:33.961726+00:00",
+  "documents": {
+    "README.md": "1d09638684607dfc747542588c3b700b1eef1a7e847b1cc75b0ca194797e74e0",
+    "REPORT.md": "b5b1ab885e674b584f491cb04bade65bc7144d1def624352f7b49dfb94db4b33"
+  },
+  "reader_review": {
+    "standalone_instructions": true,
+    "current_status_matches_evidence": true,
+    "historical_attempts_separated": true,
+    "local_links_exist": true,
+    "build_times_labeled_incremental": true,
+    "synthetic_and_real_ime_results_distinguished": true,
+    "unavailable_variant_and_event_fields_explained": true
+  }
+}

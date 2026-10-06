@@ -1,0 +1,24 @@
+[package]
+name = "ime-lab-main"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "../../build.rs"
+
+[[bin]]
+name = "ime-lab-main"
+path = "../../src/main.rs"
+
+[dependencies]
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "4c7f1350331562436df868c55ac33bebc4c6406c" }
+env_logger = "0.11"
+serde_json = "1"
+
+[patch."https://github.com/longbridge/gpui-kit"]
+gpui-base = { path = "../../vendor/main-upstream/crates/base" }
+
+[profile.release]
+debug = 0
+strip = "debuginfo"
+
+[workspace]

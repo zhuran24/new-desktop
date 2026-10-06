@@ -1,0 +1,146 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -246,3 +246,6 @@
+ 
+ #[cfg(feature = "test-support")]
+ pub mod test_support;
++
++#[doc(hidden)]
++pub mod ime_lab_observer;
+--- a/src/input/base/state.rs
++++ b/src/input/base/state.rs
+@@ -1133,6 +1133,18 @@
+         self
+     }
+ 
++    /// Lab-only observation; ranges are UTF-16 code units.
++    #[doc(hidden)]
++    pub fn ime_lab_snapshot(&self) -> serde_json::Value {
++        let marked = self.ime_marked_range.map(|r| r.start..r.end);
++        serde_json::json!({
++            "has_preedit": marked.is_some(),
++            "preedit_text": marked.as_ref().map(|r| self.text.slice(r.clone()).to_string()),
++            "marked_range_utf16": marked.as_ref().map(|r| self.range_to_utf16(r)),
++            "selection_utf16": self.range_to_utf16(&self.selected_range()),
++        })
++    }
++
+     pub fn set_clean_on_escape(&mut self, clean: bool) {
+         self.clean_on_escape = clean;
+     }
+@@ -1939,6 +1951,10 @@
+     }
+ 
+     pub(super) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
++        crate::ime_lab_observer::emit(serde_json::json!({
++            "event": "kit_enter", "secondary": action.secondary, "shift": action.shift,
++            "state": self.ime_lab_snapshot(),
++        }));
+         if M::handle_context_menu_action(self, Box::new(action.clone()), window, cx) {
+             return;
+         }
+@@ -3936,8 +3952,17 @@
+     }
+ 
+     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
++        let ime_lab_before = self.ime_lab_snapshot();
++        let ime_lab_result = (|| {
+         self.ime_marked_range = None;
+         self.undo_manager.commit_transaction();
++        })();
++        crate::ime_lab_observer::emit(serde_json::json!({
++            "event": "unmark", "source": "EntityInputHandler", 
++            "before": ime_lab_before, "after": self.ime_lab_snapshot(),
++            "value_after": self.value().to_string(),
++        }));
++        ime_lab_result
+     }
+ 
+     /// Replace text in range.
+@@ -3951,6 +3976,8 @@
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
++        let ime_lab_before = self.ime_lab_snapshot();
++        let ime_lab_result = (|| {
+         let requested_intent = self.undo_manager.take_pending_intent();
+         if !self.is_editable() {
+             return;
+@@ -4180,6 +4207,13 @@
+             cx.emit(InputEvent::Change);
+         }
+         cx.notify();
++        })();
++        crate::ime_lab_observer::emit(serde_json::json!({
++            "event": "text_commit", "source": "EntityInputHandler", "text": new_text, "replacement_range_utf16": range_utf16,
++            "before": ime_lab_before, "after": self.ime_lab_snapshot(),
++            "value_after": self.value().to_string(),
++        }));
++        ime_lab_result
+     }
+ 
+     /// Mark text is the IME temporary insert on typing.
+@@ -4191,6 +4225,8 @@
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
++        let ime_lab_before = self.ime_lab_snapshot();
++        let ime_lab_result = (|| {
+         let requested_intent = self.undo_manager.take_pending_intent();
+         if !self.is_editable() {
+             return;
+@@ -4311,6 +4347,13 @@
+             self.undo_manager.commit_transaction();
+         }
+         cx.notify();
++        })();
++        crate::ime_lab_observer::emit(serde_json::json!({
++            "event": "preedit_update", "source": "EntityInputHandler", "text": new_text, "replacement_range_utf16": range_utf16, "requested_selection_utf16": new_selected_range_utf16,
++            "before": ime_lab_before, "after": self.ime_lab_snapshot(),
++            "value_after": self.value().to_string(),
++        }));
++        ime_lab_result
+     }
+ 
+     /// Used to position IME candidates.
+@@ -4321,6 +4364,9 @@
+         _window: &mut Window,
+         _cx: &mut Context<Self>,
+     ) -> Option<Bounds<Pixels>> {
++        let ime_lab_range = range_utf16.clone();
++        let ime_lab_before = self.ime_lab_snapshot();
++        let ime_lab_result = (|| {
+         let last_layout = self.last_layout.as_ref()?;
+         let line_height = last_layout.line_height;
+         let line_number_width = last_layout.line_number_width;
+@@ -4371,6 +4417,16 @@
+             // + line_height for show IME panel under the cursor line.
+             bounds.origin + line_number_origin + point(end_origin.x, end_origin.y + line_height),
+         ))
++        })();
++        crate::ime_lab_observer::emit(serde_json::json!({
++            "event": "cursor_bounds", "source": "EntityInputHandler::bounds_for_range",
++            "range_utf16": ime_lab_range, "state": ime_lab_before,
++            "input_bounds": {"x": f32::from(bounds.origin.x), "y": f32::from(bounds.origin.y),
++                "width": f32::from(bounds.size.width), "height": f32::from(bounds.size.height)},
++            "rect": ime_lab_result.map(|r| serde_json::json!({"x": f32::from(r.origin.x),
++                "y": f32::from(r.origin.y), "width": f32::from(r.size.width), "height": f32::from(r.size.height)})),
++        }));
++        ime_lab_result
+     }
+ 
+     fn character_index_for_point(
+--- /dev/null
++++ b/src/ime_lab_observer.rs
+@@ -0,0 +1,11 @@
++//! ime-lab observation hooks. No input decisions are made here.
++use std::sync::OnceLock;
++use serde_json::Value;
++type Observer = Box<dyn Fn(Value) + Send + Sync>;
++static OBSERVER: OnceLock<Observer> = OnceLock::new();
++pub fn install(observer: impl Fn(Value) + Send + Sync + 'static) {
++    assert!(OBSERVER.set(Box::new(observer)).is_ok(), "observer already installed");
++}
++pub(crate) fn emit(event: Value) {
++    if let Some(observer) = OBSERVER.get() { observer(event); }
++}

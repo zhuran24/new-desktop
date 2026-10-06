@@ -1,0 +1,33 @@
+{
+  "checked_at_utc": "2026-10-04T18:41:48.728589+00:00",
+  "gpui_pre": "0.3.7",
+  "variants": {
+    "v070": {
+      "commit": "0c830f4d257e69fdd17200650533ab4ca9a40cc0",
+      "source": "crates.io gpui-kit =0.7.0; gpui-base =0.7.0 private observation copy"
+    },
+    "main": {
+      "commit": "4c7f1350331562436df868c55ac33bebc4c6406c",
+      "source": "git rev plus same-revision private gpui-base observation copy"
+    }
+  },
+  "pr3297": {
+    "merged": true,
+    "merge_commit": "73ef866b50e16f2ff6bf5f6da1aded0aca27a5f2",
+    "ancestor_of_main": true,
+    "ancestor_evidence": "pr3297-ancestry.json",
+    "ahead_by": 6,
+    "behind_by": 0
+  },
+  "pr3255": {
+    "merged": false,
+    "state": "open",
+    "head": "a57b5b72e97ec74aefbe73b97352ad814e8a712e",
+    "clean_apply": false,
+    "third_variant_built": false,
+    "draft": true,
+    "clean_apply_evidence": "pr-3255-apply-current.txt",
+    "diff_sha256": "76389b76694c215645c81fd6a8f241b069783677eb8b06e2170aba6758a8d58e",
+    "reason": "upstream test insertion hunk does not match the pinned main state.rs; no manual conflict resolution"
+  }
+}

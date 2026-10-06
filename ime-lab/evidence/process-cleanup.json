@@ -1,0 +1,28 @@
+{
+  "checked_at_utc": "2026-10-04T18:47:19.117640+00:00",
+  "test_runs_checked": 10,
+  "processes_left": [],
+  "private_fcitx_instances_started": 0,
+  "protected_processes": [
+    {
+      "pid": 2699,
+      "role": "owner KWin wayland-0",
+      "alive": true,
+      "start": "Sat Oct  3 20:01:24 2026"
+    },
+    {
+      "pid": 2773,
+      "role": "owner fcitx5",
+      "alive": true,
+      "start": "Sat Oct  3 20:01:25 2026"
+    },
+    {
+      "pid": 3171,
+      "role": "owner Doubao bridge",
+      "alive": true,
+      "start": "Sat Oct  3 20:01:27 2026"
+    }
+  ],
+  "temporary_runtime_dirs_left": [],
+  "source_audit_temp_removed": "/tmp/ime-lab-source-audit-fbsveb2j"
+}
