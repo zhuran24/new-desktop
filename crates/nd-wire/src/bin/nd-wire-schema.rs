@@ -17,6 +17,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             schemars::schema_for!(nd_wire::DraftUpdated),
         ),
         (
+            "attachments.schema.json",
+            schemars::schema_for!(Vec<nd_wire::Attachment>),
+        ),
+        (
             "models.schema.json",
             schemars::schema_for!(Vec<nd_wire::Model>),
         ),

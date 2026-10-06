@@ -230,6 +230,7 @@ impl Sessions {
     /// 建表、读回列表。独占登记的变化会唤醒全部装载中的会话（放行可能变了）。
     pub fn new(
         store: Arc<Store>,
+        blobs: Arc<nd_store::Blobs>,
         claims: Arc<Exclusivity>,
         backends: Backends,
         config: EngineConfig,
@@ -238,6 +239,7 @@ impl Sessions {
         let listing = Arc::new(Listing::new(state::listed(&store)?));
         let this = Arc::new(Self {
             deps: Deps {
+                blobs,
                 store,
                 claims: claims.clone(),
                 backends,

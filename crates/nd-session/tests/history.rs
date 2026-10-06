@@ -168,3 +168,86 @@ fn merged_prompts_share_one_mark_and_old_branch_cursors_cannot_jump_into_a_new_s
             .is_err()
     );
 }
+
+#[test]
+fn walking_pages_matches_the_simple_projection_and_cursors_survive_append() {
+    use nd_session::projection::{Shown, project};
+    let log: Vec<_> = (0..137)
+        .map(|n| Shown::Prompt {
+            id: format!("p{n}"),
+            text: format!("提示 {n}"),
+            intent: "fold".into(),
+            state: "landed".into(),
+            native: None,
+            reason: None,
+        })
+        .collect();
+    let expected = project(&log);
+    let mut history = History::new("session/pages".into());
+    for item in &expected {
+        history.insert(item.clone());
+    }
+    let mut request = PageReq {
+        limit: 17,
+        ..Default::default()
+    };
+    let mut actual = vec![];
+    loop {
+        let page = history.page(&request).unwrap();
+        actual.splice(0..0, page.items);
+        request.before = page.next;
+        if request.before.is_none() {
+            break;
+        }
+    }
+    assert_eq!(actual, expected);
+    let page = history
+        .page(&PageReq {
+            limit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    history.insert(item(
+        "prompt/later",
+        "prompt",
+        1000,
+        json!({"text":"稍后到达","message":"later"}),
+    ));
+    let earlier = history
+        .page(&PageReq {
+            before: page.next,
+            limit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(earlier.items[0].data["text"], "提示 135");
+    assert!(
+        history
+            .page(&PageReq {
+                limit: 0,
+                ..Default::default()
+            })
+            .is_err()
+    );
+    assert!(
+        history
+            .page(&PageReq {
+                limit: 101,
+                ..Default::default()
+            })
+            .is_err()
+    );
+    let cursor = earlier.next.unwrap();
+    let mut other = History::new("session/other".into());
+    for item in expected {
+        other.insert(item);
+    }
+    assert!(
+        other
+            .page(&PageReq {
+                before: Some(cursor),
+                ..Default::default()
+            })
+            .is_err()
+    );
+}

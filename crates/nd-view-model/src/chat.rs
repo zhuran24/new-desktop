@@ -58,6 +58,8 @@ pub struct MessageView {
     pub text: String,
     pub status: String,
     pub markdown: bool,
+    pub blocks: Vec<crate::MessageBlock>,
+    pub attachments: Vec<nd_wire::Attachment>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConversationView {
@@ -137,6 +139,13 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                 }
                 .into(),
                 markdown: i.kind == "text",
+                blocks: crate::message_blocks(
+                    &i.kind,
+                    i.data["text"].as_str().unwrap_or(&i.fallback.text),
+                    &i.data["raw"],
+                ),
+                attachments: serde_json::from_value(i.data["attachments"].clone())
+                    .unwrap_or_default(),
                 status: if i.kind == "prompt" {
                     match i.data["state"].as_str() {
                         Some("held") => "代持中",
@@ -170,6 +179,7 @@ pub fn accepted(reply: &nd_wire::CommandReply) -> bool {
 
 #[derive(Clone, Debug, Default)]
 pub struct Draft {
+    attachments: Vec<nd_wire::Attachment>,
     text: String,
     revision: u64,
     base: u64,
@@ -188,6 +198,33 @@ pub fn session_draft(snapshot: &Snapshot) -> Option<nd_wire::Draft> {
         .and_then(|i| serde_json::from_value(i.data.clone()).ok())
 }
 impl Draft {
+    pub fn attachments(&self) -> &[nd_wire::Attachment] {
+        &self.attachments
+    }
+    pub fn attach(&mut self, attachment: nd_wire::Attachment) {
+        if !self.attachments.contains(&attachment) {
+            self.attachments.push(attachment);
+            self.revision += 1;
+            self.dirty = true;
+            self.send_unconfirmed = false;
+        }
+    }
+    pub fn detach(&mut self, index: usize) {
+        if index < self.attachments.len() {
+            self.attachments.remove(index);
+            self.revision += 1;
+            self.dirty = true;
+            self.send_unconfirmed = false;
+        }
+    }
+    pub fn replace_attachments(&mut self, attachments: Vec<nd_wire::Attachment>) {
+        if self.attachments != attachments {
+            self.attachments = attachments;
+            self.revision += 1;
+            self.dirty = true;
+            self.send_unconfirmed = false;
+        }
+    }
     pub fn version(&self) -> u64 {
         self.base
     }
@@ -230,8 +267,9 @@ impl Draft {
             && self.pending.is_none()
             && let Some(remote) = &self.remote
         {
-            if self.text != remote.text {
+            if self.text != remote.text || self.attachments != remote.attachments {
                 self.text.clone_from(&remote.text);
+                self.attachments.clone_from(&remote.attachments);
                 self.revision += 1;
             }
             self.base = remote.version;
@@ -256,7 +294,8 @@ impl Draft {
             name: "session.draft.update".into(),
             args: serde_json::json!(nd_wire::DraftUpdate {
                 session: session.into(),
-                text: self.text.clone()
+                text: self.text.clone(),
+                attachments: self.attachments.clone(),
             }),
             expect: serde_json::json!(nd_wire::DraftExpected {
                 draft_version: self.base
@@ -283,7 +322,10 @@ impl Draft {
         if revision == self.revision {
             self.dirty = false;
         }
-        if remote.version == self.base + 1 && remote.text.is_empty() {
+        if remote.version == self.base + 1
+            && remote.text.is_empty()
+            && remote.attachments.is_empty()
+        {
             self.base = remote.version;
         }
         self.observe(remote, composing);
@@ -307,6 +349,10 @@ impl Draft {
             return false;
         }
         self.edit(String::new());
+        if !self.attachments.is_empty() {
+            self.attachments.clear();
+            self.revision += 1;
+        }
         true
     }
 }

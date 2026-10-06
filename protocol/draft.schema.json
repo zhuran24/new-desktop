@@ -4,6 +4,13 @@
   "description": "会话持久草稿；光标、选区和输入法组词不在此协议中。",
   "type": "object",
   "properties": {
+    "attachments": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Attachment"
+      }
+    },
     "device": {
       "type": "string"
     },
@@ -29,10 +36,43 @@
     "device"
   ],
   "$defs": {
+    "Attachment": {
+      "description": "附件正文经鉴权 HTTP GET/PUT，消息和草稿只携带内容寻址引用。",
+      "type": "object",
+      "properties": {
+        "blob": {
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "blob",
+        "name",
+        "media_type",
+        "size"
+      ]
+    },
     "SavedDraft": {
       "description": "版本比较落败的原文；id 是原编辑命令的 id，重试不重复另存。",
       "type": "object",
       "properties": {
+        "attachments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Attachment"
+          }
+        },
         "base_version": {
           "type": "integer",
           "format": "uint64",

@@ -16,6 +16,18 @@ impl Desktop {
                     && this.history.loaded(generation, result)
                 {
                     if this.history.error.is_none() {
+                        if let Some(snapshot) = this.history.snapshot() {
+                            let images: Vec<_> = nd_view_model::conversation(&snapshot)
+                                .messages
+                                .into_iter()
+                                .flat_map(|m| m.attachments)
+                                .filter(|a| a.media_type.starts_with("image/"))
+                                .take(8)
+                                .collect();
+                            for image in images {
+                                this.load_attachment_image(&image, cx);
+                            }
+                        }
                         this.scroll.set_offset(point(px(0.), px(0.)));
                     }
                     cx.notify();

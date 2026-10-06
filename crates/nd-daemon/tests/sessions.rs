@@ -1433,6 +1433,558 @@ async fn a_running_round_keeps_its_identity_when_the_daemon_restarts() {
     fx.close();
 }
 
+/// #17: 上传成功不是验收；经真 CLI 检查模型请求的图片原字节与消息里的稳定引用。
+#[tokio::test]
+async fn attachments_reach_the_model_and_remain_in_the_conversation() {
+    let fx = Fixture::start("nd17-image", 3_600_000).await;
+    let png: &[u8] = include_bytes!("fixtures/pixel.png");
+    let ui = fx.ui().await;
+    let blob = ui.put_blob(png).await.unwrap();
+    assert_eq!(ui.put_blob(png).await.unwrap(), blob);
+    let attachments =
+        json!([{"blob":blob,"name":"像素.png","media_type":"image/png","size":png.len()}]);
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("看到图片了"));
+    let reply = fx
+        .command(
+            "image-first",
+            "session.create",
+            json!({
+                "cwd":"/sandbox/home", "model":MODEL, "text":"看图", "attachments":attachments
+            }),
+        )
+        .await;
+    let session = match reply {
+        CommandReply::Receipt {
+            receipt:
+                Receipt::Accepted {
+                    stream: Some(stream),
+                    ..
+                },
+        } => stream.trim_start_matches("session/").to_owned(),
+        other => panic!("{other:?}"),
+    };
+    let snapshot = fx
+        .wait(&session, "image response", |s| texts(s) == ["看到图片了"])
+        .await;
+    let requests = fx.scenario.endpoint().requests();
+    let image = requests[0].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .find(|b| b["type"] == "image")
+        .expect("model must receive an image block");
+    assert_eq!(image["source"]["media_type"], "image/png");
+    assert_eq!(
+        image["source"]["data"],
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9l8AAAAASUVORK5CYII="
+    );
+    assert_eq!(
+        prompt(&snapshot, "看图").unwrap().data["attachments"],
+        attachments
+    );
+    assert_eq!(ui.get_blob(&blob).await.unwrap(), png);
+    fx.close();
+}
+
+#[tokio::test]
+async fn attachment_validation_rejects_a_whole_message_without_holding_partial_uploads() {
+    let fx = Fixture::start("nd17-invalid", 3_600_000).await;
+    let ui = fx.ui().await;
+    let bytes = include_bytes!("fixtures/pixel.png");
+    let blob = ui.put_blob(bytes).await.unwrap();
+    let good = json!({"blob":blob,"name":"image.png","media_type":"image/png","size":bytes.len()});
+    for (index, attachments) in [
+        json!([good, {"blob":"0".repeat(64),"name":"missing.png","media_type":"image/png","size":1}]),
+        { let mut a = good.clone(); a["size"] = json!(999); json!([a]) },
+        { let mut a = good.clone(); a["media_type"] = json!("application/octet-stream"); json!([a]) },
+    ].into_iter().enumerate() {
+        let reply = fx.command(&format!("invalid-{index}"), "session.create", json!({"cwd":"/sandbox/home","model":MODEL,"text":"拒绝附件","attachments":attachments})).await;
+        assert!(matches!(reply, CommandReply::Receipt { receipt: Receipt::Rejected { ref code, .. } } if code == "invalid_attachment"), "{reply:?}");
+    }
+    assert!(fx.scenario.endpoint().requests().is_empty());
+    // 经守护进程的正常清理器观察：整条拒绝的命令不能留下部分附件引用。
+    let config = fx.scenario.root().join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[storage]\nblob_grace_seconds=0\ngc_interval_seconds=1\n");
+    std::fs::write(config, text).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ui.get_blob(&blob).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("rejected upload must be collected");
+    fx.close();
+}
+
+#[tokio::test]
+async fn files_without_caption_reach_the_model_and_survive_restart_and_collection() {
+    let fx = Fixture::start("nd17-files", 3_600_000).await;
+    let ui = fx.ui().await;
+    let text = "文件正文：中文、emoji 🦀\n第二行\n";
+    let text_blob = ui.put_blob(text.as_bytes()).await.unwrap();
+    let pdf = include_bytes!("fixtures/material.pdf");
+    let pdf_blob = ui.put_blob(pdf).await.unwrap();
+    let attachments = json!([
+        {"blob":text_blob,"name":"材料.md","media_type":"text/plain","size":text.len()},
+        {"blob":pdf_blob,"name":"material.pdf","media_type":"application/pdf","size":pdf.len()}
+    ]);
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("已读材料"));
+    let reply = fx
+        .command(
+            "files-first",
+            "session.create",
+            json!({"cwd":"/sandbox/home","model":MODEL,"text":"","attachments":attachments}),
+        )
+        .await;
+    let session = match reply {
+        CommandReply::Receipt {
+            receipt:
+                Receipt::Accepted {
+                    stream: Some(stream),
+                    ..
+                },
+        } => stream.trim_start_matches("session/").to_owned(),
+        other => panic!("{other:?}"),
+    };
+    fx.wait(&session, "file response", |s| texts(s) == ["已读材料"])
+        .await;
+    let requests = fx.scenario.endpoint().requests();
+    let blocks: Vec<_> = requests[0].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["text"].as_str().is_some_and(|s| s.contains(text)))
+    );
+    let doc = blocks
+        .iter()
+        .find(|b| b["type"] == "document")
+        .expect("PDF reaches model as document");
+    assert_eq!(doc["source"]["media_type"], "application/pdf");
+    use base64::Engine;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(doc["source"]["data"].as_str().unwrap())
+            .unwrap(),
+        pdf
+    );
+    let config = fx.scenario.root().join("config.toml");
+    let mut config_text = std::fs::read_to_string(&config).unwrap();
+    config_text.push_str("\n[storage]\nblob_grace_seconds=0\ngc_interval_seconds=1\n");
+    std::fs::write(config, config_text).unwrap();
+    fx.scenario.restart_daemon().unwrap();
+    let ui = fx.ui().await;
+    let orphan = ui.put_blob(b"unreferenced").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ui.get_blob(&orphan).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ui.get_blob(&text_blob).await.unwrap(), text.as_bytes());
+    assert_eq!(ui.get_blob(&pdf_blob).await.unwrap(), pdf);
+    assert_eq!(
+        prompt(&fx.peek(&session).await, "").unwrap().data["attachments"],
+        attachments
+    );
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("第二份"));
+    let reply = fx
+        .command(
+            "files-send",
+            "session.send",
+            json!({"session":session,"text":"","attachments":attachments}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Done { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    fx.wait(&session, "second file response", |s| {
+        texts(s) == ["已读材料", "第二份"]
+    })
+    .await;
+    assert!(request_text(&fx.scenario.endpoint().requests()[1].body).contains("文件正文"));
+    fx.close();
+}
+
+#[tokio::test]
+async fn desktop_upload_reads_file_bytes_and_rejects_unsupported_or_missing_files() {
+    use nd_ui_core::{AttachmentSource, CommandClient};
+    let fx = Fixture::start("nd17-upload", 3_600_000).await;
+    let client = CommandClient::start(fx.socket()).unwrap();
+    let path = fx.scenario.root().join("材料.md");
+    std::fs::write(&path, "中文材料").unwrap();
+    let a = client
+        .upload(AttachmentSource::Path(path.clone()))
+        .await
+        .unwrap();
+    assert_eq!(a.name, "材料.md");
+    assert_eq!(a.media_type, "text/plain");
+    assert_eq!(
+        fx.ui().await.get_blob(&a.blob).await.unwrap(),
+        "中文材料".as_bytes()
+    );
+    assert!(
+        client
+            .upload(AttachmentSource::Bytes {
+                name: "data.bin".into(),
+                bytes: vec![0, 255, 1]
+            })
+            .await
+            .unwrap_err()
+            .contains("不支持")
+    );
+    assert!(
+        client
+            .upload(AttachmentSource::Path(fx.scenario.root().into()))
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(client.upload(AttachmentSource::Path(path)).await.is_err());
+    fx.close();
+}
+
+#[tokio::test]
+async fn native_attachment_paste_drop_and_diff_rendering() {
+    let fx = Fixture::start("nd17-window", 3_600_000).await;
+    let answer = "说明\n```rust\nfn main() {}\n```\n```diff\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-旧内容\n+新内容🦀\n```\n结束";
+    fx.scenario.endpoint().enqueue(
+        Route::new(None, "claude-haiku-4-5-20251001"),
+        ModelReply::streaming_text(answer, 1, 75),
+    );
+    let output = std::env::var_os("ND17_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-attachments"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").unwrap())
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--output")
+        .arg(&output)
+        .arg("--attachments")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = fx.scenario.endpoint().requests();
+    assert_eq!(requests.len(), 1);
+    let blocks: Vec<_> = requests[0].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        blocks.iter().any(|b| b["type"] == "image"),
+        "pasted image did not reach the model"
+    );
+    let text = request_text(&requests[0].body);
+    assert!(
+        text.contains("复制文件里的中文正文") && text.contains("拖入文件里的独立正文"),
+        "{text}"
+    );
+    let verdict: Value =
+        serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap();
+    let snapshot = fx.peek(verdict["session"].as_str().unwrap()).await;
+    assert_eq!(
+        prompt(&snapshot, "请写代码").unwrap().data["attachments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_multi_megabyte_attachment_is_not_lost_at_the_watchdog_frame_boundary() {
+    let fx = Fixture::start("nd17-large", 3_600_000).await;
+    let bytes = "材料".repeat(400_000);
+    let blob = fx.ui().await.put_blob(bytes.as_bytes()).await.unwrap();
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("大文件已收到"));
+    let reply = fx.command("large-create", "session.create", json!({"cwd":"/sandbox/home","model":MODEL,"text":"大附件","attachments":[{"blob":blob,"name":"large.txt","size":bytes.len(),"media_type":"text/plain"}]})).await;
+    let CommandReply::Receipt {
+        receipt: Receipt::Accepted {
+            stream: Some(stream),
+            ..
+        },
+    } = reply
+    else {
+        panic!("{reply:?}");
+    };
+    let session = stream.trim_start_matches("session/");
+    let snapshot = fx
+        .wait(session, "large reply or explicit failure", |s| {
+            texts(s) == ["大文件已收到"] || has_header(s, |h| h["status"] == "partial")
+        })
+        .await;
+    assert_eq!(texts(&snapshot), ["大文件已收到"]);
+    let requests = fx.scenario.endpoint().requests();
+    let received = requests[0].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .filter_map(|b| b["text"].as_str())
+        .any(|t| t.contains(&bytes));
+    assert!(
+        received,
+        "large attachment contents must reach the endpoint intact"
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn withdrawn_creation_releases_unused_attachments_and_keeps_its_receipt() {
+    let fx = Fixture::start("nd17-withdraw", 3_600_000).await;
+    let ui = fx.ui().await;
+    let blob = ui.put_blob(b"unused material").await.unwrap();
+    let args = json!({"cwd":"/sandbox/missing","text":"无法开始","attachments":[{"blob":blob,"name":"unused.txt","size":15,"media_type":"text/plain"}]});
+    let reply = fx
+        .command("withdraw-create", "session.create", args.clone())
+        .await;
+    let CommandReply::Receipt {
+        receipt: Receipt::Accepted {
+            stream: Some(ref stream),
+            ..
+        },
+    } = reply
+    else {
+        panic!("{reply:?}");
+    };
+    fx.wait(stream.trim_start_matches("session/"), "withdrawn", |s| {
+        has_header(s, |h| h["status"] == "withdrawn")
+    })
+    .await;
+    let config = fx.scenario.root().join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[storage]\nblob_grace_seconds=0\ngc_interval_seconds=1\n");
+    std::fs::write(config, text).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ui.get_blob(&blob).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("withdrawn creation without a prompt releases attachment");
+    assert_eq!(
+        fx.command("withdraw-create", "session.create", args).await,
+        reply
+    );
+    assert!(fx.scenario.endpoint().requests().is_empty());
+    fx.close();
+}
+
+#[tokio::test]
+async fn jpeg_gif_and_webp_attachments_reach_the_model_with_their_original_bytes() {
+    use base64::Engine;
+    let fx = Fixture::start("nd17-formats", 3_600_000).await;
+    let ui = fx.ui().await;
+    let samples: [(&str, &[u8]); 3] = [
+        ("image/jpeg", include_bytes!("fixtures/preview.jpg")),
+        ("image/gif", include_bytes!("fixtures/preview.gif")),
+        ("image/webp", include_bytes!("fixtures/preview.webp")),
+    ];
+    let mut attachments = vec![];
+    for (mime, bytes) in samples {
+        attachments.push(json!({"blob":ui.put_blob(bytes).await.unwrap(),"name":mime,"media_type":mime,"size":bytes.len()}));
+    }
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("三种图片"));
+    let reply=fx.command("formats-create","session.create",json!({"cwd":"/sandbox/home","model":MODEL,"text":"核对格式","attachments":attachments})).await;
+    let CommandReply::Receipt {
+        receipt: Receipt::Accepted {
+            stream: Some(stream),
+            ..
+        },
+    } = reply
+    else {
+        panic!("{reply:?}");
+    };
+    fx.wait(
+        stream.trim_start_matches("session/"),
+        "formats reply",
+        |s| texts(s) == ["三种图片"],
+    )
+    .await;
+    let requests = fx.scenario.endpoint().requests();
+    let images: Vec<_> = requests[0].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .filter(|b| b["type"] == "image")
+        .collect();
+    assert_eq!(images.len(), 3);
+    for ((mime, bytes), image) in samples.into_iter().zip(images) {
+        assert_eq!(image["source"]["media_type"], mime);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(image["source"]["data"].as_str().unwrap())
+                .unwrap(),
+            bytes
+        );
+    }
+    fx.close();
+}
+
+#[tokio::test]
+async fn real_edit_tool_exposes_the_replaced_text_for_diff_display() {
+    let fx = Fixture::start("nd17-edit", 3_600_000).await;
+    std::fs::write(
+        fx.scenario.root().join("claude/settings.json"),
+        r#"{"permissions":{"allow":["Read","Edit"]}}"#,
+    )
+    .unwrap();
+    let file = fx.scenario.root().join("project/example.txt");
+    std::fs::write(&file, "旧内容\n").unwrap();
+    let input = json!({"file_path":"/sandbox/project/example.txt","old_string":"旧内容\n","new_string":"新内容🦀\n"});
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(
+        fx.main(),
+        ModelReply::tool(
+            "toolu_read_diff",
+            "Read",
+            json!({"file_path":"/sandbox/project/example.txt"}),
+        ),
+    );
+    endpoint.enqueue(
+        fx.main(),
+        ModelReply::tool("toolu_edit_diff", "Edit", input.clone()),
+    );
+    endpoint.enqueue(fx.main(), ModelReply::text("改好了"));
+    let session = fx
+        .create("edit-diff-create", "/sandbox/project", "修改测试文件")
+        .await;
+    let snapshot = fx
+        .wait(&session, "Edit finished", |s| texts(s) == ["改好了"])
+        .await;
+    let edit = snapshot
+        .items
+        .iter()
+        .find(|i| i.kind == "tool_use" && i.data["raw"]["name"] == "Edit")
+        .expect("Edit available to diff projection");
+    for key in ["file_path", "old_string", "new_string"] {
+        assert_eq!(edit.data["raw"]["input"][key], input[key]);
+    }
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "新内容🦀\n");
+    fx.close();
+}
+
+#[tokio::test]
+async fn draft_attachments_survive_conflicts_restart_and_transfer_to_the_sent_message() {
+    let fx = Fixture::start("nd17-draft", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("开始"));
+    let session = fx
+        .create("attached-draft-create", "/sandbox/project", "开始")
+        .await;
+    fx.wait(&session, "active", |s| texts(s) == ["开始"]).await;
+    let ui = fx.ui().await;
+    let blob = ui.put_blob(b"draft attachment").await.unwrap();
+    let attachments = json!([{"blob":blob,"name":"draft.txt","media_type":"text/plain","size":16}]);
+    let command = |id: &str, text: &str, version: u64| Command {
+        id: id.into(),
+        device: id.into(),
+        name: "session.draft.update".into(),
+        args: json!({"session":session,"text":text,"attachments":attachments}),
+        expect: json!({"draft_version":version}),
+    };
+    let first = command("attached-a", "A", 0);
+    let _ = fx.ui().await.command(&first).await.unwrap();
+    let _ = fx
+        .ui()
+        .await
+        .command(&command("attached-b", "B", 0))
+        .await
+        .unwrap();
+    fx.scenario.restart_daemon().unwrap();
+    let snapshot = fx.peek(&session).await;
+    let draft = &snapshot
+        .items
+        .iter()
+        .find(|i| i.id == "draft")
+        .unwrap()
+        .data;
+    assert_eq!(draft["attachments"], attachments);
+    assert_eq!(draft["saved"][0]["attachments"], attachments);
+    let config = fx.scenario.root().join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[storage]\nblob_grace_seconds=0\ngc_interval_seconds=1\n");
+    std::fs::write(config, text).unwrap();
+    let ui = fx.ui().await;
+    let orphan = ui.put_blob(b"no reference").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ui.get_blob(&orphan).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ui.get_blob(&blob).await.unwrap(), b"draft attachment");
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("收到草稿附件"));
+    let reply = fx
+        .ui()
+        .await
+        .command(&Command {
+            id: "attached-draft-send".into(),
+            device: "a".into(),
+            name: "session.send".into(),
+            args: json!({"session":session,"text":"A","attachments":attachments}),
+            expect: json!({"draft_version":1}),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        reply,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    let done = fx
+        .wait(&session, "attached draft sent", |s| {
+            texts(s) == ["开始", "收到草稿附件"]
+        })
+        .await;
+    let draft = &done.items.iter().find(|i| i.id == "draft").unwrap().data;
+    assert_eq!(draft["attachments"], json!([]));
+    assert_eq!(draft["saved"][0]["attachments"], attachments);
+    assert_eq!(prompt(&done, "A").unwrap().data["attachments"], attachments);
+    fx.close();
+}
+
 #[tokio::test]
 async fn history_pages_are_read_only_ordered_and_resume_after_restart() {
     let fx = Fixture::start("nd20-history", 3_600_000).await;
@@ -1631,8 +2183,8 @@ async fn native_navigation_jumps_to_a_round_via_history_page() {
 }
 
 async fn native_history(fx: &Fixture, session: &str, round: &str, text: &str, rounds: usize) {
-    let output = std::env::var_os("ND_NATIVE_OUTPUT")
-        .map(std::path::PathBuf::from)
+    let output = std::env::var_os("ND20_NATIVE_OUTPUT")
+        .map(|p| std::path::PathBuf::from(p).join(format!("rounds-{rounds}")))
         .unwrap_or_else(|| fx.scenario.root().join("native-history"));
     let result = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))

@@ -106,6 +106,7 @@ impl ClaudeEndpoint {
         let (shutdown, mut stop) = tokio::sync::watch::channel(false);
         let router = Router::new()
             .route("/v1/messages", post(messages))
+            .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
             .with_state(EndpointState {
                 script: script.clone(),
                 shutdown: stop.clone(),

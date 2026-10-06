@@ -460,6 +460,7 @@ impl Paths {
 async fn assemble_sessions(
     config: &Config,
     store: &Arc<nd_store::Store>,
+    blobs: &Arc<nd_store::Blobs>,
     paths: &Paths,
 ) -> Result<Arc<nd_session::Sessions>> {
     let value = config.snapshot().value;
@@ -523,6 +524,7 @@ async fn assemble_sessions(
                 watchdogs,
                 claims.clone(),
                 generation,
+                blobs.clone(),
                 nd_claude::ClaudeBackendConfig {
                     record_dir: record.then(|| paths.data.join("recordings")),
                     ..Default::default()
@@ -533,6 +535,7 @@ async fn assemble_sessions(
     }
     let sessions = nd_session::Sessions::new(
         store.clone(),
+        blobs.clone(),
         claims.clone(),
         backends,
         nd_session::EngineConfig {
@@ -583,7 +586,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
         paths.data.join("blobs"),
         store.clone(),
     )?);
-    let sessions = assemble_sessions(&config, &store, &paths).await?;
+    let sessions = assemble_sessions(&config, &store, &blobs, &paths).await?;
     let state = Arc::new(Mutex::new(
         Engine::open(
             config.clone(),

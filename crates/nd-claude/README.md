@@ -62,7 +62,7 @@ argv 逐项传入，不拼 shell：`--output-format stream-json --input-format s
 
 ## 后端端口的 Claude 实现（#13）
 
-`ClaudeBackend::new(claude, watchdogs, claims, generation, config)` 实现 `BackendAdapter`：
+`ClaudeBackend::new(claude, watchdogs, claims, generation, blobs, config)` 实现 `BackendAdapter`：
 
 - **拉起**（`Act::Open`）：`Claude::open`（新建用预定的后端会话 id，续接用 `--resume`）；成功后向独占登记报 `Up`（看守报的进程身份、这一代守护进程的控制代次），立即重扫一次 CLI 注册表，让自己的进程按身份认作自有；然后起这个承载位的任务，交 `Opened`（能力表原样存进 `adopt`，供重启接回）和 `Tasks{Drained}`（新进程没有后台任务）。失败时把还活着的进程结束掉，等看守单元清理完、独占登记记下它离开，再交 `Failed`。
 - **承载位任务**：持有看守连接，是唯一的 stdin 写入者。`Send` 写 `{type:"user", uuid:native_uuid(票), priority, origin:{kind:"human"}}`（并入→`next`，本回合后→`later`，打断→`now`）；看守流水里出现这一行的输入记录报 `Written`，CLI 回显同一 uuid 才报 `Landed`。写看守连接出错时换连接，按看守报的已写高水位判断：没写过就用同一输入序号重写（看守按序号去重），判断不了才交付不明。`End{Graceful|Finish}` 写控制请求 `end_session`，`Kill|Discard` 让看守杀进程。每 20 ms 读一页流水，经 `Conversation` 归一成事实交一批；批次带检查点 `{seq, convo}`（流水位置与状态机快照），会话提交后 `committed` 才给看守 ack。

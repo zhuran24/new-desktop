@@ -74,6 +74,8 @@ fn profile(v: &View<'_>) -> Profile {
 /// 首条消息没有补偿：它写给后端之后就算做过不可逆步骤；之前的失败只撤掉会话。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Create {
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
     pub text: String,
 }
 impl Create {
@@ -130,6 +132,7 @@ impl Create {
                     to: carrier.clone(),
                     msg: Msg {
                         text: self.text.clone(),
+                        attachments: self.attachments.clone(),
                         intent: Intent::Fold,
                     },
                 },

@@ -92,6 +92,8 @@ pub enum Issuer {
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
     pub id: String,
     pub text: String,
     pub intent: Intent,
@@ -132,11 +134,13 @@ impl Core {
         device: &str,
         base: u64,
         text: String,
+        attachments: Vec<nd_wire::Attachment>,
     ) -> nd_wire::DraftUpdated {
         let saved = if base != self.draft.version {
             self.draft.saved.push(nd_wire::SavedDraft {
                 id: id.into(),
                 base_version: base,
+                attachments,
                 text,
                 device: device.into(),
             });
@@ -144,6 +148,7 @@ impl Core {
         } else {
             self.draft.version += 1;
             self.draft.text = text;
+            self.draft.attachments = attachments;
             self.draft.device = device.into();
             None
         };

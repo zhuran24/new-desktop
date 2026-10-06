@@ -1,27 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "DraftUpdate",
-  "description": "`session.draft.update` 的参数；前置版本放在 Command.expect。",
-  "type": "object",
-  "properties": {
-    "attachments": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/Attachment"
-      }
-    },
-    "session": {
-      "type": "string"
-    },
-    "text": {
-      "type": "string"
-    }
+  "title": "Array_of_Attachment",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/Attachment"
   },
-  "required": [
-    "session",
-    "text"
-  ],
   "$defs": {
     "Attachment": {
       "description": "附件正文经鉴权 HTTP GET/PUT，消息和草稿只携带内容寻址引用。",
