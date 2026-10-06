@@ -838,6 +838,25 @@ impl Actor {
                 },
             ));
             self.inner.carriers.lock().unwrap().remove(&self.carrier);
+            // 进程退出时还排在队列里、没写出的票：证明没写出，引擎另发（会按需拉起）。
+            self.rx.close();
+            while let Ok(cmd) = self.rx.try_recv() {
+                match cmd {
+                    Cmd::Send { ticket, .. } => facts.push(done(
+                        &ticket,
+                        Outcome::Refused {
+                            refusal: Refusal::Withheld,
+                        },
+                    )),
+                    Cmd::End { ticket, .. } => facts.push(done(
+                        &ticket,
+                        Outcome::Ok {
+                            done: Done::Ended { code: Some(code) },
+                        },
+                    )),
+                    Cmd::Ack(_) => {}
+                }
+            }
             self.inner
                 .deliver(
                     &self.session,
@@ -923,11 +942,16 @@ impl BackendAdapter for ClaudeBackend {
             Act::Send { to, msg } => {
                 let carriers = self.inner.carriers.lock().unwrap();
                 match carriers.get(&to) {
-                    Some(slot) if slot.session == issued.session => {
-                        let _ = slot.tx.send(Cmd::Send {
-                            ticket: issued.ticket,
-                            msg,
-                        });
+                    Some(slot)
+                        if slot.session == issued.session
+                            && slot
+                                .tx
+                                .send(Cmd::Send {
+                                    ticket: issued.ticket.clone(),
+                                    msg,
+                                })
+                                .is_ok() =>
+                    {
                         accepted
                     }
                     _ => Admit::Rejected {

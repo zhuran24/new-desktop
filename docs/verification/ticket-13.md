@@ -16,6 +16,7 @@
 | 创建失败：做过的保留、标部分完成 | `a_create_whose_backend_died_after_the_first_message_was_written_is_partial` | 场景故障点让后端在首条消息写出前停住，消息 `written`；杀掉后端进程后会话 `partial`，`irreversible` 列出「first（可能已做）」，首条消息 `unknown`，列表里标部分完成 |
 | 闲置回收与按需拉起 | `an_idle_backend_is_reclaimed_and_the_next_message_resumes_it` | 没人订阅时闲置到时限回收，看守报原后端进程 Gone；再发消息按需拉起新的后端进程，续接同一个后端会话，模型请求带着第一轮 |
 | 闲置不等于可回收 | `a_backend_with_a_running_background_task_is_not_reclaimed` | 后台 Bash 阻塞在 FIFO 上：会话头 `drain:busy`，超过闲置时限 4 倍仍不回收；放行后 CLI 把结果交给模型，之后回收 |
+| 后端进程意外退出后按需拉起 | `a_backend_that_died_is_relaunched_on_the_next_message` | 杀掉 CLI 后，看守记下退出、单元清理完，会话头报进程不在；下一条消息按需拉起新进程，续接同一后端会话、带着第一轮 |
 | 守护进程重启后接着用 | `the_session_keeps_its_backend_process_across_a_daemon_restart` | SIGKILL 守护进程后自动重启，接回同一个后端进程（同 pid、同后端进程编号），重启后发的消息落地、得到回答 |
 | 录制回归的来源 | `a_recorded_conversation_replays_through_the_adapter_state_machine` | 真对话（流式、工具调用与结果、两回合）的看守流水录成夹具，读回完整；回放的写出与回显一一对应且等于会话里落地消息的原生编号，完整块等于守护进程显示的内容 |
 

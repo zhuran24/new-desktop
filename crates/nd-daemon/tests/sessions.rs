@@ -751,3 +751,37 @@ async fn a_recorded_conversation_replays_through_the_adapter_state_machine() {
     }
     fx.close();
 }
+
+#[tokio::test]
+async fn a_backend_that_died_is_relaunched_on_the_next_message() {
+    let fx = Fixture::start("nd13-died", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("第一轮"));
+    let session = fx.create("died-create", "/sandbox/project", "你好").await;
+    let first = fx
+        .wait(&session, "first turn", |s| {
+            texts(s) == ["第一轮"] && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    let pid = cli_pid(&fx, &first).await;
+    signal(pid, rustix::process::Signal::KILL);
+    // 看守记下退出、单元清理完，独占登记放掉租约，会话头才报进程不在。
+    fx.wait(&session, "process gone", |s| {
+        has_header(s, |h| {
+            h["process"]["alive"] == false && h["status"] == "active"
+        })
+    })
+    .await;
+    endpoint.enqueue(fx.main(), ModelReply::text("第二轮"));
+    fx.send("died-send", &session, "还在吗").await;
+    let after = fx
+        .wait(&session, "relaunched", |s| texts(s) == ["第一轮", "第二轮"])
+        .await;
+    assert_ne!(
+        header(&after)["process"]["run"],
+        header(&first)["process"]["run"]
+    );
+    assert_eq!(prompt(&after, "还在吗").unwrap().data["state"], "landed");
+    assert!(request_text(&endpoint.requests()[1].body).contains("第一轮"));
+    fx.close();
+}
