@@ -57,7 +57,7 @@ scripts/test-scenarios.sh -- --nocapture
 
 按 owner 补充要求，在标记 ignored 后**单独手动运行一次**：128 MiB slice 中对 512 MiB 匿名内存逐页写入。结果 PASS，`memory.events.max=61`、`oom=2`、`oom_kill=1`；超额后端退出，另一个独立场景的同步副本继续可用。证据 `n7-oom-manual.log`；这次会产生桌面通知，不属于默认回归。
 
-手动复验会再次产生通知，命令仅选中这一项：
+先运行默认复验以生成带 scenarios 的 daemon 和看守二进制。手动复验会再次产生通知，以下命令仅选中这一项：
 
 ```bash
 export CARGO_TARGET_DIR=/mnt/wd_external/nd-build/target/ticket-6
@@ -93,7 +93,7 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
 | 预期单元不在而进程活着，报 IdentityMismatch | `live_process_without_its_expected_unit_is_identity_mismatch_not_gone` |
 | 后端 exec 失败，报 Gone/NeverLaunched | `failed_backend_spawn_reports_never_launched_with_no_live_identity` |
 | 阻塞 stdin 时仍能结束后端；断开的在途大输入完成一次 | `new_controller_can_end_a_backend_while_old_input_pipe_is_blocked`、`cancelled_input_transfer_finishes_once_and_reconnect_deduplicates_its_sequence` |
-| 真实录制解码；部分 JSON、中间漏行、完整末行被删均拒绝 | `nd-watchdog-proto/tests/recordings.rs` |
+| 真实录制解码；部分 JSON、中间漏行、完整末行被删均拒绝 | `crates/nd-watchdog-proto/tests/recordings.rs` |
 
 测试使用规格已确认的接缝：真 daemon/SyncReplica 的身份和 Unknown 观察、真实托管和看守协议、真实 systemd，以及实际模型 HTTP 请求；高吞吐用普通真实进程，未实现假 CLI/看守。TDD 红测日志为日志根目录的 `red-01/02/03/05/06/07/08/10/11.log`，另有对应 green 和最终场景日志；验证既有行为的增补场景直接通过，不冒称它们曾红测。首次身份检查、阻塞输入结束、并发幂等和完整末行截断回归均曾暴露真实失败并已修复。
 
