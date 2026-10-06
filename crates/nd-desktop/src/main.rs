@@ -1,0 +1,102 @@
+use gpui_kit::*;
+use nd_desktop::Desktop;
+use nd_view_model::ViewStateFile;
+use std::{path::PathBuf, time::Duration};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let mut socket = None;
+    let mut state_path = None;
+    let mut seconds = None::<u64>;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--socket" => socket = Some(PathBuf::from(args.next().ok_or("--socket needs a path")?)),
+            "--state" => {
+                state_path = Some(PathBuf::from(args.next().ok_or("--state needs a path")?))
+            }
+            "--quit-after" => {
+                seconds = Some(args.next().ok_or("--quit-after needs seconds")?.parse()?)
+            }
+            "--help" => {
+                println!("nd-desktop [--socket PATH] [--state PATH] [--quit-after SECONDS]");
+                return Ok(());
+            }
+            _ => return Err(format!("unknown argument: {arg}").into()),
+        }
+    }
+    let socket = match socket {
+        Some(path) => path,
+        None => PathBuf::from(
+            std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR missing; use --socket")?,
+        )
+        .join("new-desktop/nd.sock"),
+    };
+    let state_path = match state_path {
+        Some(path) => path,
+        None => std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+            .ok_or("HOME missing; use --state")?
+            .join("new-desktop/ui.json"),
+    };
+    let file = ViewStateFile::open(&state_path)?;
+    let (state, warning) = match file.load() {
+        Ok(state) => (state, None),
+        Err(e) => (
+            Default::default(),
+            Some(format!("视图状态读取失败，已用默认值：{e}")),
+        ),
+    };
+    let (save, mut saves) = tokio::sync::watch::channel(state.clone());
+    // 唯一后台写入者，最新偏好可合并；退出后排空并释放文件锁。
+    let writer = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("state runtime");
+        runtime.block_on(async move {
+            while saves.changed().await.is_ok() {
+                let state = saves.borrow_and_update().clone();
+                if let Err(e) = file.save(&state) {
+                    eprintln!("保存视图状态失败：{e}");
+                }
+            }
+        });
+    });
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::centered(
+                    size(px(state.window.width), px(state.window.height)),
+                    cx,
+                )),
+                app_id: Some("new-desktop".into()),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, move |window, cx| {
+                window.set_window_title("New Desktop");
+                cx.new(|cx| {
+                    Desktop::new(socket, state, save, warning, window, cx)
+                        .expect("start nd-wire worker")
+                })
+            })
+            .expect("open New Desktop window");
+            if let Some(seconds) = seconds {
+                let timer = cx.background_executor().timer(Duration::from_secs(seconds));
+                cx.spawn(async move |cx| {
+                    timer.await;
+                    cx.update(|cx| cx.quit());
+                })
+                .detach();
+            }
+        });
+    writer.join().map_err(|_| "state writer panicked")?;
+    Ok(())
+}

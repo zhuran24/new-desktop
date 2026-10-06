@@ -1,0 +1,17 @@
+[package]
+name = "nd-view-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nd-wire.workspace = true
+nd-kernel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+fs2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
