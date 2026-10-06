@@ -508,12 +508,16 @@ async fn assemble_sessions(
             cfg.poll_timeout = Duration::from_millis(claude.poll_timeout_ms);
             cfg.init_timeout = Duration::from_millis(claude.init_timeout_ms);
             cfg.record = claude.record;
+            let record = claude.record;
             let adapter = nd_claude::ClaudeBackend::new(
                 nd_claude::Claude::new(cfg, watchdogs.clone())?,
                 watchdogs,
                 claims.clone(),
                 generation,
-                Default::default(),
+                nd_claude::ClaudeBackendConfig {
+                    record_dir: record.then(|| paths.data.join("recordings")),
+                    ..Default::default()
+                },
             );
             backends = backends.with(adapter);
         }

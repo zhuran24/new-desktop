@@ -32,12 +32,16 @@ pub struct ClaudeBackendConfig {
     pub poll: Duration,
     /// 后端进程退出后等看守单元清理完（独占登记据此放掉租约）的时限。
     pub gone_timeout: Duration,
+    /// 录下读到的看守流水（场景测试与录制回归用）：每个后端进程一个 `<run>.jsonl`，
+    /// 在给看守确认、流水被回收之前写。生产默认不录。
+    pub record_dir: Option<std::path::PathBuf>,
 }
 impl Default for ClaudeBackendConfig {
     fn default() -> Self {
         Self {
             poll: Duration::from_millis(20),
             gone_timeout: Duration::from_secs(15),
+            record_dir: None,
         }
     }
 }
@@ -712,6 +716,25 @@ impl Actor {
         self.process(records, None).await
     }
 
+    fn record(&self, records: &[nd_watchdog_proto::Record]) {
+        let Some(dir) = &self.inner.config.record_dir else {
+            return;
+        };
+        use std::io::Write;
+        let _ = std::fs::create_dir_all(dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{}.jsonl", self.run_id)))
+        {
+            for record in records {
+                if let Ok(line) = serde_json::to_string(record) {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+        }
+    }
+
     async fn process(
         &mut self,
         records: Vec<nd_watchdog_proto::Record>,
@@ -720,6 +743,7 @@ impl Actor {
         if records.is_empty() && forced_exit.is_none() {
             return false;
         }
+        self.record(&records);
         let through = records.last().map_or(self.run.cursor(), |r| r.end_seq);
         let mut facts = vec![];
         let mut live = vec![];

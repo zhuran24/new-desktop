@@ -20,6 +20,7 @@ rustix.workspace = true
 
 [dev-dependencies]
 nd-testkit.workspace = true
+nd-session.workspace = true
 tempfile.workspace = true
 
 [features]

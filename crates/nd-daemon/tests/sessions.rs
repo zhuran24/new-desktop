@@ -620,3 +620,134 @@ async fn the_session_keeps_its_backend_process_across_a_daemon_restart() {
     assert_eq!(prompt(&after, "还在吗").unwrap().data["state"], "landed");
     fx.close();
 }
+
+/// 录制回归的来源：主接缝跑一段真对话（流式文字、工具调用与结果、两个回合），
+/// 适配器录下它读到的看守流水；按能力、后端、版本、场景存成夹具，喂对话状态机得到的事实
+/// 要和守护进程实际显示的一致。设了 `ND_RECORD_FIXTURE=<目录>` 时把夹具和事实写进去（入库用）。
+#[tokio::test]
+async fn a_recorded_conversation_replays_through_the_adapter_state_machine() {
+    let fx = Fixture::start("nd13-record", 3_600_000).await;
+    std::fs::create_dir_all(fx.scenario.root().join("claude")).unwrap();
+    std::fs::write(
+        fx.scenario.root().join("claude/settings.json"),
+        r#"{"permissions":{"allow":["Bash"]}}"#,
+    )
+    .unwrap();
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(
+        fx.main(),
+        ModelReply::tool(
+            "toolu_rec_1",
+            "Bash",
+            json!({"command":"echo ND_TOOL_OK","description":"say ok"}),
+        ),
+    );
+    endpoint.enqueue(
+        fx.main(),
+        ModelReply::streaming_text("命令跑完了：ND_TOOL_OK", 2, 10),
+    );
+    endpoint.enqueue(fx.main(), ModelReply::streaming_text("第二轮的回答", 2, 10));
+    let session = fx
+        .create("record-create", "/sandbox/project", "跑个命令")
+        .await;
+    fx.wait(&session, "first turn", |s| {
+        texts(s) == ["命令跑完了：ND_TOOL_OK"]
+            && has_header(s, |h| h["process"]["turn_running"] == false)
+    })
+    .await;
+    fx.send("record-send", &session, "第二条").await;
+    let snapshot = fx
+        .wait(&session, "second turn", |s| {
+            texts(s) == ["命令跑完了：ND_TOOL_OK", "第二轮的回答"]
+                && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    let run = header(&snapshot)["process"]["run"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let raw = std::fs::read_to_string(fx.scenario.root().join(format!("recordings/{run}.jsonl")))
+        .unwrap();
+    let records: Vec<nd_watchdog_proto::Record> = raw
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let meta = nd_watchdog_proto::FixtureMeta {
+        format: 1,
+        capability: "conversation".into(),
+        backend: "claude".into(),
+        version: "2.1.289".into(),
+        scenario: "stream-tool-two-turns".into(),
+    };
+    let path = fx.scenario.root().join("out/stream-tool-two-turns.jsonl");
+    nd_watchdog_proto::write_fixture(&path, &meta, &records).unwrap();
+    let (read_meta, read) = nd_watchdog_proto::read_fixture(&path).unwrap();
+    assert_eq!(read_meta, meta);
+    let facts: Vec<nd_claude::Convo> = nd_claude::convo::replay(&read)
+        .into_iter()
+        .flatten()
+        .collect();
+    // 每条写出的 user 行恰好回显一次，回显的 uuid 就是会话里落地消息的原生编号。
+    let written: Vec<&str> = facts
+        .iter()
+        .filter_map(|f| match f {
+            nd_claude::Convo::Written { uuid } => Some(uuid.as_str()),
+            _ => None,
+        })
+        .collect();
+    let echoed: Vec<&str> = facts
+        .iter()
+        .filter_map(|f| match f {
+            nd_claude::Convo::Echo { uuid } => Some(uuid.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(written, echoed);
+    let landed: Vec<&str> = snapshot
+        .items
+        .iter()
+        .filter(|i| i.kind == "prompt")
+        .map(|i| i.data["native"].as_str().unwrap())
+        .collect();
+    assert_eq!(echoed, landed);
+    // 完整块与守护进程显示的一致：工具调用、工具结果、两段文字。
+    let blocks: Vec<&nd_backend::Item> = facts
+        .iter()
+        .filter_map(|f| match f {
+            nd_claude::Convo::Block { item } => Some(item),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b.kind == nd_backend::ItemKind::ToolUse && b.text.contains("ND_TOOL_OK"))
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b.kind == nd_backend::ItemKind::ToolResult && b.text.contains("ND_TOOL_OK"))
+    );
+    let block_texts: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b.kind == nd_backend::ItemKind::Text)
+        .map(|b| b.text.as_str())
+        .collect();
+    assert_eq!(block_texts, texts(&snapshot));
+    let ends = facts
+        .iter()
+        .filter(|f| matches!(f, nd_claude::Convo::TurnEnded { ok: true, .. }))
+        .count();
+    assert_eq!(ends, 2);
+    if let Some(dest) = std::env::var_os("ND_RECORD_FIXTURE") {
+        let dest = Path::new(&dest);
+        std::fs::create_dir_all(dest).unwrap();
+        std::fs::copy(&path, dest.join("stream-tool-two-turns.jsonl")).unwrap();
+        std::fs::write(
+            dest.join("stream-tool-two-turns.facts.json"),
+            serde_json::to_string_pretty(&nd_claude::convo::replay(&read)).unwrap(),
+        )
+        .unwrap();
+    }
+    fx.close();
+}

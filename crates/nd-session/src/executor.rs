@@ -229,10 +229,17 @@ impl Executor {
             self.publish_live(batch.live.clone());
             return Flow::Continue;
         }
-        if let Input::Tick = input {
-            if !self.idle_due() {
-                return Flow::Continue;
-            }
+        if let Input::Tick = input
+            && !self.idle_due()
+        {
+            return Flow::Continue;
+        }
+        // 外部条件变了，但没有在等它的操作或消息：不开事务。
+        if let Input::Kick = input
+            && self.core.ops.is_empty()
+            && self.core.messages.values().all(|m| m.ticket.is_some())
+        {
+            return Flow::Continue;
         }
         let (reply, work) = match input {
             Input::Command { command, reply } => (Some(reply), Work::Command(command)),

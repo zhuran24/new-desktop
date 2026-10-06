@@ -4180,6 +4180,7 @@ dependencies = [
  "nd-claims",
  "nd-mod-proto",
  "nd-runs",
+ "nd-session",
  "nd-testkit",
  "nd-watchdog-proto",
  "rustix",
