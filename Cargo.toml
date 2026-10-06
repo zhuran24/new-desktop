@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-view-model", "crates/nd-desktop", "crates/nd-composer", "crates/nd-testkit"]
-default-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-view-model", "crates/nd-composer", "crates/nd-testkit"]
+members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-view-model", "crates/nd-desktop", "crates/nd-composer", "crates/nd-testkit", "crates/nd-watchdog-proto", "crates/nd-watchdog", "crates/nd-runs"]
+default-members = ["crates/nd-kernel", "crates/nd-wire", "crates/nd-ui-core", "crates/nd-store", "crates/nd-config", "crates/nd-daemon", "crates/nd-claude-records", "crates/nd-convert", "crates/nd-view-model", "crates/nd-composer", "crates/nd-testkit", "crates/nd-watchdog-proto", "crates/nd-watchdog", "crates/nd-runs"]
 exclude = ["ime-lab/variants/main", "ime-lab/variants/v070"]
 
 [workspace.package]
@@ -13,6 +13,8 @@ repository = "https://github.com/zhuran24/new-desktop"
 
 [workspace.dependencies]
 nd-composer = { path = "crates/nd-composer" }
+nd-watchdog-proto = { path = "crates/nd-watchdog-proto" }
+nd-runs = { path = "crates/nd-runs" }
 nd-view-model = { path = "crates/nd-view-model" }
 nd-claude-records = { path = "crates/nd-claude-records" }
 nd-convert = { path = "crates/nd-convert" }

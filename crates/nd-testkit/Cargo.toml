@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+toml.workspace = true
+nd-runs.workspace = true
+nd-watchdog-proto.workspace = true
 nd-ui-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

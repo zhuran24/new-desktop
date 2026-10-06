@@ -4192,8 +4192,10 @@ dependencies = [
  "futures",
  "nd-config",
  "nd-kernel",
+ "nd-runs",
  "nd-store",
  "nd-ui-core",
+ "nd-watchdog-proto",
  "nd-wire",
  "rustix",
  "serde",
@@ -4229,6 +4231,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nd-runs"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "nd-watchdog-proto",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "nd-store"
 version = "0.1.0"
 dependencies = [
@@ -4247,13 +4261,16 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "nd-runs",
  "nd-ui-core",
+ "nd-watchdog-proto",
  "nd-wire",
  "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml 0.9.12+spec-1.1.0",
  "uuid",
 ]
 
@@ -4283,6 +4300,28 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "nd-watchdog"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "nd-watchdog-proto",
+ "rustix",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "nd-watchdog-proto"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

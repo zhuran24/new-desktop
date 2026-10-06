@@ -78,6 +78,8 @@ impl Section for WireConfig {
     const NAME: &'static str = "wire";
 }
 fn validate_config(value: &Value) -> nd_config::Result<()> {
+    serde_json::from_value::<Option<nd_runs::Config>>(value["watchdogs"].clone())
+        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
     serde_json::from_value::<DiagnosticsConfig>(value["diagnostics"].clone())
         .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
     let storage: StorageConfig = serde_json::from_value(value["storage"].clone())
@@ -105,6 +107,8 @@ fn validate_config(value: &Value) -> nd_config::Result<()> {
     Ok(())
 }
 struct Engine {
+    runs: Option<nd_runs::Watchdogs>,
+    runs_config: Option<nd_runs::Config>,
     blobs: Arc<nd_store::Blobs>,
     store: Arc<nd_store::Store>,
     config: Arc<Config>,
@@ -171,6 +175,8 @@ impl Engine {
         let diagnostics = kernel.require(diagnostics);
         let (events, _) = broadcast::channel(128);
         let mut this = Self {
+            runs: None,
+            runs_config: None,
             blobs,
             store,
             config: config.clone(),
@@ -195,6 +201,16 @@ impl Engine {
         Ok(this)
     }
     async fn configure(&mut self, config: &Config) -> Result<()> {
+        let next: Option<nd_runs::Config> =
+            serde_json::from_value(config.snapshot().value["watchdogs"].clone())?;
+        if next != self.runs_config {
+            let runs = next.clone().map(nd_runs::Watchdogs::new).transpose()?;
+            if let Some(runs) = &runs {
+                runs.recover().await?;
+            }
+            self.runs = runs;
+            self.runs_config = next;
+        }
         let section = config.section::<DiagnosticsConfig>()?.get()?;
         self.kernel
             .configure(&[ConfigChange::new("diagnostics", section.value.enabled, 0)])?;
@@ -203,6 +219,9 @@ impl Engine {
     }
     fn names(&self) -> BTreeMap<String, u32> {
         let mut names = BTreeMap::from([("system".into(), 1)]);
+        if self.runs.is_some() {
+            names.insert("runs".into(), 1);
+        }
         if let Some(optional) = self.diagnostics.with(|p| p.names()) {
             names.extend(optional);
         }
@@ -385,7 +404,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     let (_watcher, mut changes) = source.watch()?;
     let config = Arc::new(Config::open(
         source,
-        json!({"diagnostics":{"enabled":true},"commands":{"receipt_keep_ms":604800000},"wire":{"send_queue":128,"send_timeout_ms":5000},"storage":{"blob_grace_seconds":86400,"gc_interval_seconds":3600}}),
+        json!({"watchdogs":null,"diagnostics":{"enabled":true},"commands":{"receipt_keep_ms":604800000},"wire":{"send_queue":128,"send_timeout_ms":5000},"storage":{"blob_grace_seconds":86400,"gc_interval_seconds":3600}}),
         validate_config,
     )?);
     let store = Arc::new(nd_store::Store::open(paths.data.join("state.sqlite"), 4)?);
@@ -559,6 +578,18 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                         Request::Get { id, res, page } if greeted => {
                             let result = if res == "system" {
                                 page_items(engine.snapshot.items.iter().filter(|i| i.namespace == "system").cloned().collect(), &page)
+                            } else if res == "runs" {
+                                match &engine.runs {
+                                    Some(runs) => match runs.inspect() {
+                                        Ok(found) => page_items(found.into_iter().map(|f| Item {
+                                            id: format!("run/{}", f.run), namespace: "runs".into(), kind: "run".into(),
+                                            fallback: Fallback { title: f.run.clone(), text: f.state.clone() },
+                                            data: serde_json::to_value(f).unwrap(),
+                                        }).collect(), &page),
+                                        Err(e) => Err(e.to_string()),
+                                    },
+                                    None => Err("not_found".into()),
+                                }
                             } else {
                                 engine.diagnostics.with(|p| {
                                     if p.names().contains_key(&res) { p.page(&page) } else { Err("not_found".into()) }

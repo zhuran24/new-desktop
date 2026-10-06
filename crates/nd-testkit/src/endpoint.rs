@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use futures::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
@@ -39,6 +40,8 @@ pub struct ModelReply {
     content: Vec<Value>,
     stop_reason: &'static str,
     gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    chunk_chars: usize,
+    pause_ms: u64,
 }
 impl ModelReply {
     pub fn text(text: impl Into<String>) -> Self {
@@ -46,13 +49,24 @@ impl ModelReply {
             content: vec![json!({"type":"text","text":text.into()})],
             stop_reason: "end_turn",
             gate: None,
+            chunk_chars: usize::MAX,
+            pause_ms: 0,
         }
+    }
+    /// Emit a real SSE delta per character chunk, with configurable offline pacing.
+    pub fn streaming_text(text: impl Into<String>, chunk_chars: usize, pause_ms: u64) -> Self {
+        let mut reply = Self::text(text);
+        reply.chunk_chars = chunk_chars.max(1);
+        reply.pause_ms = pause_ms;
+        reply
     }
     pub fn tool(id: &str, name: &str, input: Value) -> Self {
         Self {
             content: vec![json!({"type":"tool_use","id":id,"name":name,"input":input})],
             stop_reason: "tool_use",
             gate: None,
+            chunk_chars: usize::MAX,
+            pause_ms: 0,
         }
     }
 }
@@ -69,6 +83,7 @@ impl ResponseGate {
 struct Script {
     replies: HashMap<Route, VecDeque<ModelReply>>,
     requests: Vec<ModelRequest>,
+    any_agent: HashMap<String, VecDeque<ModelReply>>,
 }
 
 #[derive(Clone)]
@@ -118,6 +133,17 @@ impl ClaudeEndpoint {
             .unwrap()
             .replies
             .entry(route)
+            .or_default()
+            .push_back(reply);
+    }
+    /// Explicit model-wide plan for dynamically generated Workflow agent IDs.
+    /// An exact agent/model route takes precedence; absence of either plan still fails closed.
+    pub fn enqueue_any_agent(&self, model: &str, reply: ModelReply) {
+        self.script
+            .lock()
+            .unwrap()
+            .any_agent
+            .entry(model.into())
             .or_default()
             .push_back(reply);
     }
@@ -192,7 +218,16 @@ async fn messages(
         });
         (
             id,
-            script.replies.get_mut(&route).and_then(VecDeque::pop_front),
+            script
+                .replies
+                .get_mut(&route)
+                .and_then(VecDeque::pop_front)
+                .or_else(|| {
+                    script
+                        .any_agent
+                        .get_mut(&route.model)
+                        .and_then(VecDeque::pop_front)
+                }),
         )
     };
     let Some(mut reply) = reply else {
@@ -236,17 +271,32 @@ async fn messages(
             )
         };
         events.push(json!({"type":"content_block_start","index":index,"content_block":start}));
-        events.push(json!({"type":"content_block_delta","index":index,"delta":delta}));
+        if delta["type"] == "text_delta" {
+            let chars = delta["text"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .collect::<Vec<_>>();
+            for chunk in chars.chunks(reply.chunk_chars) {
+                events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":chunk.iter().collect::<String>()}}));
+            }
+        } else {
+            events.push(json!({"type":"content_block_delta","index":index,"delta":delta}));
+        }
         events.push(json!({"type":"content_block_stop","index":index}));
     }
     events.push(json!({"type":"message_delta","delta":{"stop_reason":reply.stop_reason,"stop_sequence":null},"usage":{"output_tokens":10}}));
     events.push(json!({"type":"message_stop"}));
-    axum::response::Sse::new(futures::stream::iter(events.into_iter().map(|event| {
+    let pause_ms = reply.pause_ms;
+    axum::response::Sse::new(futures::stream::iter(events).then(move |event| async move {
+        if pause_ms > 0 && event["type"] == "content_block_delta" {
+            tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+        }
         Ok::<_, std::convert::Infallible>(
             axum::response::sse::Event::default()
                 .event(event["type"].as_str().unwrap())
                 .data(event.to_string()),
         )
-    })))
+    }))
     .into_response()
 }

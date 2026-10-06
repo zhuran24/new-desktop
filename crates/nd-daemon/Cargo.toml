@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+nd-runs.workspace = true
+nd-watchdog-proto.workspace = true
 nd-ui-core.workspace = true
 nd-kernel.workspace = true
 nd-wire.workspace = true
