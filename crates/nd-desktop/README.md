@@ -1,6 +1,6 @@
 # 桌面聊天界面
 
-日期：2026-10-06。状态：Claude 会话创建、侧栏、流式 Markdown/代码块和界面冷启动恢复已实现。真实输入法、上屏延迟、空闲 CPU 与真模型对话保留为人工验收。
+日期：2026-10-06。状态：Claude 会话创建、侧栏、流式 Markdown/代码块、持久草稿和界面冷启动恢复已实现。真实输入法、上屏延迟、空闲 CPU 与真模型对话保留为人工验收。
 
 依赖锁定为 `gpui-pre 0.3.7` 和 gpui-kit Git 提交 `4c7f1350331562436df868c55ac33bebc4c6406c`。桌面 crate 属于 workspace，位于 `default-members` 之外；没有使用 ime-lab 观测补丁。
 
@@ -23,14 +23,18 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
 3. 在下方输入首条消息，Enter 或发送按钮提交。等待明确受理时保留正文；新建成功自动选中会话。侧栏显示准备中、可对话、部分完成，以及撤掉会话的一次性失败提示。
 4. 点击侧栏切换会话，继续输入消息。正文按 `data.seq` 排列；增量和完整块共用身份，完整块替换累计文字。Markdown 支持未闭合的流式代码围栏；未知条目保留后备文字。停在底部时跟随新输出，上滚阅读时保持位置。
 
-Enter 组词保护和 Shift/Alt+Enter 换行复用产品输入框，见 [COMPOSER.md](COMPOSER.md)。当前发送使用默认意图 `fold`；三种意图、撤回与停止回合的交互归 #18。部分完成的创建保留原因，当前禁止继续发送，未决处置入口归 #33。内存草稿按会话保留，持久草稿归 #16；长历史分页、虚拟化与滚动锚点归 #20。
+Enter 组词保护和 Shift/Alt+Enter 换行复用产品输入框，见 [COMPOSER.md](COMPOSER.md)。当前发送使用默认意图 `fold`；三种意图、撤回与停止回合的交互归 #18。部分完成的创建保留原因，当前禁止继续发送，未决处置入口归 #33。长历史分页、虚拟化与滚动锚点归 #20。
+
+已创建会话的输入会自动保存到守护进程，输入框旁显示保存状态。另一界面更新时，空闲编辑器同步到最新稿；本地未保存文字和输入法组词受保护。两台基于同一版本修改时，落败稿另存，在输入框上方可查看原文并点击「载入这份草稿」。保存结果不明时文字留在窗口，重连或点击「重试保存草稿」只查询原收据，查不到仍标未确认；只有明确未受理的 `unavailable` 才可用原命令重试。窗口崩溃前尚未送达守护进程的文字不属于已保存草稿。新建表单尚未有会话身份，首条消息提交前的文字仍只在该窗口。
+
+输入后立即发送会先等对应草稿保存，再受理发送与清稿；等待期间修改正文或发生版本冲突，会取消这次待发送意图，提示核对后再发。发送已经受理时，原草稿清空来自同一守护进程事务，不会清除后来的编辑。组词中不向守护进程保存 preedit，也不能切换会话或载入另存稿；完成组词后再操作。
 
 默认 socket 为 `$XDG_RUNTIME_DIR/new-desktop/nd.sock`。设备偏好位于 `$XDG_STATE_HOME/new-desktop/ui.json`，未设时为 `~/.local/state/new-desktop/ui.json`。`--socket`、`--state` 可连接隔离实例；`--quit-after` 用于冒烟。不同窗口应使用不同状态文件，文件锁保证每份偏好只有一个写入者。偏好不包含快照、纪元、游标或消息正文。
 
 ## 接口与寿命
 
 - `nd-ui-core::ReplicaFeed`：专用 Tokio 线程驱动 `SyncReplica`；容量为 1 的通道传完整累计快照，满了就等待。外壳分别订阅 `global` 和选中会话的 `session/<id>`；切走会话即撤回旧订阅。冷启动必须取快照；已有副本的短断线由同步副本按游标恢复。关闭界面不结束后端。
-- `nd-ui-core::CommandClient`：容量为 8 的请求队列、独立 Tokio 线程；`models` 和 `command` 可在任意 executor 等待。所有命令复用 `SyncReplica::command` 的收据与断线规则；没有界面私有协议。模型查询不阻塞流式接收。
+- `nd-ui-core::CommandClient`：容量为 8 的请求队列、独立 Tokio 线程；`models`、`command` 和 `receipt` 可在任意 executor 等待。所有命令复用 `SyncReplica::command` 的收据与断线规则；没有界面私有协议。模型查询不阻塞流式接收。
 - `nd-view-model::{sidebar, conversation}`：从公开快照生成显示数据；简单的完整投影保留作以后优化的差分基准。`Draft` 用修订号保护受理后的清空；新编辑、不同会话和未提交组词不能被旧收据清掉。
 - `Desktop::{begin_create, select_session}`：切换视图、草稿及订阅。会话选择应使用此入口；`update_view_state` 用于其他设备偏好。`composer()` 返回已接好发送者的输入框，不应重复订阅发送。
 - `Desktop::slots` 的 `Renderer` 接收 `Presentation{snapshot,state,theme,item}`。会话条目的快照为会话流；外壳槽位为 global。`Sidebar`、`Item(kind)`、`Header`、`RightPanel`、`Settings`、`CommandPalette` 保留，条目渲染器优先于内置 Markdown/后备文本。
@@ -55,4 +59,6 @@ bash scripts/test-scenarios.sh
 
 脚本自动构建 scenarios 版桌面并设置 `ND_TEST_DESKTOP`。可设 `ND_NATIVE_OUTPUT=/mnt/wd_external/nd-build/tmp/ticket-14/native` 保留截图和清理记录。测试需要 KWin、Spectacle、bwrap、systemd 用户实例及 `/dev/dri`，不操作 owner 的显示会话。每场景断网、临时 HOME/CLAUDE_CONFIG_DIR/XDG、独立限额 slice；模型只访问离线伪端点。
 
-`scenarios` 下的 stdout 副本观测和 `--scenario-create` 仅用于上述隔离测试；生产构建没有自动输入入口、不打印对话。原生冒烟不能证明豆包/Rime、真实上屏性能、静止 CPU 或真模型服务。
+`draft_native_windows_save_reopen_follow_and_recover` 验证真实输入、SIGKILL 后恢复、双窗口同步、载入落败稿和发送时清稿。`ND_NATIVE_DRAFT_OUTPUT` 可保留其截图和清理证据，接口及验证详见 [#16 记录](../../docs/verification/ticket-16.md)。
+
+`scenarios` 下的 stdout 副本/编辑器观测、`--scenario-create` 和 `--scenario-draft` 仅用于上述隔离测试；生产构建没有自动输入入口、不打印对话。原生冒烟不能证明豆包/Rime、真实上屏性能、静止 CPU 或真模型服务。

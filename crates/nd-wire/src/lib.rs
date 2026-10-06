@@ -6,6 +6,44 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// 会话持久草稿；光标、选区和输入法组词不在此协议中。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct Draft {
+    pub version: u64,
+    pub text: String,
+    pub device: String,
+    #[serde(default)]
+    pub saved: Vec<SavedDraft>,
+}
+
+/// 版本比较落败的原文；id 是原编辑命令的 id，重试不重复另存。
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SavedDraft {
+    pub id: String,
+    pub base_version: u64,
+    pub text: String,
+    pub device: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DraftUpdated {
+    pub draft: Draft,
+    /// None 为替换当前稿；Some 为另存稿的 id。两种都是已持久化的 Done。
+    pub saved: Option<String>,
+}
+
+/// `session.draft.update` 的参数；前置版本放在 Command.expect。
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DraftUpdate {
+    pub session: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DraftExpected {
+    pub draft_version: u64,
+}
+
 /// 后端实时给出的模型选项；value 原样用于 session.create，不从显示名称推导。
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Model {
