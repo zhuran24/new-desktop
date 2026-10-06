@@ -144,6 +144,15 @@
 
 本单没有编号待验证项，不验证 Codex `clientId` 回显 V3。没有写 CLI 原生存储，没有新增可选组件或结构/派发操作；图与索引均由守护进程通过 nd-wire 提供。回合进行中重启的测试只证明谱系身份与映射持久，不代替 #19 的全部流式恢复验收。
 
+## 守护进程恢复与交付澄清（#19）
+
+固定 CLI 2.1.289，散列沿用上文。本单不写 CLI 原生存储。产品级验证见 [#19 验证记录](verification/ticket-19.md)。
+
+| 编号 | 依赖 | 出处 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|---|
+| RECOVERY-ECHO | 守护进程重连后原 CLI 继续流式回合，`isReplay` 保留原 uuid；不再次 initialize、不按文本猜送达 | ADR 0005；规格「恢复闸门」「写后记账」；CONV-ECHO、MOD-HTTP | `restart_keeps_a_written_message_pending_until_its_original_echo`、`ambiguous_write_and_crash_before_accounting_never_resend_the_native_input`；真 CLI、两种写后窗口 | 不能确定消费时标 Unknown，保留原票，不自动重发 |
+| RECOVERY-STREAM | 已开始的内容块经守护进程重连仍沿用原身份、以完整块结束 | CONV-STREAM；规格第 2 步验收 | `streaming_survives_kill_and_service_restart_with_a_checkpoint_mid_block`，kill -9 与 restart 各一遍 | 不猜块或文本，保留已知内容与不明状态；该版本不能通过升级关卡 |
+| RECOVERY-LOSS | 证实未送达须有原票的明确证据；`command_lifecycle` 的 refused/discarded 只归属匹配的原 uuid，不以 completed/result 推断未送达 | `research/impl/cli-protocol.md` §4、§6；规格「结果」「恢复闸门」 | 真流水缺失场景验证 Unknown 退路；真实连续流水对账验证原输入未写出及经 nd-wire 手动重发；脚本适配器验证 Lost/Clarified 与崩溃矩阵。refused/discarded 的具体 CLI 触发路径未在本单新增实测，沿用 #13 的解析边界 | 没有可验证证据就保持 Unknown；旧检查点缺输入记账时不能证明未写出 |
 ## 附件输入（#17）
 
 固定 CLI 2.1.289，字节指纹同 #13。协议依据：`research/protocol.md` §3.3、`research/impl/INDEX.md` #17，以及本单真实产品主接缝请求。详细验证与平台退路见 [ticket-17](verification/ticket-17.md)。

@@ -92,6 +92,15 @@ pub struct ClaudeBackend {
 fn fact(key: String, body: FactBody) -> Fact {
     Fact { key, body }
 }
+fn clarified(ticket: &Ticket, outcome: Outcome) -> Fact {
+    fact(
+        format!("clarified:{ticket}"),
+        FactBody::Clarified {
+            ticket: ticket.clone(),
+            outcome,
+        },
+    )
+}
 fn done(ticket: &Ticket, outcome: Outcome) -> Fact {
     fact(
         format!("done:{ticket}"),
@@ -224,33 +233,58 @@ impl Inner {
         }
     }
 
-    /// 看守流水里有没有写过这些 user 行（输入记录先于写管道落流水）。
-    async fn written(&self, run: &RunId, uuids: &HashSet<String>) -> HashSet<String> {
+    /// 扫描检查点之后的完整连续流水；读错或缺行不能当作“没写过”。
+    async fn written(
+        &self,
+        run: &RunId,
+        uuids: &HashSet<String>,
+        after: u64,
+    ) -> (HashMap<String, u64>, u64, bool) {
         let watchdogs = self.watchdogs.clone();
         let run = run.0.clone();
         let wanted = uuids.clone();
         tokio::task::spawn_blocking(move || {
-            let mut found = HashSet::new();
-            let mut after = 0;
-            while let Ok(records) = watchdogs.records(&run, after, 1000) {
-                let Some(last) = records.last() else { break };
-                after = last.end_seq;
-                for record in &records {
-                    if let Event::In { line, .. } = &record.event
-                        && let Ok(frame) = serde_json::from_str::<Value>(line)
+            let mut found = HashMap::new();
+            let mut through = after;
+            let mut complete = true;
+            loop {
+                let records = match watchdogs.records(&run, through, 1000) {
+                    Ok(records) => records,
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                };
+                if records.is_empty() {
+                    break;
+                }
+                for record in records {
+                    if record.seq > through.saturating_add(1)
+                        || matches!(
+                            record.event,
+                            Event::Gap {
+                                reason: nd_watchdog_proto::GapReason::LostLines
+                            }
+                        )
+                    {
+                        complete = false;
+                    }
+                    through = record.end_seq;
+                    if let Event::In { line, in_seq } = record.event
+                        && let Ok(frame) = serde_json::from_str::<Value>(&line)
                         && let Some(uuid) = frame["uuid"]
                             .as_str()
                             .or_else(|| frame["request_id"].as_str())
                         && wanted.contains(uuid)
                     {
-                        found.insert(uuid.to_owned());
+                        found.insert(uuid.to_owned(), in_seq);
                     }
                 }
             }
-            found
+            (found, through, complete)
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|_| (HashMap::new(), after, false))
     }
 
     /// 先占住承载位的命令队列：接回进行中交来的票排在这里，任务起来后按序写出。
@@ -275,16 +309,30 @@ impl Inner {
         pending: HashMap<String, Ticket>,
     ) {
         let rx = self.reserve(&session, &carrier);
-        self.spawn_actor(session, carrier, run, convo, pending, rx);
+        self.spawn_actor(
+            HashMap::new(),
+            session,
+            carrier,
+            run,
+            convo,
+            pending,
+            HashMap::new(),
+            None,
+            rx,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_actor(
         self: &Arc<Self>,
+        controls: HashMap<String, Ticket>,
         session: SessionId,
         carrier: CarrierId,
         run: ClaudeRun,
         convo: Conversation,
         pending: HashMap<String, Ticket>,
+        writes: HashMap<String, u64>,
+        recover_through: Option<u64>,
         rx: mpsc::UnboundedReceiver<Cmd>,
     ) {
         let actor = Actor {
@@ -296,8 +344,10 @@ impl Inner {
             run,
             convo,
             pending,
+            writes,
             ending: None,
-            controls: HashMap::new(),
+            controls,
+            recover_through,
             rx,
         };
         self.runtime.spawn(actor.run());
@@ -433,11 +483,13 @@ impl Inner {
                 .adopt_carrier(&part.session, record, mine, queued)
                 .await;
         }
+        let mut recovered = HashSet::new();
         for pending in &part.pending {
             if handled.contains(&pending.issued.ticket) {
                 continue;
             }
             let carrier = pending.act.carrier().clone();
+            recovered.insert(carrier.clone());
             let outcome = match &pending.act {
                 Act::Open { run, .. } => match self.inspect(run).await {
                     // 从没拉起过：证明没做，引擎重新放行后另发。
@@ -463,6 +515,14 @@ impl Inner {
             )
             .await;
         }
+        for carrier in recovered {
+            self.deliver_facts(
+                &part.session,
+                &carrier,
+                vec![fact("recovered".into(), FactBody::Recovered)],
+            )
+            .await;
+        }
     }
 
     async fn adopt_carrier(
@@ -480,7 +540,24 @@ impl Inner {
             .filter(|p| matches!(p.act, Act::Send { .. }))
             .map(|p| (native_uuid(&p.issued.ticket), p.issued.ticket.clone()))
             .collect();
-        let written = self.written(&run, &sends.keys().cloned().collect()).await;
+        let mut written: HashMap<String, u64> = record
+            .checkpoint
+            .as_ref()
+            .and_then(|c| serde_json::from_value(c.0["writes"].clone()).ok())
+            .unwrap_or_default();
+        let cursor = record
+            .checkpoint
+            .as_ref()
+            .and_then(|c| c.0["seq"].as_u64())
+            .unwrap_or(0);
+        let known_prefix = record
+            .checkpoint
+            .as_ref()
+            .is_none_or(|c| c.0["writes"].is_object());
+        let (scanned, through, complete) = self
+            .written(&run, &sends.keys().cloned().collect(), cursor)
+            .await;
+        written.extend(scanned);
         let found = self.inspect(&run).await;
         let caps: Option<Caps> = serde_json::from_value(record.adopt.clone()).ok();
         let bs = record.bs.as_ref().map(|b| b.id.clone()).unwrap_or_default();
@@ -492,19 +569,13 @@ impl Inner {
         };
         let mut facts = vec![];
         let Some(mut claude_run) = adopted else {
-            // 进程不在了（或接不回来：结束掉）：写过的结果不明，没写过的证明没写出。
+            // 看守已消失时不能从“不在剩余流水里”推导没写出。
             self.settle_gone(&run, true).await;
-            for (uuid, ticket) in &sends {
+            for ticket in sends.values() {
                 facts.push(done(
                     ticket,
-                    if written.contains(uuid) {
-                        Outcome::Unknown {
-                            evidence: "写出后进程退出，没有等到回显".into(),
-                        }
-                    } else {
-                        Outcome::Refused {
-                            refusal: Refusal::Withheld,
-                        }
+                    Outcome::Unknown {
+                        evidence: "后端已退出或接回失败，缺少确定的消费结论".into(),
                     },
                 ));
             }
@@ -553,6 +624,7 @@ impl Inner {
                     code: None,
                 },
             ));
+            facts.push(fact("recovered".into(), FactBody::Recovered));
             self.deliver_facts(session, &record.carrier, facts).await;
             return;
         };
@@ -563,37 +635,63 @@ impl Inner {
             ),
             None => (0, Conversation::new()),
         };
+        let recover_through = claude_run.cursor();
         claude_run.seek(cursor);
         let mut waiting = HashMap::new();
         for (uuid, ticket) in sends {
-            if written.contains(&uuid) {
+            if written.contains_key(&uuid) {
                 // 写过了：从检查点接着读，等它的回显。
                 waiting.insert(uuid, ticket);
-            } else {
+            } else if known_prefix && complete && through >= recover_through {
                 facts.push(done(
                     &ticket,
                     Outcome::Refused {
                         refusal: Refusal::Withheld,
                     },
                 ));
+                // 若原票已经 Unknown，只更新证实未送达的消息；不会自动另发。
+                facts.push(clarified(
+                    &ticket,
+                    Outcome::Refused {
+                        refusal: Refusal::Lost {
+                            evidence: "完整检查点与连续流水证明原输入未写出".into(),
+                        },
+                    },
+                ));
+            } else {
+                facts.push(done(
+                    &ticket,
+                    Outcome::Unknown {
+                        evidence: "检查点或流水不完整，不能证明原输入未写出".into(),
+                    },
+                ));
+                waiting.insert(uuid, ticket);
             }
         }
+        let mut restored_controls = HashMap::new();
         for p in &pending {
             if let Act::Invoke { invocation, .. } = &p.act {
                 let id = format!("title:{}", p.issued.ticket);
-                let written = self
-                    .written(&run, &HashSet::from([id.clone()]))
-                    .await
-                    .contains(&id)
+                let (seen, _, complete) = self.written(&run, &HashSet::from([id.clone()]), 0).await;
+                let was_written = seen.contains_key(&id)
                     || record
                         .checkpoint
                         .as_ref()
                         .is_some_and(|c| !c.0["controls"][&id].is_null());
-                if let Some(slot) = self.carriers.lock().unwrap().get(&record.carrier) {
+                if was_written {
+                    restored_controls.insert(id, p.issued.ticket.clone());
+                } else if !complete {
+                    facts.push(done(
+                        &p.issued.ticket,
+                        Outcome::Unknown {
+                            evidence: "标题流水不完整，不能重发生成请求".into(),
+                        },
+                    ));
+                } else if let Some(slot) = self.carriers.lock().unwrap().get(&record.carrier) {
                     let _ = slot.tx.send(Cmd::Title {
                         ticket: p.issued.ticket.clone(),
                         invocation: invocation.clone(),
-                        write: !written,
+                        write: true,
                     });
                 }
             }
@@ -617,11 +715,14 @@ impl Inner {
             }
         }
         self.spawn_actor(
+            restored_controls,
             session.clone(),
             record.carrier.clone(),
             claude_run,
             convo,
             waiting,
+            written,
+            Some(recover_through),
             queued,
         );
         if !facts.is_empty() {
@@ -640,8 +741,10 @@ struct Actor {
     convo: Conversation,
     /// 写出了、还没见到回显的 user 行：uuid → 票。
     pending: HashMap<String, Ticket>,
+    writes: HashMap<String, u64>,
     ending: Option<Ticket>,
     controls: HashMap<String, Ticket>,
+    recover_through: Option<u64>,
     rx: mpsc::UnboundedReceiver<Cmd>,
 }
 
@@ -666,6 +769,23 @@ impl Actor {
         }
     }
     async fn run(mut self) {
+        if let Some(through) = self.recover_through.take() {
+            while self.run.cursor() < through {
+                if self.poll().await {
+                    break;
+                }
+                if self.run.cursor() < through {
+                    tokio::time::sleep(self.inner.config.poll).await;
+                }
+            }
+            self.inner
+                .deliver_facts(
+                    &self.session,
+                    &self.carrier,
+                    vec![fact("recovered".into(), FactBody::Recovered)],
+                )
+                .await;
+        }
         loop {
             tokio::select! {
                 biased;
@@ -761,6 +881,22 @@ impl Actor {
                 self.pending.insert(uuid.clone(), ticket.clone());
                 #[cfg(feature = "scenarios")]
                 self.stop_fault(&msg.text);
+                #[cfg(feature = "scenarios")]
+                if self.delivery_fault(&msg.text, false).is_some() {
+                    self.inner
+                        .deliver_facts(
+                            &self.session,
+                            &self.carrier,
+                            vec![done(
+                                &ticket,
+                                Outcome::Unknown {
+                                    evidence: "场景故障：输入传输回应丢失，尚未核实写入".into(),
+                                },
+                            )],
+                        )
+                        .await;
+                    return;
+                }
                 if let Err(error) = self.run.write(&frame).await {
                     // 传输出错（例如别处接管了看守连接）：换连接后按看守报的已写高水位定，
                     // 没写过就同一行再写一次（传输层重发，uuid 与输入序号都不变）。
@@ -776,7 +912,7 @@ impl Actor {
                         };
                     }
                     if let Some(error) = failure {
-                        self.pending.remove(&uuid);
+                        // 保留原票映射；之后出现原 uuid 的回显或拒绝时上报 Clarified。
                         self.inner
                             .deliver_facts(
                                 &self.session,
@@ -785,6 +921,32 @@ impl Actor {
                                     &ticket,
                                     Outcome::Unknown {
                                         evidence: format!("写给看守时连接出错：{error}"),
+                                    },
+                                )],
+                            )
+                            .await;
+                    }
+                }
+                #[cfg(feature = "scenarios")]
+                if let Some(action) = self.delivery_fault(&msg.text, true) {
+                    if action == "crash_after_write" {
+                        std::process::abort();
+                    }
+                    if action == "pause_after_write" {
+                        let _ = rustix::process::kill_process(
+                            rustix::process::Pid::from_raw(std::process::id() as i32).unwrap(),
+                            rustix::process::Signal::STOP,
+                        );
+                    }
+                    if action == "unknown_after_write" {
+                        self.inner
+                            .deliver_facts(
+                                &self.session,
+                                &self.carrier,
+                                vec![done(
+                                    &ticket,
+                                    Outcome::Unknown {
+                                        evidence: "场景故障：写出后连接中断".into(),
                                     },
                                 )],
                             )
@@ -880,6 +1042,25 @@ impl Actor {
         }
     }
 
+    #[cfg(feature = "scenarios")]
+    fn delivery_fault(&self, text: &str, written: bool) -> Option<String> {
+        let path = self
+            .inner
+            .claude
+            .config()
+            .socket
+            .with_file_name("delivery-fault.json");
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        if !value["contains"].as_str().is_some_and(|s| text.contains(s)) {
+            return None;
+        }
+        if (value["action"] == "unknown_without_write") == written {
+            return None;
+        }
+        std::fs::remove_file(path).ok()?;
+        value["action"].as_str().map(str::to_owned)
+    }
+
     /// 场景构建的故障点：写某条消息之前让后端进程停住（SIGSTOP），模拟「写出了、还没被处理」。
     /// 故障文件在 mod 通道 socket 旁边，用一次就删掉；生产构建没有这段。
     #[cfg(feature = "scenarios")]
@@ -965,6 +1146,13 @@ impl Actor {
         let mut live = vec![];
         let mut exited = forced_exit;
         for record in &records {
+            if let Event::In { in_seq, line } = &record.event
+                && let Ok(frame) = serde_json::from_str::<Value>(line)
+                && let Some(uuid) = frame["uuid"].as_str()
+                && self.pending.contains_key(uuid)
+            {
+                self.writes.insert(uuid.to_owned(), *in_seq);
+            }
             for (n, convo) in self.convo.apply(record).into_iter().enumerate() {
                 let key = format!("{}:{}:{n}", self.run_id, record.seq);
                 match convo {
@@ -983,23 +1171,27 @@ impl Actor {
                         }
                     }
                     Convo::Echo { uuid } => {
+                        self.writes.remove(&uuid);
                         if let Some(ticket) = self.pending.remove(&uuid) {
-                            facts.push(done(
-                                &ticket,
-                                Outcome::Ok {
-                                    done: Done::Landed { native: uuid },
-                                },
-                            ));
+                            let outcome = Outcome::Ok {
+                                done: Done::Landed { native: uuid },
+                            };
+                            facts.push(done(&ticket, outcome.clone()));
+                            facts.push(clarified(&ticket, outcome));
                         }
                     }
                     Convo::Lifecycle { uuid, state }
                         if matches!(state.as_str(), "refused" | "discarded") =>
                     {
                         if let Some(ticket) = self.pending.remove(&uuid) {
-                            facts.push(done(
-                                &ticket,
-                                Outcome::failed(format!("CLI 没有处理这条消息（{state}）")),
-                            ));
+                            self.writes.remove(&uuid);
+                            let outcome = Outcome::Refused {
+                                refusal: Refusal::Lost {
+                                    evidence: format!("CLI 明确没有处理原 uuid 的消息（{state}）"),
+                                },
+                            };
+                            facts.push(done(&ticket, outcome.clone()));
+                            facts.push(clarified(&ticket, outcome));
                         }
                     }
                     Convo::Lifecycle { .. } => {}
@@ -1147,7 +1339,7 @@ impl Actor {
             return false;
         }
         let checkpoint = (!facts.is_empty()).then(|| {
-            Checkpoint(json!({"seq": through, "convo": self.convo, "controls":self.controls}))
+            Checkpoint(json!({"seq": through, "convo": self.convo, "writes": self.writes, "controls":self.controls}))
         });
         self.inner
             .deliver(

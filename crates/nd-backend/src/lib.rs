@@ -338,6 +338,13 @@ pub enum FactBody {
     TitleChanged {
         title: String,
     },
+    /// 此承载位的 hello、流水追平和未结票对账完成；本代恢复闸门据此放行。
+    Recovered,
+    /// Unknown 之后的新证据；不产生第二个终结结果，由原签发者更新当前结论。
+    Clarified {
+        ticket: Ticket,
+        outcome: Outcome,
+    },
     /// 一张票的终结结果。
     Done {
         ticket: Ticket,

@@ -10,6 +10,7 @@
 //! 后端经 [`nd_backend::Backends`]；跨会话的独占经 [`nd_claims::Exclusivity`]，在执行器的事务里放行。
 mod executor;
 mod feed;
+pub mod history;
 pub mod journal;
 pub mod lineage;
 pub mod ops;
@@ -288,6 +289,15 @@ impl Sessions {
         Ok(ids)
     }
 
+    /// 已装载会话的全部来源完成流水追平与对账；随后才完成独占登记的首轮扫描。
+    pub fn adopted(&self) -> bool {
+        self.executors
+            .lock()
+            .unwrap()
+            .values()
+            .all(|h| h.shared.adopted.load(Ordering::Acquire))
+    }
+
     pub fn kick_all(&self) {
         for handle in self.executors.lock().unwrap().values() {
             let _ = handle.inputs.try_send(Input::Kick);
@@ -326,6 +336,7 @@ impl Sessions {
                 vec![],
             )),
             watchers: Default::default(),
+            adopted: Default::default(),
         });
         let (ready, born) = std::sync::mpsc::sync_channel(1);
         let deps = self.deps.clone();
@@ -347,18 +358,39 @@ impl Sessions {
         Ok(Some(handle))
     }
 
-    /// 命令：`session.create`、`session.send`。不是会话命令时返回 None，由别的提供者处理。
+    /// 会话命令统一经过恢复闸门和收据账本；其他命令返回 None，由别的提供者处理。
     pub async fn execute(&self, command: &Command) -> Option<CommandReply> {
         let target = match command.name.as_str() {
             "session.create" => session_id_for(&command.id),
-            "session.send" | "session.configure" | "session.rename" | "session.draft.update" => {
-                match command.args["session"].as_str() {
-                    Some(id) => SessionId(id.to_owned()),
-                    None => return Some(self.reject_without_session(command, "invalid")),
-                }
-            }
+            "session.resend"
+            | "session.send"
+            | "session.configure"
+            | "session.rename"
+            | "session.draft.update" => match command.args["session"].as_str() {
+                Some(id) => SessionId(id.to_owned()),
+                None => return Some(self.reject_without_session(command, "invalid")),
+            },
             _ => return None,
         };
+        if !self.adopted() || self.deps.claims.recovery().ok() != Some(nd_claims::Recovery::Ready) {
+            // 恢复闸门不遮住已有收据；新命令没有受理、没有收据，允许同 id 退避重试。
+            return Some(
+                match nd_ledger::lookup(
+                    &self.deps.store,
+                    &command.id,
+                    Some(&command.content_hash()),
+                ) {
+                    Ok(nd_wire::ReceiptLookup::Found { receipt }) => {
+                        CommandReply::Receipt { receipt }
+                    }
+                    Ok(nd_wire::ReceiptLookup::Conflict) => CommandReply::Conflict,
+                    Ok(nd_wire::ReceiptLookup::Expired) => CommandReply::Expired,
+                    _ => CommandReply::Unavailable {
+                        reason: "守护进程恢复中，命令未受理".into(),
+                    },
+                },
+            );
+        }
         let allow_unborn = command.name == "session.create";
         let handle = match self.handle(&target, allow_unborn) {
             Ok(Some(handle)) => handle,
@@ -430,6 +462,19 @@ impl Sessions {
             .unwrap_or_else(|e| CommandReply::Unavailable {
                 reason: e.to_string(),
             })
+    }
+
+    /// 只读显示历史；不发后端动作、不产生收据。
+    pub fn page(
+        &self,
+        id: &SessionId,
+        request: &nd_wire::PageReq,
+    ) -> Result<nd_wire::Page, String> {
+        let handle = self
+            .handle(id, false)
+            .map_err(|e| e.to_string())?
+            .ok_or("not_found")?;
+        handle.shared.feed.lock().unwrap().page(request)
     }
 
     /// 订阅 `session/<id>`：装载会话（不存在则 None），先快照或续上事件。

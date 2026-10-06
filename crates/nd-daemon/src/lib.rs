@@ -413,12 +413,20 @@ fn page_items(
     items: Vec<Item>,
     request: &nd_wire::PageReq,
 ) -> std::result::Result<nd_wire::Page, String> {
-    if request.before.is_some() || request.limit == 0 || request.limit > 1000 {
+    if request.before.is_some()
+        || request.after.is_some()
+        || request.around.is_some()
+        || request.limit == 0
+        || request.limit > 1000
+    {
         return Err("invalid_page".into());
     }
     Ok(nd_wire::Page {
         items: items.into_iter().take(request.limit as usize).collect(),
         next: None,
+        newer: None,
+        anchor: None,
+        at: None,
     })
 }
 
@@ -545,16 +553,22 @@ async fn assemble_sessions(
         },
     )?;
     sessions.recover()?;
-    // 两层恢复：身份已知 → 第一次注册表扫描完成；之后放行不再回 Recovering。
-    tokio::task::spawn_blocking(move || -> nd_store::Result<()> {
-        claims.observe(nd_claims::Observed::Recovered)?;
-        // 扫描失败（半文件、读不了）时登记停在 Checking，由它自己的线程按时重扫；不挡守护进程起来。
-        if let Err(e) = claims.refresh() {
-            eprintln!("CLI 注册表第一次扫描没完成：{e}");
+    // 监听可先提供快照与收据；新操作在来源追平、身份已知、首轮扫描完成之前回 unavailable。
+    let recovering_sessions = sessions.clone();
+    tokio::spawn(async move {
+        while !recovering_sessions.adopted() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        Ok(())
-    })
-    .await??;
+        let _ = tokio::task::spawn_blocking(move || -> nd_store::Result<()> {
+            claims.observe(nd_claims::Observed::Recovered)?;
+            // 扫描失败仍停在 Checking，独占登记自己的线程继续重扫。
+            if let Err(e) = claims.refresh() {
+                eprintln!("CLI 注册表第一次扫描没完成：{e}");
+            }
+            Ok(())
+        })
+        .await;
+    });
     Ok(sessions)
 }
 
@@ -744,6 +758,15 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                 let Ok(req) = serde_json::from_str::<Request>(&text) else { break; };
                 // 会话的命令与流不经全局锁：命令要等会话执行器提交，流各自转发。
                 let req = match req {
+                    Request::Get { id, res, page } if greeted && res.starts_with("session/") => {
+                        let session = res["session/".len()..].strip_suffix("/items").unwrap_or(&res["session/".len()..]);
+                        let response = match sessions.page(&nd_backend::SessionId(session.into()), &page) {
+                            Ok(page) => WireResponse::Reply { id, value: serde_json::to_value(page).unwrap(), error: None },
+                            Err(error) => WireResponse::Reply { id, value: Value::Null, error: Some(error) },
+                        };
+                        if !enqueue(&outgoing, response) { break; }
+                        continue;
+                    }
                     Request::Models { id, backend, cwd } if greeted => {
                         let response = match sessions.models(&backend, cwd.into()).await {
                             Ok(models) => WireResponse::Reply { id, value: serde_json::to_value(models).unwrap(), error: None },

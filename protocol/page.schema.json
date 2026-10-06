@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Page",
+  "type": "object",
+  "properties": {
+    "anchor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "at": {
+      "description": "本页和会话事件流的同一观察点；界面据此合并先到的更新。",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Cursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Item"
+      }
+    },
+    "newer": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "next": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "items"
+  ],
+  "$defs": {
+    "Cursor": {
+      "type": "object",
+      "properties": {
+        "epoch": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "epoch",
+        "seq"
+      ]
+    },
+    "Fallback": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "text"
+      ]
+    },
+    "Item": {
+      "type": "object",
+      "properties": {
+        "data": true,
+        "fallback": {
+          "$ref": "#/$defs/Fallback"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "namespace",
+        "kind",
+        "data",
+        "fallback"
+      ]
+    }
+  }
+}
