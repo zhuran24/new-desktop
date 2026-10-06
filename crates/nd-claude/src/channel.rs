@@ -16,7 +16,7 @@ use nd_mod_proto::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -49,10 +49,15 @@ pub struct Binding {
     pub mods: BTreeMap<ModName, Hello>,
 }
 
+/// 没人取走的结论最多留这么多条，最早的先丢。
+const KEEP_RESULTS: usize = 1024;
+
 struct Run {
     state: ModState,
-    record: Vec<Recorded>,
+    /// 只在开了录制时保留；生产默认不录。
+    record: Option<Vec<Recorded>>,
     results: HashMap<String, CommandResult>,
+    result_order: VecDeque<String>,
 }
 impl Run {
     fn apply(&mut self, event: ModEvent) -> Vec<Fact> {
@@ -60,25 +65,36 @@ impl Run {
         for fact in &facts {
             match fact {
                 Fact::Finished { op_id, outcome, .. } => {
-                    self.results
-                        .insert(op_id.clone(), CommandResult::Outcome(outcome.clone()));
+                    self.conclude(op_id, CommandResult::Outcome(outcome.clone()))
                 }
-                Fact::Unknown { op_id, .. } => {
-                    self.results.insert(op_id.clone(), CommandResult::Unknown);
-                }
+                Fact::Unknown { op_id, .. } => self.conclude(op_id, CommandResult::Unknown),
                 _ => {}
             }
         }
-        self.push(event, facts.clone());
+        if let Some(record) = &mut self.record {
+            record.push(Recorded {
+                seq: record.len() as u64 + 1,
+                ms: now_ms(),
+                event,
+                facts: facts.clone(),
+            });
+        }
         facts
     }
-    fn push(&mut self, event: ModEvent, facts: Vec<Fact>) {
-        self.record.push(Recorded {
-            seq: self.record.len() as u64 + 1,
-            ms: now_ms(),
-            event,
-            facts,
-        });
+    fn conclude(&mut self, op_id: &str, result: CommandResult) {
+        if self.results.insert(op_id.to_owned(), result).is_none() {
+            self.result_order.push_back(op_id.to_owned());
+        }
+        while self.result_order.len() > KEEP_RESULTS {
+            if let Some(oldest) = self.result_order.pop_front() {
+                self.results.remove(&oldest);
+            }
+        }
+    }
+    fn take(&mut self, op_id: &str) -> Option<CommandResult> {
+        let found = self.results.remove(op_id)?;
+        self.result_order.retain(|o| o != op_id);
+        Some(found)
     }
     fn binding(&self) -> Binding {
         Binding {
@@ -96,6 +112,7 @@ struct Inner {
     runs: Mutex<HashMap<String, Run>>,
     changed: Arc<Notify>,
     poll_timeout: Duration,
+    record: bool,
     socket: PathBuf,
     /// 绑定时 socket 文件的（设备，inode）：只删自己建的那个，不删后来者替换上的。
     inode: (u64, u64),
@@ -125,8 +142,8 @@ pub fn now_ms() -> u64 {
 
 impl ModChannel {
     /// 在 `socket` 上监听。已有的同名 socket 文件（上一个守护进程留下的）会被替换；
-    /// 不是 socket 的文件不动、直接报错。
-    pub fn bind(socket: &Path, poll_timeout: Duration) -> std::io::Result<Self> {
+    /// 不是 socket 的文件不动、直接报错。`record` 打开 mod 往返录制（场景测试用）。
+    pub fn bind(socket: &Path, poll_timeout: Duration, record: bool) -> std::io::Result<Self> {
         match std::fs::symlink_metadata(socket) {
             Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(socket)?,
             Ok(_) => {
@@ -145,6 +162,7 @@ impl ModChannel {
             runs: Mutex::new(HashMap::new()),
             changed: Arc::new(Notify::new()),
             poll_timeout,
+            record,
             socket: socket.to_owned(),
             inode: (meta.dev(), meta.ino()),
             stop,
@@ -175,8 +193,9 @@ impl ModChannel {
             run.to_owned(),
             Run {
                 state: ModState::new(expected_session),
-                record: vec![],
+                record: self.inner.record.then(Vec::new),
                 results: HashMap::new(),
+                result_order: VecDeque::new(),
             },
         );
         self.inner.changed.notify_waiters();
@@ -201,8 +220,10 @@ impl ModChannel {
         self.with(run, |r| r.binding())
     }
 
+    /// 录下的 mod 往返；没开录制时为空。
     pub fn recording(&self, run: &str) -> Vec<Recorded> {
-        self.with(run, |r| r.record.clone()).unwrap_or_default()
+        self.with(run, |r| r.record.clone().unwrap_or_default())
+            .unwrap_or_default()
     }
 
     /// 等到 `until` 对当前绑定成立，或到时限后返回最后一次看到的绑定。
@@ -236,18 +257,18 @@ impl ModChannel {
         sent
     }
 
-    /// 等这条命令的结论；到时限还没有就回 None（交付不明，由调用方按可重发类别处理）。
+    /// 等这条命令的结论并取走；到时限还没有就回 None（交付不明，由调用方按可重发类别处理）。
     pub async fn result(&self, run: &str, op_id: &str, timeout: Duration) -> Option<CommandResult> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.inner.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(found) = self.with(run, |r| r.results.get(op_id).cloned())? {
+            if let Some(found) = self.with(run, |r| r.take(op_id))? {
                 return Some(found);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return self.with(run, |r| r.results.get(op_id).cloned()).flatten();
+                return self.with(run, |r| r.take(op_id)).flatten();
             }
         }
     }

@@ -74,6 +74,7 @@ impl Fixture {
         config.limits.overflow = root.join("cache/spool-overflow");
         config.hello_timeout = Duration::from_secs(10);
         config.poll_timeout = Duration::from_secs(5);
+        config.record = true;
         config
     }
     pub fn claude(&self, config: ClaudeConfig) -> Claude {

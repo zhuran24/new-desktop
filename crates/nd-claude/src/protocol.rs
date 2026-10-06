@@ -6,7 +6,7 @@ use nd_mod_proto::{
     Command, Hello, HelloCause, ModName, NextQuery, Outcome, Report, ReportBody, Resend, ResultPost,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// 通道里发生的一件事：mod 发来的消息、适配器发出的命令，或握手阶段的变化。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +116,12 @@ pub struct ModState {
     pub bound: BTreeMap<ModName, Bound>,
     /// 已发出、还没有结果的命令。
     pub outstanding: BTreeMap<String, (ModName, Command, bool)>,
+    /// 最近见过的报告 id，用于去重；只留最近 [`KEEP_REPORT_IDS`] 个。
     reports: BTreeSet<String>,
+    report_order: VecDeque<String>,
 }
+
+pub const KEEP_REPORT_IDS: usize = 4096;
 
 impl ModState {
     pub fn new(expected_session: &str) -> Self {
@@ -128,6 +132,7 @@ impl ModState {
             bound: BTreeMap::new(),
             outstanding: BTreeMap::new(),
             reports: BTreeSet::new(),
+            report_order: VecDeque::new(),
         }
     }
 
@@ -205,6 +210,12 @@ impl ModState {
             ModEvent::Report { report } => {
                 if !self.reports.insert(report.report_id.clone()) {
                     return vec![];
+                }
+                self.report_order.push_back(report.report_id.clone());
+                while self.report_order.len() > KEEP_REPORT_IDS {
+                    if let Some(oldest) = self.report_order.pop_front() {
+                        self.reports.remove(&oldest);
+                    }
                 }
                 vec![Fact::Reported {
                     module: report.module,

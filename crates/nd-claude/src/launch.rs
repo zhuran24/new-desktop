@@ -43,6 +43,8 @@ pub struct ClaudeConfig {
     pub poll_timeout: Duration,
     /// 等 initialize 回应的时限。
     pub init_timeout: Duration,
+    /// 录下 mod 往返（场景测试与录制回归用）；生产默认不录。
+    pub record: bool,
 }
 impl ClaudeConfig {
     pub fn new(
@@ -61,6 +63,7 @@ impl ClaudeConfig {
             hello_timeout: Duration::from_secs(10),
             poll_timeout: Duration::from_secs(25),
             init_timeout: Duration::from_secs(30),
+            record: false,
         }
     }
 }

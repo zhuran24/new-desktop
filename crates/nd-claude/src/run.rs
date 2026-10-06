@@ -94,6 +94,9 @@ pub struct Ready {
     pub initialize: Value,
 }
 
+/// mod 的 `$.http.fetch` 对 `socketPath` 的长度限制（约 100 字节）。
+pub const SOCKET_PATH_MAX: usize = 100;
+
 pub struct Claude {
     config: ClaudeConfig,
     watchdogs: Arc<Watchdogs>,
@@ -101,9 +104,16 @@ pub struct Claude {
 }
 
 impl Claude {
-    /// 在配置的 socket 上开 mod 通道。
+    /// 在配置的 socket 上开 mod 通道。mod 一侧 `socketPath` 约 100 字节以内。
     pub fn new(config: ClaudeConfig, watchdogs: Arc<Watchdogs>) -> Result<Self> {
-        let channel = ModChannel::bind(&config.socket, config.poll_timeout)?;
+        if config.socket.as_os_str().len() > SOCKET_PATH_MAX {
+            return Err(format!(
+                "mod 通道 socket 路径超过 {SOCKET_PATH_MAX} 字节：{}",
+                config.socket.display()
+            )
+            .into());
+        }
+        let channel = ModChannel::bind(&config.socket, config.poll_timeout, config.record)?;
         Ok(Self {
             config,
             watchdogs,
@@ -122,7 +132,21 @@ impl Claude {
     pub async fn open(&self, run: &str, open: Open, init: InitOptions) -> Result<ClaudeRun> {
         let session = open.start.session().to_owned();
         self.channel.register(run, &session);
-        let spec = launch_spec(&self.config, run, &open);
+        let opened = self.handshake(run, &session, &open, &init).await;
+        if opened.is_err() {
+            self.channel.unregister(run);
+        }
+        opened
+    }
+
+    async fn handshake(
+        &self,
+        run: &str,
+        session: &str,
+        open: &Open,
+        init: &InitOptions,
+    ) -> Result<ClaudeRun> {
+        let spec = launch_spec(&self.config, run, open);
         let launched = self.watchdogs.launch(run, spec).await?;
         let mut link = self.watchdogs.link(run).await?;
         let binding = self
@@ -130,7 +154,7 @@ impl Claude {
             .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
             .await
             .ok_or("run unregistered while waiting for hellos")?;
-        let readiness = readiness(&binding, &session, self.config.hello_timeout);
+        let readiness = readiness(&binding, session, self.config.hello_timeout);
         let id = format!("nd-init-{run}");
         let mut request = json!({
             "subtype": "initialize",
@@ -148,7 +172,7 @@ impl Claude {
         Ok(ClaudeRun {
             ready: Ready {
                 run: run.to_owned(),
-                backend_session_id: session,
+                backend_session_id: session.to_owned(),
                 identity: launched.identity,
                 hellos: binding.mods,
                 caps: caps(readiness, init.per_task_stop_affordance),
