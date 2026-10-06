@@ -48,6 +48,21 @@
 - #20：保留简单 diff 全量投影作差分基准；分页时按显示范围安排图片下载。#23：主题文件需要覆盖两个 diff 颜色变量。
 - 清理只能释放被删除业务对象自己的 owner 引用，不能按某个 UI 窗口消失来释放已发消息。
 
+## 最终自动检查
+
+集成 v1 `904aa88`（#16 持久草稿）后验证：
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --workspace --locked` | 172 passed、0 failed、1 ignored（既有 #8 真 CLI 现场项） |
+| `scripts/test-scenarios.sh` | 98 passed、0 failed、1 ignored（既有手动 OOM 项，未运行） |
+| Clippy | workspace/all-targets，含 daemon/testkit/claude/desktop scenarios，`-D warnings` 通过 |
+| release | 桌面、守护进程、看守构建通过 |
+| 格式、Schema、脚本 | cargo fmt、git diff --check、nd-wire/mod Schema 重生成一致；Python AST、owner 命令 bash -n 通过 |
+| 原生呈现与清理 | 四象限图片、明暗 diff、未发送附件草稿恢复截图已查看；原生 cleanup 的 remaining 为空，temporary_root_removed=true |
+
+当前证据位于 `/mnt/wd_external/nd-build/tmp/ticket-17/`：`logs/workspace-final.log`、`logs/scenarios-merged.log`、`logs/clippy-final.log`、`logs/release-final.log`、`native-merged-final/`。Cargo.lock SHA-256 为 `9c0b546d361109bc36e581453de57e5dc8229c75f7ea0e3447976a164d6e818b`；新增的依赖边复用既有锁定包，未升级第三方版本。
+
 ## owner_checklist
 
 独立实例的完整启动、登录、清理命令见不入库实施记录 `research/impl/tickets/17.md`。以下尚未执行，不影响自动实施闭环。
