@@ -5,6 +5,7 @@
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub mod channel;
+pub mod fixture;
 pub mod launch;
 pub mod protocol;
 pub mod run;

@@ -11,8 +11,8 @@ use axum::{
     routing::{get, post},
 };
 use nd_mod_proto::{
-    Action, Command, ErrorReply, Hello, HelloReply, ModName, Next, NextQuery, Outcome, Report,
-    ReportAck, Resend, ResultPost,
+    Command, ErrorReply, Hello, HelloReply, ModName, Next, NextQuery, Outcome, Report, ReportAck,
+    ResultPost,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -56,57 +56,21 @@ struct Run {
 }
 impl Run {
     fn apply(&mut self, event: ModEvent) -> Vec<Fact> {
-        let mut facts = self.state.apply(&event);
-        let mut requeued = vec![];
+        let facts = self.state.apply(&event);
         for fact in &facts {
             match fact {
                 Fact::Finished { op_id, outcome, .. } => {
                     self.results
                         .insert(op_id.clone(), CommandResult::Outcome(outcome.clone()));
                 }
-                Fact::Orphaned {
-                    op_id,
-                    resend: Resend::NotResendable,
-                    ..
-                } => {
+                Fact::Unknown { op_id, .. } => {
                     self.results.insert(op_id.clone(), CommandResult::Unknown);
                 }
-                Fact::Orphaned {
-                    module,
-                    op_id,
-                    resend: Resend::Resendable,
-                } => requeued.push((*module, op_id.clone())),
                 _ => {}
             }
         }
         self.push(event, facts.clone());
-        // 可重发的命令用同一个操作 id、按新代次再发一次。
-        if let ModEvent::Hello { hello } = &self.record.last().expect("pushed").event {
-            let hello = hello.clone();
-            for (module, op_id) in requeued {
-                let action = self.lost_action(&op_id);
-                let command = Command {
-                    op_id,
-                    expected_backend_session_id: hello.backend_session_id.clone(),
-                    expected_mod_gen: hello.mod_gen.clone(),
-                    action,
-                };
-                facts.extend(self.apply(ModEvent::Send { module, command }));
-            }
-        }
         facts
-    }
-    fn lost_action(&self, op_id: &str) -> Action {
-        self.record
-            .iter()
-            .rev()
-            .find_map(|r| match &r.event {
-                ModEvent::Send { command, .. } if command.op_id == op_id => {
-                    Some(command.action.clone())
-                }
-                _ => None,
-            })
-            .expect("orphaned command was sent")
     }
     fn push(&mut self, event: ModEvent, facts: Vec<Fact>) {
         self.record.push(Recorded {

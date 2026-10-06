@@ -79,11 +79,15 @@ pub enum Fact {
         op_id: String,
         outcome: Outcome,
     },
-    /// 发出的命令随旧代次丢了结果：可重发的重新排队，不可重发的记 Unknown。
-    Orphaned {
+    /// 发出的命令随旧代次丢了结果，可以重发：同一个操作 id 按新代次重新排队。
+    Resent {
         module: ModName,
         op_id: String,
-        resend: Resend,
+    },
+    /// 发出的命令随旧代次丢了结果，不可重发：结论是 Unknown。
+    Unknown {
+        module: ModName,
+        op_id: String,
     },
     /// 结果对不上在途的命令（重复、未知操作或不是发给这个 mod 的），丢弃。
     Stray {
@@ -232,18 +236,30 @@ impl ModState {
                 to_gen: hello.mod_gen.clone(),
             });
             // 旧代次的结果随模块变量一起没了：按可重发类别处理在途命令。
-            let lost: Vec<String> = self
-                .outstanding
-                .iter()
-                .filter(|(_, (m, c, _))| *m == hello.module && c.expected_mod_gen != hello.mod_gen)
-                .map(|(op, _)| op.clone())
-                .collect();
-            for op_id in lost {
-                let (module, command, _) = self.outstanding.remove(&op_id).expect("listed");
-                facts.push(Fact::Orphaned {
-                    module,
+            let session = self.session.clone();
+            let mut unknown = vec![];
+            for (op_id, (module, command, delivered)) in self.outstanding.iter_mut() {
+                if *module != hello.module || command.expected_mod_gen == hello.mod_gen {
+                    continue;
+                }
+                match command.action.resend() {
+                    Resend::Resendable => {
+                        command.expected_mod_gen = hello.mod_gen.clone();
+                        command.expected_backend_session_id = session.clone();
+                        *delivered = false;
+                        facts.push(Fact::Resent {
+                            module: *module,
+                            op_id: op_id.clone(),
+                        });
+                    }
+                    Resend::NotResendable => unknown.push(op_id.clone()),
+                }
+            }
+            for op_id in unknown {
+                self.outstanding.remove(&op_id);
+                facts.push(Fact::Unknown {
+                    module: hello.module,
                     op_id,
-                    resend: command.action.resend(),
                 });
             }
         }

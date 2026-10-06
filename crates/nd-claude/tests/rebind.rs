@@ -3,7 +3,7 @@
 mod support;
 use nd_claude::{CommandResult, Fact, InitOptions};
 use nd_mod_proto::{Action, HelloCause, ModName, Outcome, Rejection};
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 use support::*;
 
 fn pong_session(result: Option<CommandResult>) -> String {
@@ -113,6 +113,27 @@ async fn clear_rebinds_both_mods_to_the_new_session_and_stale_commands_are_refus
         .await
         .unwrap();
     assert_eq!(frames.last().unwrap()["session_id"], new.as_str());
+    // 录下的 mod 往返读回后重放，事实与现场一致；可导出成默认回归用的夹具。
+    let path = fx.scenario.root().join("clear-rebind.jsonl");
+    let meta = nd_claude::fixture::FixtureMeta {
+        format: nd_claude::fixture::FORMAT,
+        capability: "mod-channel".into(),
+        backend: "claude".into(),
+        version: "2.1.289".into(),
+        scenario: "clear-rebind".into(),
+    };
+    nd_claude::fixture::write_fixture(&path, &meta, &old, &run.recording()).unwrap();
+    let (_, start, records) = nd_claude::fixture::read_fixture(&path).unwrap();
+    assert_eq!(records, run.recording());
+    let replayed = nd_claude::fixture::replay(&start, &records);
+    assert_eq!(
+        replayed,
+        records.iter().map(|r| r.facts.clone()).collect::<Vec<_>>()
+    );
+    if let Some(dest) = std::env::var_os("ND_TEST_EVIDENCE") {
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::copy(&path, Path::new(&dest).join("clear-rebind.jsonl")).unwrap();
+    }
     drop(run);
     drop(claude);
     fx.close();
