@@ -4146,6 +4146,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nd-claims"
+version = "0.1.0"
+dependencies = [
+ "nd-claude-records",
+ "nd-runs",
+ "nd-store",
+ "nd-watchdog-proto",
+ "notify",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "nd-claude-records"
 version = "0.1.0"
 dependencies = [

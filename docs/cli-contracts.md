@@ -58,3 +58,16 @@
 | CONVERT-PROFILE | Claude 权限模式和 Codex approvalPolicy/sandbox 是不同机制；effort 支持集合按模型动态提供 | ADR 0010/0017；`research/impl/cli-protocol.md` §7；固定 schema `v2/AskForApproval.ts`、`v2/SandboxMode.ts` | `tests/profile.rs`，实际产品映射表见 `crates/nd-convert/README.md` | #13/#21 对接设置与能力表；无法对应时使用目标默认值并报告，不能把 max 猜成 xhigh，不能把源模型名发往目标 |
 
 本清单由 #9 引入转换相关行。没有新增写 CLI 存储的例外，没有会话结构或派发操作；操作崩溃矩阵由实际执行 `Open{Seeded}`/`Import` 的后续工单添加。
+
+## 独占登记（#12）
+
+固定 2.1.289 与 SHA-256 同 #5。注册表解析在 `nd-claims/src/registry.rs`；公开接缝、隔离复现命令和后续边界见 [库说明](../crates/nd-claims/README.md)。
+
+| 依赖 | 出处 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|
+| `sessions/<pid>.json` 带完整 sessionId、字符串 procStart、cwd、version、startedAt、pidDomain；PID 域是 `linux:<machine-id>:<pid namespace>` | 真实离线 `session.json`/`identity.json`；固定二进制 `fJo` @201874306；父规格「独占登记」 | `scripts/test-claims-live.sh`：真 CLI 写注册表，Rust 登记读取真 `/proc`；自己被排除，第二条同 id CLI 被判冲突；默认测试在原始副本上造错 ticks、异 PID 域、旧启动纪元和无 pid | 缺身份不猜，`ExternalUnverified`；损坏或读失败 `Checking`，完整重扫成功后再放行 |
+| `agents --json --all` 是数组，列表里的 pid 本身不构成启动身份 | 真实离线 `agents.json`；父规格「窄接缝二」 | `PinnedCli` 运行真命令的现场 probe；脚本化命令测试无 pid 列表条目，文件检测在没有列表兴趣时继续运行 | 只按 pid 与 sessionId 同时匹配的注册表补身份；无法核实标 unverified，不按会话 id 排除外部写者 |
+| `jobs/<8 位 id>/state.json` 可引用完整会话 id 而没有 pid | 真实离线 `job-state.json`（blocked/login required）；生成器仅在隔离目录写入工作目录信任设置 | 原始后台作业夹具直接读入，未订阅列表也阻止该 id 放行；现场自动生成并保留状态文件 | 保守等待，不据无 pid 推断退出。完整版本/参数资格与接管退路 R12-X2 留 #64 |
+| 外部目录扫描和进程身份确认不足以封闭“检查后才出现写者”的窗口 | 父规格单写者及常开检测；R12 §2.3.1/§2.3.3 | 默认行为测试覆盖同 id 外部出现、消失、列表隐藏、半文件重读、后台周期补扫 | 后续发现后暂停；不增加每条传输路径各自的第二套准入，也不承诺 OS 文件锁 |
+
+本单没有 CLI 存储写入例外，最后自有叶子只接受自有流水证据，文件检查使用 #8 的纯解析库。`CliCommands::stop` 仅定义并实现短 id 命令边界，本单不调用它实施接管；stop/退出/注册项消失的实际状态机与验证属于 #64。完整验证与 owner 边界见 [验证记录](verification/ticket-12.md)。
