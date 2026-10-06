@@ -29,6 +29,13 @@ pub enum Convo {
         uuid: String,
     },
     TurnStarted,
+    /// 实际回合的提示集合；同一回合可包含多条 user，工具调用不另开轮。
+    TurnMapped {
+        turn: String,
+        uuids: Vec<String>,
+        complete: bool,
+        last_assistant: Option<String>,
+    },
     /// 回合结束；`uuids` 是这一回合消费的用户消息。
     TurnEnded {
         ok: bool,
@@ -83,6 +90,12 @@ pub struct Conversation {
     lost: bool,
     reported: Option<Drain>,
     running: bool,
+    #[serde(default)]
+    turn_key: Option<String>,
+    #[serde(default)]
+    turn_uuids: Vec<String>,
+    #[serde(default)]
+    last_assistant: Option<String>,
 }
 
 const SCHEDULE_TOOLS: [&str; 2] = ["CronCreate", "ScheduleWakeup"];
@@ -181,8 +194,65 @@ impl Conversation {
         out
     }
 
+    fn map_turn(&mut self, frame: &Value, out: &mut Vec<Convo>) {
+        if frame["type"] == "system" && frame["subtype"] == "init" {
+            self.turn_key = frame["uuid"].as_str().map(str::to_owned);
+            self.turn_uuids.clear();
+            self.last_assistant = None;
+            return;
+        }
+        let complete = frame["type"] == "result";
+        if !(complete
+            || frame["type"] == "assistant"
+            || (frame["type"] == "stream_event" && frame["event"]["type"] == "message_start"))
+        {
+            return;
+        }
+        let mut uuids: Vec<String> = frame["user_message_uuids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|u| u.as_str().map(str::to_owned))
+            .collect();
+        if uuids.is_empty()
+            && let Some(id) = frame["user_message_uuid"].as_str()
+        {
+            uuids.push(id.into());
+        }
+        for id in uuids {
+            if !self.turn_uuids.contains(&id) {
+                self.turn_uuids.push(id);
+            }
+        }
+        if frame["type"] == "assistant" {
+            self.last_assistant = frame["uuid"].as_str().map(str::to_owned);
+        }
+        // 无法识别回合归属时不按文本、票序或发送次数猜轮。
+        if self.turn_key.is_none() {
+            self.turn_key = self.turn_uuids.first().cloned();
+        }
+        if let Some(turn) = &self.turn_key
+            && !self.turn_uuids.is_empty()
+        {
+            out.push(Convo::TurnMapped {
+                turn: turn.clone(),
+                uuids: self.turn_uuids.clone(),
+                complete,
+                last_assistant: self.last_assistant.clone(),
+            });
+        }
+        if complete {
+            self.turn_key = None;
+            self.turn_uuids.clear();
+            self.last_assistant = None;
+        }
+    }
+
     fn frame(&mut self, frame: &Value, out: &mut Vec<Convo>) {
         let main = frame["parent_tool_use_id"].is_null();
+        if main {
+            self.map_turn(frame, out);
+        }
         match frame["type"].as_str() {
             Some("user") => {
                 if frame["isReplay"] == true {
@@ -273,7 +343,7 @@ impl Conversation {
                     _ => {}
                 }
             }
-            Some("result") => {
+            Some("result") if main => {
                 let subtype = frame["subtype"].as_str().unwrap_or("unknown").to_owned();
                 let ok = subtype == "success" && frame["is_error"] != true;
                 let error = if ok {

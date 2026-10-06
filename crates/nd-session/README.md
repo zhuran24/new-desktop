@@ -1,6 +1,6 @@
 # 会话组件：名册与持久操作引擎
 
-日期：2026-10-06。状态：#13 实现第 2 步的最小引擎、名册新建、发送台、对话投影、按需拉起与闲置回收。审批台、谱系、任务账本与转接、子代理、收场的未决处置、恢复闸门等由后续工单在同一引擎上补。
+日期：2026-10-06。状态：已实现第 2 步的最小引擎、名册新建、发送台、对话投影、谱系、按需拉起与闲置回收。审批台、任务账本与转接、子代理、结构操作入口、收场的未决处置、恢复闸门由后续工单在同一引擎上补。
 
 后端经 [`nd-backend`](../nd-backend/src/lib.rs) 的 `Backends`（真接缝是 `BackendAdapter`），跨会话的独占经 [`nd-claims`](../nd-claims/README.md) 的 `Exclusivity`，命令收据经 `nd-ledger`。守护进程负责组装（见[守护进程说明](../nd-daemon/README.md#会话与-claude-后端)）。
 
@@ -14,6 +14,7 @@
 | `Sessions::subscribe(&SessionId, since)` | `session/<id>` 流：快照或同纪元续上的事件，外加 `WatchGuard`（持有期间算「有人在看」） |
 | `Sessions::listing()` | 侧栏列表与一次性的提示（`global` 流里 `sessions` 命名空间的条目） |
 | `session_id_for(command_id)` | 新建会话的 id 由建它的命令 id 派生：同一条命令重试落在同一个会话上 |
+| `lineage::{Lineage, Event}` | 谱系的纯值 fold；段、承载区间、轮的原生位置、显式边、同步点、拓扑与共同前缀 |
 | `projection::{project, Projection, Shown}` | 对话投影的最简版与增量版，见下文差分基准 |
 | `scripted::ScriptedAdapter` | 窄接缝一的脚本化适配器（测试用，#32 扩展） |
 
@@ -33,11 +34,26 @@
 | `header` | `header` | `status`（`preparing` 准备中、`active`、`partial` 部分完成、`withdrawn` 已撤掉）、`note`、`irreversible`、`process{carrier,backend_session,run,alive,readiness,turn_running,drain}`、进行中的 `op` |
 | `prompt/<消息 id>` | `prompt` | `text`、`intent`、`state`：`held` 代持、`waiting` 等独占、`pending` 已签票、`written` 已写出、`landed` 回显了原编号、`failed`、`unknown` 交付不明；`native` 是写出用的原生编号 |
 | `block/<API 消息 id>:<块序号>`、`block/result:<工具调用 id>` | `text`、`thinking`、`tool_use`、`tool_result`、`other` | `text`、`complete`；流式增量期间 `complete:false`、文字累积，完整块到了整体替换 |
-| `turn/<承载位>/<n>` | `turn` | 回合结束：`ok`、`subtype`、`error` |
+| `turn/<承载位>/<n>` | `turn` | 后端回合结束的诊断条目：`ok`、`subtype`、`error`；其中 `n` 是后端 result 的计数，导航使用下面的谱系轮索引 |
+| `lineage` | `lineage` | `current` 当前段、`rounds` 当前段从 1 起的轮索引、`topology`、`segments`、`carriers`、`edges`、`switches`、`origin`。轮含 `id`、`n`、`messages`、`positions`、`complete`、`last_assistant` |
 | `op/<操作 id>` | `op` | `kind`、`phase`、`reason`、`irreversible` |
 | `asked/<请求 id>` | `asked` | 后端在等回答的请求；第 2 步只显示，审批台在第 3 步 |
 
 侧栏条目 `session/<id>`（命名空间 `sessions`，kind `session`）带 `status`、`created_by`、`cwd`、`model`、`process_alive`；撤掉的会话从列表消失，换成一条 `notice/<id>`（只提示一次，不落库）。
+
+## 谱系与轮导航
+
+[`lineage.rs`](src/lineage.rs) 是会话执行器内的纯值计算，不另建组件或后端端口。`Lineage::fold(&Event)` 返回新状态，失败时原状态不变；`turns(segment)`、`segment(id)`、`topology()`、`common_prefix(a,b)`、`common_prefix_with(a,other,b)` 是只读计算。`fork(source_session,from,through,target)` 产生新会话的谱系，来源不变。共同前缀比较稳定轮身份，不比较文字、发送时间或消息次数。
+
+- **段与承载区间**：段存从开头到末尾的完整轮路径。根段在 `Done::Opened` 后建立；后端进程回收或续接不另开段、不另开承载区间。`Branch` 的 `through` 含该轮，`None` 表示空前缀；回退创建并切到新段，清空保留旧段但新路径为空，外部续写创建旁支而不抢当前段。不能以进行中的轮为截点。
+- **换后端与镜像**：`CarrierKnown` 记后端会话已存在，不改变有效区间；`SwitchBackend` 记录已落定的换后端，保持段 id，关闭旧区间并开启新的一段区间。`Binding::{from,to}` 是从 0 起的轮边界 `[from,to)`，`to=None` 是还在承载的区间。`Imported` 将原生位置追加到既有轮上，并在目标承载位记同步点，允许发生在换后端落定前；`InvalidateSync` 保留压缩、外部续写、版本不兼容、导入失败或不明的原因。操作调用方提供这些已经确认的事实，fold 不自行探测外部状态。
+- **轮、消息和票分开**：`Landed` 只记消息 id、票、原生位置的关联，不开轮。`TurnObserved` 用适配器确认的回合身份及用户输入集合开轮或并入；同回合多条提示只有一轮，同一轮可以对应多个原生位置。工具结果、任务通知及没有人类提示落地证据的输入不开人类轮。新票可以使用新 UUID，消息 id 不必变化。重放和迟到的早期输出不重复计轮，也不把最终分叉锚点移回早期输出。
+- **Claude 的实际位置**：`system/init.uuid` 是当前进程内的回合身份，端口加后端进程编号；`stream_event/message_start`、`assistant`、`result` 的 `user_message_uuids`（缺少数组时读单数 `user_message_uuid`）给实际提示集合。工具调用后的多次模型请求沿用同一回合。最后一条主对话 `assistant.uuid` 是 `last_assistant.native`，可交只读记录解析库定位；它不是 API 的 `message.id`。`result` 只使轮结束，不冒充 user 回显。缺少归属信息就不生成猜测的索引。
+- **界面读取**：桌面、ndctl 和场景都经 `session/<id>` 的 `lineage` 条目读同一份索引。导航使用 `rounds[].n` 和稳定的 `id`，提示定位用 `messages`/`positions`；只有 `complete=true` 且有对应后端锚点的轮才可供后续分叉入口选择。拓扑只在守护进程计算。
+
+谱系和显示缓存、发件结果、适配器检查点同事务保存。旧版核心缺少 `lineage` 时仍能读取；旧的 result 计数不能重建人类轮，旧历史不会被猜数补齐，完整历史导入需要后续导入操作提供真实位置。当前产品接入只消费新建、落地和实际回合事实；回退、切段、换后端、会话分叉、外部续写和同步点的纯函数已可用，实际结构操作由对应工单接入。同步点留在持久谱系里，当前导航条目不公开同步点的内部恢复状态。
+
+测试见 [`tests/lineage.rs`](tests/lineage.rs)、[真 CLI 会话场景](../nd-daemon/tests/sessions.rs) 及 [#15 验证记录](../../docs/verification/ticket-15.md)。没有新增结构或派发操作，现有引擎崩溃矩阵继续覆盖新建、回收和拉起。
 
 ## 引擎
 
@@ -78,7 +94,7 @@
 
 ## 存储
 
-`sessions` 表每会话一行：写入代次、状态、建它的命令 id、核心记录（JSON：会话元数据、承载位、进行中的操作账、未结的发件、发送台里没结论的消息）。结束了的进显示缓存 `session_items`，不再占核心。独占登记的状态在它自己的表里，同一个事务提交。
+`sessions` 表每会话一行：写入代次、状态、建它的命令 id、核心记录（JSON：会话元数据、承载位、进行中的操作账、未结的发件、发送台里没结论的消息）。已结束的对话内容进显示缓存 `session_items`；谱系索引（含已结束轮及落地位置）随核心长期保留。独占登记的状态在它自己的表里，同一个事务提交。
 
 ## 已知边界
 

@@ -191,3 +191,33 @@ fn simple_and_incremental_projections_agree_on_the_recorded_conversation() {
         assert_eq!(project(&log[..cut]), partial.items(), "prefix {cut}");
     }
 }
+
+#[test]
+fn recorded_human_rounds_keep_their_user_uuids_and_final_assistant_anchor() {
+    let facts: Vec<_> = replay(&conversation()).into_iter().flatten().collect();
+    let mapped: Vec<_> = facts
+        .iter()
+        .filter_map(|f| match f {
+            Convo::TurnMapped {
+                turn,
+                uuids,
+                complete,
+                last_assistant,
+            } => Some((turn, uuids, complete, last_assistant)),
+            _ => None,
+        })
+        .collect();
+    let ended: Vec<_> = mapped.iter().filter(|(_, _, done, _)| **done).collect();
+    assert_eq!(ended.len(), 2);
+    assert_eq!(ended[0].1, &["8bbb9518-5d44-435a-af28-c83760afc30e"]);
+    assert_eq!(ended[1].1, &["c2dcd113-067a-49d8-a5f4-706d4940060d"]);
+    assert_ne!(ended[0].0, ended[1].0);
+    for end in ended {
+        assert!(end.3.is_some());
+        assert!(
+            mapped
+                .iter()
+                .any(|(id, ids, done, _)| id == &end.0 && !**done && ids == &end.1)
+        );
+    }
+}
