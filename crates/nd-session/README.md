@@ -1,6 +1,6 @@
 # 会话组件：名册与持久操作引擎
 
-日期：2026-10-06。状态：已实现第 2 步的最小引擎、名册新建、发送台、对话投影、谱系、按需拉起与闲置回收。审批台、任务账本与转接、子代理、结构操作入口、收场的未决处置、恢复闸门由后续工单在同一引擎上补。
+日期：2026-10-06。状态：已实现第 2 步的最小引擎、名册新建、发送台、持久草稿、对话投影、谱系、按需拉起与闲置回收。审批台、任务账本与转接、子代理、结构操作入口、收场的未决处置、恢复闸门由后续工单在同一引擎上补。
 
 后端经 [`nd-backend`](../nd-backend/src/lib.rs) 的 `Backends`（真接缝是 `BackendAdapter`），跨会话的独占经 [`nd-claims`](../nd-claims/README.md) 的 `Exclusivity`，命令收据经 `nd-ledger`。守护进程负责组装（见[守护进程说明](../nd-daemon/README.md#会话与-claude-后端)）。
 
@@ -10,7 +10,7 @@
 |---|---|
 | `Sessions::new(store, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
 | `Sessions::recover()` | 守护进程启动时装载有活进程、进行中操作或未结票的会话，交端口 `adopt` 对账 |
-| `Sessions::execute(&Command)` | `session.create`、`session.send`；不是会话命令时返回 None |
+| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`；不是会话命令时返回 None |
 | `Sessions::subscribe(&SessionId, since)` | `session/<id>` 流：快照或同纪元续上的事件，外加 `WatchGuard`（持有期间算「有人在看」） |
 | `Sessions::listing()` | 侧栏列表与一次性的提示（`global` 流里 `sessions` 命名空间的条目） |
 | `session_id_for(command_id)` | 新建会话的 id 由建它的命令 id 派生：同一条命令重试落在同一个会话上 |
@@ -24,6 +24,28 @@
 |---|---|---|
 | `session.create` | `cwd`（绝对路径）、`text`（首条消息）、可选 `model`、`permission_mode`、`backend`（目前只有 `claude`） | `accepted{op, stream:"session/<id>"}`；参数缺失 `invalid`，没有这种后端 `unsupported` |
 | `session.send` | `session`、`text`、可选 `intent`（`fold` 默认、`after_turn`、`interrupting`） | `done{message:<命令 id>}` 只表示进了发送台；之后的代持、写出、落地看这条消息的条目。撤掉的会话回 `precondition` |
+| `session.draft.update` | `args:{session,text}`；必须带 `expect:{draft_version}` | `done{draft,saved}`；版本相符替换当前稿，否则另存原文，`saved` 为另存稿 id。参数不合法回 `invalid` |
+
+### 持久草稿
+
+每个已创建会话有一份 `Draft{version,text,device,saved[]}`，初始版本为 0。草稿及收据由会话执行器在同一 SQLite 事务落盘，经会话快照和事件公开；不放进设备偏好，不发模型请求。空字符串是合法编辑，用来主动清空。草稿不因切段而另建一份。
+
+编辑须携带实际编辑基准的 `expect.draft_version`。相符时当前稿版本加一；不符时当前稿不变，把这次原文存成 `SavedDraft{id,base_version,text,device}`，id 等于编辑命令 id。冲突另存也是成功持久化，返回 `Receipt::Done`；它不是“无副作用的拒绝”。重试遵循原有收据契约，同 id 同内容返回原收据、不同内容回 `conflict`，不会再增加一份另存稿。
+
+`session.send` 可带同一个 `expect.draft_version`。受理消息时只有版本和发送正文均等于当前草稿才清空并加一版本，和发送台入账同事务；`Done.value` 除 `message` 外也返回该事务的 `draft`。版本过时仍受理明确发送的正文，但保留其他编辑。旧界面不带版本时不清稿。界面不得在发送后另发无条件空稿。
+
+取回另存稿是带当前编辑基准版本的普通 `session.draft.update`，另存原文继续保留，暂不提供删除入口。已保存的草稿可在界面关闭、守护进程崩溃后从快照恢复；尚未确认持久化的编辑只存在活着的界面中，界面须显示保存状态并保留待确认命令的 id。
+
+`state::Core::update_draft(id, device, base, text)` 是同 crate 内的回填接入点。#18 撤回已使用该入口；#22 总结、#35 回退处理完成事实时在同一执行器事务调用它；调用方须用原操作账或去重事实保证一次落定，并保存操作开始时的草稿版本，不能拿完成时的最新版冒充基准。并发编辑时回填文字另存。`From` 回填原文、`UpTo` 回填空串的具体规则由对应操作接入，不在本单模拟后端动作。#17 扩展附件时，应同时扩展当前稿、另存稿和比较/清空条件，附件引用随核心事务更新 Blobs 引用。
+
+接口类型和四份 `protocol/draft*.schema.json` 均从 `nd-wire` Rust 类型生成。草稿仅含正文；光标、选区、组词、附件编辑（#17）不在当前结构内。
+
+### 撤回与停止（#18）
+
+- `session.withdraw`：`args:{session,message,draft?:{version,text}}`。可选 draft 是界面在操作开始时看到的草稿基准，不是无条件保存。`Done{withdrawal,message}` 只表示持久受理；`prompt.state=withdrawing/withdrawn` 与 `control/<命令 id>` 给最终结果。已不在发送台的消息回 `not_withdrawable`，重复在途撤回回 `withdrawing`。
+- `session.interrupt`：`args:{session,queued?:"keep"|"cancel",draft?:{version,text}}`，默认 keep。没有活进程回 `Done{idle:true}`；否则 `Done{control}` 是持久受理。`control.state=acknowledged` 只表示停止请求被确认，回合结束仍看 turn/header。Cancel 未获后端能力声明时拒绝；取消成功的消息按发送台到达顺序合成一份回填。
+- 成功撤回将原 Send 票结为 `Refused::Withdrawn`，在同事务通过 `Core::update_draft` 回填。保存操作开始时的版本、正文、设备；并发编辑时以稳定 `return/<命令 id>` 另存，不能覆盖新稿。撤回 false 不改变原 Send；未知结果不回填、不重投。迟到的撤回错误不能覆盖已经确认的送达。
+- `header.interaction` 给三种发送意图、withdraw、interrupt、cancel_queued、interrupt_spares_background、immediate_preserves_mcp 和 rewind_menu。界面按这些中立能力呈现，不能解读 Claude 的私有字段。
 
 ### 会话流的条目（命名空间 `session`）
 
@@ -32,7 +54,8 @@
 | id | kind | 内容 |
 |---|---|---|
 | `header` | `header` | `status`（`preparing` 准备中、`active`、`partial` 部分完成、`withdrawn` 已撤掉）、`note`、`irreversible`、`process{carrier,backend_session,run,alive,readiness,turn_running,drain}`、进行中的 `op` |
-| `prompt/<消息 id>` | `prompt` | `text`、`intent`、`state`：`held` 代持、`waiting` 等独占、`pending` 已签票、`written` 已写出、`landed` 回显了原编号、`failed`、`unknown` 交付不明；`native` 是写出用的原生编号 |
+| `draft` | `draft` | 当前草稿 `version,text,device` 和 `saved[]`；编辑控件使用此项，不作为已发对话显示 |
+| `prompt/<消息 id>` | `prompt` | `text`、`intent`、`state`：`held` 代持、`waiting` 等独占、`pending` 已签票、`written` 已写出、`landed` 回显了原编号、`failed`、`unknown` 交付不明、`withdrawing` 撤回中、`withdrawn` 已撤回；`native` 是写出用的原生编号 |
 | `block/<API 消息 id>:<块序号>`、`block/result:<工具调用 id>` | `text`、`thinking`、`tool_use`、`tool_result`、`other` | `text`、`complete`；流式增量期间 `complete:false`、文字累积，完整块到了整体替换 |
 | `turn/<承载位>/<n>` | `turn` | 后端回合结束的诊断条目：`ok`、`subtype`、`error`；其中 `n` 是后端 result 的计数，导航使用下面的谱系轮索引 |
 | `lineage` | `lineage` | `current` 当前段、`rounds` 当前段从 1 起的轮索引、`topology`、`segments`、`carriers`、`edges`、`switches`、`origin`。轮含 `id`、`n`、`messages`、`positions`、`complete`、`last_assistant` |
@@ -85,6 +108,7 @@
 | 新建 | 拉起失败（没做过不可逆步骤） | `a_create_that_cannot_start_is_withdrawn_at_every_commit_point` | 撤掉，没有原生步骤生效 |
 | 新建 | 首条消息交付不明 | `a_create_whose_first_message_is_unknown_is_partial_at_every_commit_point` | 部分完成，列出「first」 |
 | 闲置回收＋按需拉起 | 回收后发一条消息 | `idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_every_commit_point` | 活动，代持的消息恰好送达一次，两次拉起各一次 |
+| 发送＋草稿 | 同版本竞争、清稿、继续编辑、旧发送命令重试 | `draft_conflict_and_send_consumption_recover_at_every_commit_point` | 落败稿恰好一份，原生发送一次，后来编辑保留 |
 
 #32 在这套矩阵上加三层记录的可重发类别、代持去处与租约结束等断言；后续结构操作按「新增操作就加（操作，场景）行」接入。
 
@@ -102,3 +126,6 @@
 - 闲置计时在内存里，守护进程重启后重新计。
 - 独占登记的 `Write` 放行按原因记账，消息越多登记的状态越大（#12 的结构，见其说明）。
 - 装载过的会话执行器目前一直留着（每会话一个线程），还没有按需卸载。
+
+
+#18 在同一崩溃矩阵追加三行：`withdraw/queued`（撤回并仅回填一次）、`interrupt/queued`（等待中控制仍受理、保留队列）、`interrupt/cancel-queue`（停止并仅回填一次）。另有控制窄接缝测试：Busy 不是终结、未知撤回不回填、迟到的撤回错误不覆盖送达。真 CLI/界面恢复证据见 [#18 验证记录](../../docs/verification/ticket-18.md)。

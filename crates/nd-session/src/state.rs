@@ -87,10 +87,34 @@ pub struct OutRow {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "by", rename_all = "snake_case")]
 pub enum Issuer {
-    Op { op: String, key: String },
-    Message { id: String },
-    Control { id: String },
-    Withdrawal { id: String, message: Message },
+    Op {
+        op: String,
+        key: String,
+    },
+    Message {
+        id: String,
+    },
+    Control {
+        id: String,
+        #[serde(default)]
+        restore: Option<DraftRestore>,
+        #[serde(default)]
+        held: Vec<Message>,
+    },
+    Withdrawal {
+        id: String,
+        message: Message,
+        #[serde(default)]
+        restore: DraftRestore,
+    },
+}
+
+/// 控制操作开始时看到的草稿基准；完成时版本已变化就走 #16 的另存稿。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftRestore {
+    pub version: u64,
+    pub text: String,
+    pub device: String,
 }
 
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
@@ -108,6 +132,8 @@ pub struct Message {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Core {
+    #[serde(default)]
+    pub draft: nd_wire::Draft,
     pub meta: Option<Meta>,
     pub current: Option<CarrierId>,
     #[serde(default)]
@@ -116,16 +142,8 @@ pub struct Core {
     pub ops: BTreeMap<String, OpRecord>,
     pub outbox: BTreeMap<Ticket, OutRow>,
     pub messages: BTreeMap<String, Message>,
-    /// 撤回回填和结 Send 票同事务。#16 可在此基础上扩展版本比较与落败另存。
-    #[serde(default)]
-    pub draft: Draft,
     pub next_op: u64,
     pub arrivals: u64,
-}
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Draft {
-    pub text: String,
-    pub version: u64,
 }
 impl Core {
     pub fn meta(&self) -> &Meta {
@@ -133,6 +151,34 @@ impl Core {
     }
     pub fn current_carrier(&self) -> Option<&Carrier> {
         self.current.as_ref().and_then(|c| self.carriers.get(c))
+    }
+    /// 执行器事务内的编辑/回填入口；调用方用收据或操作账保证同 id 只落定一次。
+    /// 撤回、总结、回退可在处理其完成事实的同一事务内复用，不另发清稿命令。
+    pub fn update_draft(
+        &mut self,
+        id: &str,
+        device: &str,
+        base: u64,
+        text: String,
+    ) -> nd_wire::DraftUpdated {
+        let saved = if base != self.draft.version {
+            self.draft.saved.push(nd_wire::SavedDraft {
+                id: id.into(),
+                base_version: base,
+                text,
+                device: device.into(),
+            });
+            Some(id.into())
+        } else {
+            self.draft.version += 1;
+            self.draft.text = text;
+            self.draft.device = device.into();
+            None
+        };
+        nd_wire::DraftUpdated {
+            draft: self.draft.clone(),
+            saved,
+        }
     }
 }
 

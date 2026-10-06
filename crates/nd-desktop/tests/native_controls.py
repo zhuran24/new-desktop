@@ -2,6 +2,7 @@
 """私有原生窗口：发送意图、撤回中 SIGKILL、冷启动草稿、Esc 面板和回合分派。"""
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -61,6 +62,11 @@ def inner():
         path.with_suffix('.tmp').replace(path)
         wait(lambda vs:state(vs).get('action') == action_id)
 
+    def screenshot(name):
+        time.sleep(.25)
+        result=subprocess.run(['spectacle','-b','-n','-f','-o',str(out/f'{name}.png')],capture_output=True,timeout=10,env=dict(os.environ,QT_QPA_PLATFORM='wayland'))
+        assert result.returncode == 0,result.stderr.decode()
+
     def wait_file(name):
         deadline = time.monotonic() + 20
         while not (out / name).exists():
@@ -84,6 +90,7 @@ def inner():
         (out / 'ui-killed').touch(); wait_file('resumed')
         start('reopened')
         cold = wait(lambda vs:state(vs).get('text') == 'ui later' and prompt(vs,'ui later','withdrawn'))
+        screenshot('withdrawn-draft')
         action('intent',intent='interrupting'); action('edit',text='ui now'); action('send')
         wait(lambda vs:prompt(vs,'ui now','written'))
         (out / 'wait-now').touch(); wait_file('now-started')
@@ -95,6 +102,7 @@ def inner():
         wait(lambda vs:any(i['kind']=='header' and not i['data']['process']['turn_running'] for i in snapshot(vs)['items']))
         action('escape'); action('escape')
         wait(lambda vs:state(vs).get('panel') == 'rewind')
+        screenshot('rewind-menu')
         action('escape'); wait(lambda vs: state(vs).get('panel') is None)
         (out / 'result.json').write_text(json.dumps({'pass':True,'session':plan['session'],'cold':snapshot(cold),
             'checks':['three UI intent choices','withdraw survives SIGKILL before CLI ACK','cold editor restores durable draft',

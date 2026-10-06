@@ -342,7 +342,7 @@ impl Sessions {
     pub async fn execute(&self, command: &Command) -> Option<CommandReply> {
         let target = match command.name.as_str() {
             "session.create" => session_id_for(&command.id),
-            "session.send" | "session.interrupt" | "session.withdraw" | "session.draft.save" => {
+            "session.send" | "session.draft.update" | "session.withdraw" | "session.interrupt" => {
                 match command.args["session"].as_str() {
                     Some(id) => SessionId(id.to_owned()),
                     None => return Some(self.reject_without_session(command, "invalid")),

@@ -129,7 +129,13 @@ impl Executor {
             Some((write_gen, core)) => (write_gen, core, true),
             None => (0, Core::default(), false),
         };
-        let projection = Projection::restore(state::items(&deps.store, &id)?);
+        let mut projection = Projection::restore(state::items(&deps.store, &id)?);
+        if born {
+            // 草稿是核心事实；即使旧版显示缓存没有它，冷启动也必须给出可编辑的版本。
+            projection.apply(&Shown::Draft {
+                draft: core.draft.clone(),
+            });
+        }
         let this = Self {
             id,
             write_gen,
@@ -442,20 +448,24 @@ impl Executor {
     ) -> nd_store::Result<Receipt> {
         match command.name.as_str() {
             "session.create" => self.create(tx, command, fx),
-            "session.draft.save" if self.born => {
-                let (Some(version), Some(text)) = (
-                    command.args["version"].as_u64(),
-                    command.args["text"].as_str(),
+            "session.draft.update" => {
+                let (Ok(args), Ok(expected)) = (
+                    serde_json::from_value::<nd_wire::DraftUpdate>(command.args.clone()),
+                    serde_json::from_value::<nd_wire::DraftExpected>(command.expect.clone()),
                 ) else {
-                    return Ok(rejected("invalid", json!({"need":["version","text"]})));
+                    return Ok(rejected(
+                        "invalid",
+                        json!({"need":["text", "expect.draft_version"]}),
+                    ));
                 };
-                if version != self.core.draft.version {
-                    return Ok(rejected("draft_conflict", json!(self.core.draft)));
-                }
-                self.core.draft.text = text.to_owned();
-                self.core.draft.version += 1;
+                let result = self.core.update_draft(
+                    &command.id,
+                    &command.device,
+                    expected.draft_version,
+                    args.text,
+                );
                 Ok(Receipt::Done {
-                    value: json!(self.core.draft),
+                    value: json!(result),
                 })
             }
             "session.interrupt" if self.born => self.interrupt(tx, command, fx),
@@ -531,8 +541,8 @@ impl Executor {
         })
     }
 
-    fn capture_draft(&mut self, args: &Value) -> Result<(), Receipt> {
-        if let Some(draft) = args.get("draft") {
+    fn return_draft(&self, command: &Command) -> Result<state::DraftRestore, Receipt> {
+        let (version, text) = if let Some(draft) = command.args.get("draft") {
             let (Some(version), Some(text)) = (draft["version"].as_u64(), draft["text"].as_str())
             else {
                 return Err(rejected(
@@ -540,13 +550,34 @@ impl Executor {
                     json!({"need":["draft.version","draft.text"]}),
                 ));
             };
-            if version != self.core.draft.version {
-                return Err(rejected("draft_conflict", json!(self.core.draft)));
-            }
-            self.core.draft.text = text.into();
-            self.core.draft.version += 1;
+            (version, text.to_owned())
+        } else {
+            (self.core.draft.version, self.core.draft.text.clone())
+        };
+        Ok(state::DraftRestore {
+            version,
+            text,
+            device: command.device.clone(),
+        })
+    }
+
+    fn refill_draft(&mut self, id: &str, restore: &state::DraftRestore, messages: &[Message]) {
+        if messages.is_empty() {
+            return;
         }
-        Ok(())
+        let mut text = restore.text.clone();
+        for message in messages {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&message.text);
+        }
+        self.core.update_draft(
+            &format!("return/{id}"),
+            &restore.device,
+            restore.version,
+            text,
+        );
     }
 
     fn restore_withdrawn(
@@ -556,11 +587,6 @@ impl Executor {
         message: &Message,
     ) -> nd_store::Result<()> {
         self.core.messages.remove(&message.id);
-        if !self.core.draft.text.is_empty() {
-            self.core.draft.text.push_str("\n\n");
-        }
-        self.core.draft.text.push_str(&message.text);
-        self.core.draft.version += 1;
         self.show_message(tx, fx, message, "withdrawn", None)
     }
 
@@ -584,9 +610,10 @@ impl Executor {
         {
             return Ok(rejected("withdrawing", json!({"message":id})));
         }
-        if let Err(receipt) = self.capture_draft(&command.args) {
-            return Ok(receipt);
-        }
+        let restore = match self.return_draft(command) {
+            Ok(r) => r,
+            Err(receipt) => return Ok(receipt),
+        };
         if let Some(send) = &message.ticket {
             let Some(original) = self.core.outbox.get(send).cloned() else {
                 return Ok(rejected("not_withdrawable", json!({"message":id})));
@@ -608,6 +635,7 @@ impl Executor {
                     issuer: Issuer::Withdrawal {
                         id: command.id.clone(),
                         message: message.clone(),
+                        restore: restore.clone(),
                     },
                     display: None,
                     outcome: None,
@@ -618,6 +646,7 @@ impl Executor {
             self.show_message(tx, fx, &message, "withdrawing", None)?;
         } else {
             self.restore_withdrawn(tx, fx, &message)?;
+            self.refill_draft(&command.id, &restore, &[message]);
         }
         Ok(Receipt::Done {
             value: json!({"withdrawal":command.id,"message":id}),
@@ -639,21 +668,24 @@ impl Executor {
             .core
             .current_carrier()
             .or_else(|| self.core.carriers.values().find(|c| c.alive))
-            .cloned();
-        if queued == nd_backend::QueuedPolicy::Cancel {
+            .cloned()
+            .filter(|c| c.alive);
+        let mut held = vec![];
+        let restore = if queued == nd_backend::QueuedPolicy::Cancel {
             if carrier
                 .as_ref()
-                .is_some_and(|c| c.alive && !c.interaction.cancel_queued)
+                .is_some_and(|c| !c.interaction.cancel_queued)
             {
                 return Ok(rejected(
                     "unsupported",
                     json!({"why":"后端未声明取消排队能力"}),
                 ));
             }
-            if let Err(receipt) = self.capture_draft(&command.args) {
-                return Ok(receipt);
-            }
-            let mut held: Vec<_> = self
+            let restore = match self.return_draft(command) {
+                Ok(r) => r,
+                Err(receipt) => return Ok(receipt),
+            };
+            held = self
                 .core
                 .messages
                 .values()
@@ -661,13 +693,23 @@ impl Executor {
                 .cloned()
                 .collect();
             held.sort_by_key(|m| m.arrival);
-            for message in held {
-                self.restore_withdrawn(tx, fx, &message)?;
+            for message in &held {
+                self.core.messages.remove(&message.id);
+                self.show_message(tx, fx, message, "withdrawing", None)?;
             }
-        }
-        let Some(carrier) = carrier.filter(|c| c.alive) else {
+            Some(restore)
+        } else {
+            None
+        };
+        let Some(carrier) = carrier else {
+            for message in &held {
+                self.restore_withdrawn(tx, fx, message)?;
+            }
+            if let Some(restore) = restore {
+                self.refill_draft(&command.id, &restore, &held);
+            }
             return Ok(Receipt::Done {
-                value: json!({"idle": true}),
+                value: json!({"idle":true}),
             });
         };
         let ticket = Ticket(format!("control:{}", command.id));
@@ -686,6 +728,8 @@ impl Executor {
                 kind: carrier.kind,
                 issuer: Issuer::Control {
                     id: command.id.clone(),
+                    restore,
+                    held,
                 },
                 display: None,
                 outcome: None,
@@ -703,7 +747,7 @@ impl Executor {
             },
         )?;
         Ok(Receipt::Done {
-            value: json!({"control": command.id}),
+            value: json!({"control":command.id}),
         })
     }
 
@@ -724,10 +768,6 @@ impl Executor {
             "interrupting" => Intent::Interrupting,
             other => return Ok(rejected("invalid", json!({"intent": other}))),
         };
-        if command.args["draft_version"].as_u64() == Some(self.core.draft.version) {
-            self.core.draft.text.clear();
-            self.core.draft.version += 1;
-        }
         self.core.arrivals += 1;
         self.core.messages.insert(
             command.id.clone(),
@@ -741,9 +781,17 @@ impl Executor {
                 arrival: self.core.arrivals,
             },
         );
+        // 发送与清稿同一事务；旧界面、不同正文和重试均不能清掉后来编辑的草稿。
+        if command.expect["draft_version"].as_u64() == Some(self.core.draft.version)
+            && self.core.draft.text == text
+        {
+            self.core.draft.version += 1;
+            self.core.draft.text.clear();
+            self.core.draft.device = command.device.clone();
+        }
         // Done 只表示进了发送台；代持、写出、回显看这条消息的状态。
         Ok(Receipt::Done {
-            value: json!({"message": command.id}),
+            value: json!({"message": command.id, "draft": self.core.draft}),
         })
     }
 
@@ -994,7 +1042,11 @@ impl Executor {
         }
         self.core.outbox.remove(ticket);
         match row.issuer {
-            Issuer::Withdrawal { id, message } => {
+            Issuer::Withdrawal {
+                id,
+                message,
+                restore,
+            } => {
                 let state = match &outcome {
                     Outcome::Ok {
                         done: Done::Withdrawn { ok: true },
@@ -1010,6 +1062,7 @@ impl Executor {
                             )?;
                         }
                         self.restore_withdrawn(tx, fx, &message)?;
+                        self.refill_draft(&id, &restore, &[message.clone()]);
                         "withdrawn"
                     }
                     Outcome::Ok {
@@ -1027,11 +1080,15 @@ impl Executor {
                         "not_withdrawable"
                     }
                     Outcome::Unknown { .. } => {
-                        self.show_message(tx, fx, &message, "unknown", Some(outcome.reason()))?;
+                        if self.core.messages.contains_key(&message.id) {
+                            self.show_message(tx, fx, &message, "unknown", Some(outcome.reason()))?;
+                        }
                         "unknown"
                     }
                     _ => {
-                        self.show_message(tx, fx, &message, "written", Some(outcome.reason()))?;
+                        if self.core.messages.contains_key(&message.id) {
+                            self.show_message(tx, fx, &message, "written", Some(outcome.reason()))?;
+                        }
                         "failed"
                     }
                 };
@@ -1045,32 +1102,39 @@ impl Executor {
                     },
                 )?;
             }
-            Issuer::Control { id } => {
+            Issuer::Control {
+                id,
+                restore,
+                mut held,
+            } => {
                 if let Outcome::Ok {
                     done: Done::Interrupted { cancelled },
                 } = &outcome
                 {
-                    let mut messages: Vec<_> = self
-                        .core
-                        .messages
-                        .values()
-                        .filter(|m| m.ticket.as_ref().is_some_and(|t| cancelled.contains(t)))
-                        .cloned()
-                        .collect();
-                    messages.sort_by_key(|m| m.arrival);
-                    for message in messages {
-                        if let Some(send) = &message.ticket {
-                            self.record_outcome(
-                                tx,
-                                fx,
-                                send,
-                                Outcome::Refused {
-                                    refusal: Refusal::Withdrawn,
-                                },
-                            )?;
-                        }
-                        self.restore_withdrawn(tx, fx, &message)?;
+                    held.extend(
+                        self.core
+                            .messages
+                            .values()
+                            .filter(|m| m.ticket.as_ref().is_some_and(|t| cancelled.contains(t)))
+                            .cloned(),
+                    );
+                }
+                held.sort_by_key(|m| m.arrival);
+                for message in &held {
+                    if let Some(send) = &message.ticket {
+                        self.record_outcome(
+                            tx,
+                            fx,
+                            send,
+                            Outcome::Refused {
+                                refusal: Refusal::Withdrawn,
+                            },
+                        )?;
                     }
+                    self.restore_withdrawn(tx, fx, message)?;
+                }
+                if let Some(restore) = restore {
+                    self.refill_draft(&id, &restore, &held);
                 }
                 let state = match &outcome {
                     Outcome::Ok { .. } => "acknowledged",
@@ -1942,8 +2006,7 @@ impl Executor {
             tx,
             fx,
             Shown::Draft {
-                text: self.core.draft.text.clone(),
-                version: self.core.draft.version,
+                draft: self.core.draft.clone(),
             },
         )?;
         let header = header(&self.core);

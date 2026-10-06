@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DraftUpdated",
+  "type": "object",
+  "properties": {
+    "draft": {
+      "$ref": "#/$defs/Draft"
+    },
+    "saved": {
+      "description": "None 为替换当前稿；Some 为另存稿的 id。两种都是已持久化的 Done。",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "draft"
+  ],
+  "$defs": {
+    "Draft": {
+      "description": "会话持久草稿；光标、选区和输入法组词不在此协议中。",
+      "type": "object",
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "saved": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SavedDraft"
+          }
+        },
+        "text": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "version",
+        "text",
+        "device"
+      ]
+    },
+    "SavedDraft": {
+      "description": "版本比较落败的原文；id 是原编辑命令的 id，重试不重复另存。",
+      "type": "object",
+      "properties": {
+        "base_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "device": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "base_version",
+        "text",
+        "device"
+      ]
+    }
+  }
+}

@@ -24,7 +24,7 @@ argv 逐项传入，不拼 shell：`--output-format stream-json --input-format s
 
 `--settings` 的 JSON：`pluginConfigs.{new-desktop,new-desktop-actions}.options = {sock, run}`；`enabledPlugins` 把 `codex-direct@skills-dir`、`sendnow@skills-dir`、`cc-quota@skills-dir`、`ultracode-toggle@skills-dir` 设为 false。flag 层的 `enabledPlugins` 与用户设置按键合并：用户自己关掉的仍关着，别的 skills-dir mod 照常装载，旧 mod 的文件不动。
 
-环境从 `ClaudeConfig.env` 构造（生产传守护进程继承的环境，测试从空白构造），去掉 `BUN_OPTIONS`（看守进程也会去掉），再固定加 `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`、`CLAUDE_CODE_FORK_SUBAGENT=1`、`CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true`、`CLAUDE_CODE_SDK_READS_SESSION_STATE=1`、`DISABLE_UPDATES=1`、`CLAUDE_CODE_PLUGIN_DIR_WATCH=0`。这几项不能被配置覆盖。`CLAUDE_AUTO_BACKGROUND_TASKS` 不设（E2b 归 #18）。
+环境从 `ClaudeConfig.env` 构造（生产传守护进程继承的环境，测试从空白构造），去掉 `BUN_OPTIONS`（看守进程也会去掉），再固定加 `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`、`CLAUDE_CODE_FORK_SUBAGENT=1`、`CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true`、`CLAUDE_CODE_SDK_READS_SESSION_STATE=1`、`DISABLE_UPDATES=1`、`CLAUDE_CODE_PLUGIN_DIR_WATCH=0`。这几项不能被配置覆盖。另固定 `CLAUDE_AUTO_BACKGROUND_TASKS=1`：E2b 已用真实 FIFO MCP 验证立即发送时转后台、之后正常交付结果；当前模板下显式 `Agent(run_in_background:false)` 也按 CLI 的策略异步完成，不承诺阻塞或固定两分钟延迟。
 
 ## 就绪与降级
 
@@ -94,3 +94,12 @@ scripts/test-scenarios.sh -- clear_rebinds   # 也可按测试名过滤
 后端端口这一层的场景在守护进程的 `crates/nd-daemon/tests/sessions.rs`（经 nd-wire 驱动，见[会话组件说明](../nd-session/README.md)）。
 
 CLI 依赖逐条登记在 [CLI 契约清单](../../docs/cli-contracts.md) 的「mod 与 Claude 后端进程（#11）」「第一条 Claude 对话（#13）」两节。
+
+
+## 发送、撤回和停止回合
+
+`Act::Send` 的中立 `Fold/AfterTurn/Interrupting` 映射到 user 的 `next/later/now`。回显与实际轮归属仍分别处理：活动模型尚无输出时被打断，可能缺少可确认的原生轮归属，不能猜轮。
+
+`Act::Withdraw{send}` 用原 Send 票派生 UUID，发 `cancel_async_message`。`cancelled:true` 才结撤回成功；false 保留原 Send 的后续结果。`Act::Interrupt{queued:Keep}` 发普通 `interrupt`，ACK 只结控制票，后续 result 才结束回合。Cancel 必须先观察 `system/init.capabilities` 的 `interrupt_cancel_queued_v1`，再发 `cancel_queued:true`，仅返回明确列出的取消票；缺少列表记交付不明。
+
+单一写入者优先处理控制和流水确认；普通输入最多 128 条，满时同步 Busy，由引擎保留同票重试。撤回和取消排队先完成目标输入的因果前置写出。检查点保存未答控制请求；恢复时已写请求只等重放回应，证实未写才派发。进程退出时已写未答记 Unknown，尚未写出的普通输入记 Withheld。没有把 ACK、空 success 或进程存活当作停止完成。

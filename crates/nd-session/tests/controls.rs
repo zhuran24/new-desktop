@@ -4,6 +4,42 @@ use serde_json::json;
 use support::*;
 
 #[tokio::test]
+async fn a_late_withdrawal_failure_cannot_erase_confirmed_delivery() {
+    let h = Harness::new(config()).await;
+    let session = accepted_session(&h.create("late-withdraw", "ready").await);
+    h.wait(&session, "created", |s| header(s)["status"] == "active")
+        .await;
+    h.adapter.script(ActKind::Send, Reply::Hold);
+    h.adapter.script(ActKind::Withdraw, Reply::Hold);
+    h.send("pending", &session, "already delivered").await;
+    h.sessions
+        .execute(&command(
+            "withdraw",
+            "session.withdraw",
+            json!({"session":session,"message":"pending"}),
+        ))
+        .await;
+    assert!(h.adapter.release(Reply::Ok));
+    h.wait(&session, "confirmed delivery", |s| {
+        prompt(s, "already delivered").is_some_and(|i| i.data["state"] == "landed")
+    })
+    .await;
+    assert!(h.adapter.release(Reply::Unknown("reply lost".into())));
+    let snapshot = h
+        .wait(&session, "withdrawal unknown", |s| {
+            s.items
+                .iter()
+                .any(|i| i.id == "control/withdraw" && i.data["state"] == "unknown")
+        })
+        .await;
+    assert_eq!(
+        prompt(&snapshot, "already delivered").unwrap().data["state"],
+        "landed"
+    );
+    assert_eq!(item(&snapshot, "draft").data["text"], "");
+}
+
+#[tokio::test]
 async fn unknown_withdrawal_does_not_refill_the_draft_or_retry_the_send() {
     let h = Harness::new(config()).await;
     let session = accepted_session(&h.create("unknown-withdraw", "ready").await);

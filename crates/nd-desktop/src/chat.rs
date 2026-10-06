@@ -73,21 +73,22 @@ impl Desktop {
             window,
             |this, _, event, window, cx| match event {
                 ComposerEvent::Changed(state) => {
-                    let key = this.draft_key();
-                    let draft = this.drafts.entry(key).or_default();
-                    draft.edit(state.text.clone());
-                    if !state.composing
-                        && let Some(remote) = this
-                            .session_snapshot
-                            .as_ref()
-                            .and_then(|s| s.items.iter().find(|i| i.kind == "draft"))
-                        && draft.receive(
-                            remote.data["version"].as_u64().unwrap_or(0),
-                            remote.data["text"].as_str().unwrap_or_default(),
-                        )
-                    {
-                        this.restore_draft(window, cx);
+                    if state.composing {
+                        return;
                     }
+                    let key = this.draft_key();
+                    let draft = this.drafts.entry(key.clone()).or_default();
+                    let revision = draft.revision();
+                    draft.edit(state.text.clone());
+                    if revision != draft.revision() {
+                        this.queued_send = None;
+                    }
+                    if let Some(session) = key {
+                        this.sync_draft(window, cx);
+                        this.persist_draft(session, window, cx);
+                    }
+                    this.refresh_send(cx);
+                    cx.notify();
                 }
                 ComposerEvent::Action(ComposerAction::Submit { text }) => {
                     this.send_text(text.clone(), window, cx)
@@ -129,6 +130,10 @@ impl Desktop {
             .text()
             .to_owned();
         let input = self.composer.read(cx).editor().clone();
+        let current = self.composer.update(cx, |c, cx| c.snapshot(window, cx));
+        if current.composing || current.text == text {
+            return;
+        }
         input.update(cx, |input, cx| {
             input.set_value(text.clone(), window, cx);
             input.set_selected_range(text.len()..text.len(), cx);
@@ -136,6 +141,11 @@ impl Desktop {
     }
     pub(crate) fn refresh_send(&mut self, cx: &mut Context<Self>) {
         let enabled = !self.sending
+            && self.queued_send.is_none()
+            && !self
+                .drafts
+                .get(&self.draft_key())
+                .is_some_and(|d| d.needs_send_review())
             && self.snapshot.is_some()
             && if self.creating {
                 self.model_cwd.as_deref() == Some(self.directory.read(cx).value().as_ref())
@@ -152,6 +162,16 @@ impl Desktop {
             .update(cx, |c, cx| c.set_send_enabled(enabled, cx));
     }
     pub fn begin_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .composer
+            .update(cx, |c, cx| c.snapshot(window, cx))
+            .composing
+        {
+            self.warning = Some("请先完成组词，再切换会话".into());
+            cx.notify();
+            return;
+        }
+        self.queued_send = None;
         self.scroll = ScrollHandle::new();
         self.escape = Default::default();
         self.send_intent = "fold".into();
@@ -165,6 +185,16 @@ impl Desktop {
         cx.notify();
     }
     pub fn select_session(&mut self, session: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .composer
+            .update(cx, |c, cx| c.snapshot(window, cx))
+            .composing
+        {
+            self.warning = Some("请先完成组词，再切换会话".into());
+            cx.notify();
+            return;
+        }
+        self.queued_send = None;
         self.scroll = ScrollHandle::new();
         self.escape = Default::default();
         self.send_intent = "fold".into();
@@ -195,23 +225,9 @@ impl Desktop {
                                         {
                                             this.scroll.scroll_to_bottom();
                                         }
-                                        let current = this
-                                            .composer
-                                            .update(cx, |c, cx| c.snapshot(window, cx));
-                                        let draft =
-                                            this.drafts.entry(Some(session.clone())).or_default();
-                                        draft.edit(current.text);
-                                        if !current.composing
-                                            && let Some(remote) =
-                                                s.items.iter().find(|i| i.kind == "draft")
-                                            && draft.receive(
-                                                remote.data["version"].as_u64().unwrap_or(0),
-                                                remote.data["text"].as_str().unwrap_or_default(),
-                                            )
-                                        {
-                                            this.restore_draft(window, cx);
-                                        }
                                         this.session_snapshot = Some(s);
+                                        this.sync_draft(window, cx);
+                                        this.persist_draft(session.clone(), window, cx);
                                     }
                                     FeedUpdate::Unavailable(e) => {
                                         this.session_snapshot = None;
@@ -269,7 +285,16 @@ impl Desktop {
         .detach();
         cx.notify();
     }
-    fn send_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn send_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_text_intent(text, self.send_intent.clone(), window, cx);
+    }
+    pub(crate) fn send_text_intent(
+        &mut self,
+        text: String,
+        intent: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.sending
             || !self
                 .composer
@@ -282,11 +307,20 @@ impl Desktop {
         let draft = self.drafts.entry(key.clone()).or_default();
         draft.edit(text.clone());
         let revision = draft.revision();
-        let draft_version = draft.server_version();
+        let version = draft.version();
+        if let Some(session) = key.clone()
+            && !draft.is_saved()
+        {
+            self.queued_send = Some((session.clone(), text, revision, intent));
+            self.persist_draft(session, window, cx);
+            self.refresh_send(cx);
+            cx.notify();
+            return;
+        }
         let command = Command {
             id: uuid::Uuid::new_v4().to_string(),
-            device: "desktop".into(),
-            expect: json!({}),
+            device: self.device.clone(),
+            expect: json!({"draft_version":version}),
             name: if self.creating {
                 "session.create"
             } else {
@@ -296,7 +330,7 @@ impl Desktop {
             args: if self.creating {
                 json!({"cwd":self.directory.read(cx).value().to_string(), "model":self.model, "text":text})
             } else {
-                json!({"session":key, "text":text, "intent":self.send_intent, "draft_version":draft_version})
+                json!({"session":key, "text":text, "intent":intent})
             },
         };
         self.sending = true;
@@ -307,28 +341,51 @@ impl Desktop {
             let result = client.command(command).await;
             let _ = weak.update_in(cx, |this, window, cx| {
                 this.sending = false;
+                if key.is_some() && !result.as_ref().is_ok_and(accepted) {
+                    this.drafts
+                        .entry(key.clone())
+                        .or_default()
+                        .unconfirmed_send();
+                }
                 match result {
                     Ok(reply) if accepted(&reply) => {
                         // 现场检查 IME，避免清掉尚未提交的 preedit。
                         let current = this.composer.update(cx, |c, cx| c.snapshot(window, cx));
                         let same_view = this.draft_key() == key;
-                        if same_view {
+                        if same_view && !current.composing {
                             this.drafts
                                 .entry(key.clone())
                                 .or_default()
                                 .edit(current.text);
                         }
-                        let cleared = (!same_view || !current.composing)
-                            && this.drafts.entry(key.clone()).or_default().accept(revision);
-                        if cleared && same_view {
-                            this.restore_draft(window, cx);
+                        let mut follow_created = false;
+                        if key.is_some() {
                             if let CommandReply::Receipt {
-                                receipt:
-                                    Receipt::Accepted {
-                                        stream: Some(stream),
-                                        ..
-                                    },
-                            } = reply
+                                receipt: Receipt::Done { value },
+                            } = &reply
+                                && let Ok(remote) =
+                                    serde_json::from_value::<nd_wire::Draft>(value["draft"].clone())
+                            {
+                                this.drafts.entry(key.clone()).or_default().sent(
+                                    revision,
+                                    remote,
+                                    same_view && current.composing,
+                                );
+                            }
+                        } else if !same_view || !current.composing {
+                            follow_created =
+                                this.drafts.entry(key.clone()).or_default().accept(revision);
+                        }
+                        if same_view {
+                            this.restore_draft(window, cx);
+                            if follow_created
+                                && let CommandReply::Receipt {
+                                    receipt:
+                                        Receipt::Accepted {
+                                            stream: Some(stream),
+                                            ..
+                                        },
+                                } = reply
                                 && let Some(session) = stream.strip_prefix("session/")
                             {
                                 this.select_session(session.into(), window, cx);
@@ -336,13 +393,18 @@ impl Desktop {
                         }
                     }
                     Ok(CommandReply::DeliveryUnknown) => {
-                        this.warning = Some("交付不明，正文已保留；请先核对会话记录".into())
+                        this.warning =
+                            Some("交付不明，正文已保留；请核对记录后修改草稿或重试保存".into())
                     }
                     Ok(CommandReply::Receipt {
                         receipt: Receipt::Rejected { code, now },
                     }) => this.warning = Some(format!("未受理：{code} {now}")),
                     Ok(reply) => this.warning = Some(format!("未确认受理，正文已保留：{reply:?}")),
                     Err(e) => this.warning = Some(format!("发送未确认，正文已保留：{e}")),
+                }
+                let sessions: Vec<_> = this.drafts.keys().flatten().cloned().collect();
+                for session in sessions {
+                    this.persist_draft(session, window, cx);
                 }
                 this.refresh_send(cx);
                 cx.notify();

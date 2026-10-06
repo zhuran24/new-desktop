@@ -419,3 +419,66 @@ async fn idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_eve
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn draft_conflict_and_send_consumption_recover_at_every_commit_point() {
+    let session = session_id_for("matrix-draft-create");
+    let update = |id: &str, version: u64, text: &str| nd_wire::Command {
+        id: id.into(),
+        device: id.into(),
+        name: "session.draft.update".into(),
+        args: json!({"session":session,"text":text}),
+        expect: json!({"draft_version":version}),
+    };
+    let send = nd_wire::Command {
+        id: "matrix-draft-send".into(),
+        device: "a".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"胜出的草稿"}),
+        expect: json!({"draft_version":1}),
+    };
+    matrix(Scenario {
+        name: "send/draft-conflict-consume-retry",
+        script: vec![],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-draft-create", "你好"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: update("matrix-draft-a", 0, "胜出的草稿"),
+                until: |s| item(s, "draft").data["version"] == 1,
+            },
+            Step {
+                command: update("matrix-draft-b", 0, "落败稿"),
+                until: |s| {
+                    item(s, "draft").data["saved"]
+                        .as_array()
+                        .is_some_and(|a| a.len() == 1)
+                },
+            },
+            Step {
+                command: send.clone(),
+                until: |s| prompt(s, "胜出的草稿").is_some_and(|i| i.data["state"] == "landed"),
+            },
+            Step {
+                command: update("matrix-draft-new", 2, "后来编辑"),
+                until: |s| item(s, "draft").data["version"] == 3,
+            },
+            Step {
+                command: send,
+                until: |s| item(s, "draft").data["text"] == "后来编辑",
+            },
+        ],
+        check: |h, s| {
+            let d = &item(s, "draft").data;
+            assert_eq!(d["text"], "后来编辑");
+            assert_eq!(d["version"], 3);
+            assert_eq!(d["saved"].as_array().unwrap().len(), 1);
+            assert_eq!(d["saved"][0]["text"], "落败稿");
+            assert_eq!(applied_counts(h).get("send:胜出的草稿"), Some(&1));
+        },
+    })
+    .await;
+}

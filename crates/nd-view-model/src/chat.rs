@@ -185,43 +185,122 @@ pub fn accepted(reply: &nd_wire::CommandReply) -> bool {
 pub struct Draft {
     text: String,
     revision: u64,
-    server_version: Option<u64>,
-    server_text: String,
+    base: u64,
+    remote: Option<nd_wire::Draft>,
+    dirty: bool,
+    pending: Option<(u64, nd_wire::Command)>,
+    save_unconfirmed: bool,
+    send_unconfirmed: bool,
+}
+
+pub fn session_draft(snapshot: &Snapshot) -> Option<nd_wire::Draft> {
+    snapshot
+        .items
+        .iter()
+        .find(|i| i.id == "draft" && i.kind == "draft")
+        .and_then(|i| serde_json::from_value(i.data.clone()).ok())
 }
 impl Draft {
-    pub fn server_version(&self) -> Option<u64> {
-        self.server_version
+    pub fn version(&self) -> u64 {
+        self.base
     }
-    /// 撤回请求携带当前编辑缓冲；随后的同文快照不是另一份待追加正文。
-    pub fn preparing_restore(&mut self) {
-        self.server_text = self.text.clone();
+    pub fn is_saved(&self) -> bool {
+        self.remote.is_some() && !self.dirty && self.pending.is_none() && !self.send_unconfirmed
     }
-    pub fn receive(&mut self, version: u64, text: &str) -> bool {
-        if self.server_version.is_some_and(|known| version <= known) {
-            return false;
+    pub fn needs_send_review(&self) -> bool {
+        self.send_unconfirmed
+    }
+    pub fn needs_receipt(&self) -> bool {
+        self.save_unconfirmed
+    }
+    pub fn save_failed(&mut self, uncertain: bool) {
+        self.save_unconfirmed = uncertain;
+    }
+    pub fn unconfirmed_send(&mut self) {
+        self.send_unconfirmed = true;
+    }
+    pub fn retry_save(&mut self) {
+        if self.send_unconfirmed {
+            self.send_unconfirmed = false;
+            self.dirty = true;
         }
-        let before = self.text.clone();
-        if self.text == self.server_text || self.text == text {
-            self.edit(text.into());
-        } else if !text.is_empty() {
-            let added = text
-                .strip_prefix(&self.server_text)
-                .unwrap_or(text)
-                .trim_start_matches('\n');
-            if !added.is_empty() {
-                let mut merged = self.text.clone();
-                if !merged.is_empty() {
-                    merged.push_str("\n\n");
-                }
-                merged.push_str(added);
-                self.edit(merged);
+    }
+    /// 只读副本更新不能盖掉本地未持久化的编辑或组词。
+    pub fn observe(&mut self, remote: nd_wire::Draft, composing: bool) {
+        if self
+            .remote
+            .as_ref()
+            .is_none_or(|old| remote.version >= old.version)
+        {
+            self.remote = Some(remote);
+        }
+        self.adopt_remote(composing);
+    }
+    fn adopt_remote(&mut self, composing: bool) {
+        if !composing
+            && !self.send_unconfirmed
+            && !self.dirty
+            && self.pending.is_none()
+            && let Some(remote) = &self.remote
+        {
+            if self.text != remote.text {
+                self.text.clone_from(&remote.text);
+                self.revision += 1;
+            }
+            self.base = remote.version;
+        }
+    }
+    /// 每会话至多一个在途保存；未知结果保留原命令，needs_receipt 时只能查收据。
+    pub fn save_command(
+        &mut self,
+        session: &str,
+        device: &str,
+        id: &str,
+    ) -> Option<nd_wire::Command> {
+        if let Some((_, command)) = &self.pending {
+            return Some(command.clone());
+        }
+        if !self.dirty || self.remote.is_none() || self.send_unconfirmed {
+            return None;
+        }
+        let command = nd_wire::Command {
+            id: id.into(),
+            device: device.into(),
+            name: "session.draft.update".into(),
+            args: serde_json::json!(nd_wire::DraftUpdate {
+                session: session.into(),
+                text: self.text.clone()
+            }),
+            expect: serde_json::json!(nd_wire::DraftExpected {
+                draft_version: self.base
+            }),
+        };
+        self.pending = Some((self.revision, command.clone()));
+        Some(command)
+    }
+    pub fn saved(&mut self, result: nd_wire::DraftUpdated, composing: bool) {
+        self.save_unconfirmed = false;
+        if let Some((revision, _)) = self.pending.take() {
+            if revision == self.revision {
+                self.dirty = false;
+            }
+            // 成功后续写自己的新版本；落败后的继续编辑仍按原基准另存。
+            if result.saved.is_none() {
+                self.base = result.draft.version;
             }
         }
-        self.server_text = text.into();
-        self.server_version = Some(version);
-        self.text != before
+        self.observe(result.draft, composing);
     }
-
+    /// 清稿来自发送事务的结果，不能再补发一条无条件清空命令。
+    pub fn sent(&mut self, revision: u64, remote: nd_wire::Draft, composing: bool) {
+        if revision == self.revision {
+            self.dirty = false;
+        }
+        if remote.version == self.base + 1 && remote.text.is_empty() {
+            self.base = remote.version;
+        }
+        self.observe(remote, composing);
+    }
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -230,8 +309,10 @@ impl Draft {
     }
     pub fn edit(&mut self, text: String) {
         if self.text != text {
+            self.send_unconfirmed = false;
             self.text = text;
             self.revision += 1;
+            self.dirty = true;
         }
     }
     pub fn accept(&mut self, revision: u64) -> bool {

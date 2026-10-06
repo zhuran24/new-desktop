@@ -47,7 +47,7 @@ impl Desktop {
     fn control(&mut self, name: &str, args: Value, cx: &mut Context<Self>) {
         let command = Command {
             id: uuid::Uuid::new_v4().to_string(),
-            device: "desktop".into(),
+            device: self.device.clone(),
             expect: json!({}),
             name: name.into(),
             args,
@@ -82,11 +82,8 @@ impl Desktop {
         let key = self.draft_key();
         let draft = self.drafts.entry(key.clone()).or_default();
         draft.edit(current.text);
-        let Some(version) = draft.server_version() else {
-            return;
-        };
+        let version = draft.version();
         let text = draft.text().to_owned();
-        draft.preparing_restore();
         self.control(
             "session.withdraw",
             json!({"session":key,"message":message,"draft":{"version":version,"text":text}}),
@@ -101,11 +98,8 @@ impl Desktop {
         let key = self.draft_key();
         let draft = self.drafts.entry(key.clone()).or_default();
         draft.edit(current.text);
-        let Some(version) = draft.server_version() else {
-            return;
-        };
+        let version = draft.version();
         let text = draft.text().to_owned();
-        draft.preparing_restore();
         self.control(
             "session.interrupt",
             json!({"session":key,"queued":"cancel","draft":{"version":version,"text":text}}),

@@ -17,8 +17,7 @@ pub const NAMESPACE: &str = "session";
 #[serde(tag = "shown", rename_all = "snake_case")]
 pub enum Shown {
     Draft {
-        text: String,
-        version: u64,
+        draft: nd_wire::Draft,
     },
     Control {
         id: String,
@@ -109,11 +108,11 @@ impl Shown {
     fn render(&self, seq: u64, accumulated: Option<&str>) -> Item {
         let id = self.id();
         let (kind, mut data, title, text) = match self {
-            Shown::Draft { text, version } => (
+            Shown::Draft { draft } => (
                 "draft",
-                json!({"text":text,"version":version}),
-                "草稿".into(),
-                shorten(text),
+                serde_json::to_value(draft).expect("draft value"),
+                "草稿".to_owned(),
+                shorten(&draft.text),
             ),
             Shown::Control { id, state, outcome } => (
                 "control",

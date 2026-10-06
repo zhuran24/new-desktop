@@ -2,6 +2,7 @@
 mod chat;
 pub mod composer;
 mod controls;
+mod drafts;
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
@@ -34,6 +35,9 @@ pub struct Desktop {
     send_intent: String,
     escape: nd_view_model::EscapeState,
     started: std::time::Instant,
+    device: String,
+    draft_writes: std::collections::BTreeSet<String>,
+    queued_send: Option<(String, String, u64, String)>,
     drafts: std::collections::BTreeMap<Option<String>, nd_view_model::Draft>,
     subscriptions: Vec<Subscription>,
     composer: Entity<composer::Composer>,
@@ -51,6 +55,8 @@ pub struct Desktop {
     last_report: Option<Snapshot>,
     #[cfg(feature = "scenarios")]
     last_session_report: Option<Snapshot>,
+    #[cfg(feature = "scenarios")]
+    last_editor_report: Option<serde_json::Value>,
 }
 impl Desktop {
     pub fn new(
@@ -146,6 +152,9 @@ impl Desktop {
             send_intent: "fold".into(),
             escape: Default::default(),
             started: std::time::Instant::now(),
+            device: format!("desktop-{}", uuid::Uuid::new_v4()),
+            draft_writes: Default::default(),
+            queued_send: None,
             drafts: Default::default(),
             subscriptions: vec![],
             composer,
@@ -163,6 +172,8 @@ impl Desktop {
             last_report: None,
             #[cfg(feature = "scenarios")]
             last_session_report: None,
+            #[cfg(feature = "scenarios")]
+            last_editor_report: None,
         };
         this.connect_chat(window, cx);
         Ok(this)
@@ -259,6 +270,16 @@ pub fn apply_theme(theme: &Theme, cx: &mut App) {
 impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(feature = "scenarios")]
+        {
+            let editor = self.composer.update(cx, |c, cx| c.snapshot(window, cx));
+            let report = serde_json::json!({"text":editor.text,"composing":editor.composing,
+                "saved": self.drafts.get(&self.draft_key()).is_some_and(|d| d.is_saved() && d.text() == editor.text)});
+            if self.last_editor_report.as_ref() != Some(&report) {
+                println!("{}", serde_json::json!({"rendered_editor":report}));
+                self.last_editor_report = Some(report);
+            }
+        }
+        #[cfg(feature = "scenarios")]
         if self.snapshot != self.last_report {
             if let Some(snapshot) = &self.snapshot {
                 println!("{}", serde_json::json!({"rendered_snapshot": snapshot}));
@@ -283,6 +304,7 @@ impl Render for Desktop {
         let chat_sidebar = self.chat_sidebar(cx);
         let chat_content = self.chat_content(window, cx);
         let controls = self.chat_controls(cx);
+        let draft_panel = (!self.creating).then(|| self.draft_panel(window, cx));
         let theme = &self.theme;
         div()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -372,6 +394,7 @@ impl Render for Desktop {
                                 div()
                                     .p(px(theme.spacing.medium))
                                     .child(controls)
+                                    .children(draft_panel)
                                     .child(self.composer.clone()),
                             ),
                     )
