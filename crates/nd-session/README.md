@@ -8,7 +8,7 @@
 
 | 接口 | 用法 |
 |---|---|
-| `Sessions::new(store, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
+| `Sessions::new(store, blobs, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
 | `Sessions::recover()` | 守护进程启动时装载有活进程、进行中操作或未结票的会话，交端口 `adopt` 对账 |
 | `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`；不是会话命令时返回 None |
 | `Sessions::subscribe(&SessionId, since)` | `session/<id>` 流：快照或同纪元续上的事件，外加 `WatchGuard`（持有期间算「有人在看」） |
@@ -42,8 +42,8 @@
 
 ### 撤回与停止（#18）
 
-- `session.withdraw`：`args:{session,message,draft?:{version,text}}`。可选 draft 是界面在操作开始时看到的草稿基准，不是无条件保存。`Done{withdrawal,message}` 只表示持久受理；`prompt.state=withdrawing/withdrawn` 与 `control/<命令 id>` 给最终结果。已不在发送台的消息回 `not_withdrawable`，重复在途撤回回 `withdrawing`。
-- `session.interrupt`：`args:{session,queued?:"keep"|"cancel",draft?:{version,text}}`，默认 keep。没有活进程回 `Done{idle:true}`；否则 `Done{control}` 是持久受理。`control.state=acknowledged` 只表示停止请求被确认，回合结束仍看 turn/header。Cancel 未获后端能力声明时拒绝；取消成功的消息按发送台到达顺序合成一份回填。
+- `session.withdraw`：`args:{session,message,draft?:{version,text,attachments?}}`。可选 draft 是界面在操作开始时看到的草稿基准，不是无条件保存。`Done{withdrawal,message}` 只表示持久受理；`prompt.state=withdrawing/withdrawn` 与 `control/<命令 id>` 给最终结果。已不在发送台的消息回 `not_withdrawable`，重复在途撤回回 `withdrawing`。
+- `session.interrupt`：`args:{session,queued?:"keep"|"cancel",draft?:{version,text,attachments?}}`，默认 keep。没有活进程回 `Done{idle:true}`；否则 `Done{control}` 是持久受理。`control.state=acknowledged` 只表示停止请求被确认，回合结束仍看 turn/header。Cancel 未获后端能力声明时拒绝；取消成功的消息按发送台到达顺序合成一份回填。
 - 成功撤回将原 Send 票结为 `Refused::Withdrawn`，在同事务通过 `Core::update_draft` 回填。保存操作开始时的版本、正文、设备；并发编辑时以稳定 `return/<命令 id>` 另存，不能覆盖新稿。撤回 false 不改变原 Send；未知结果不回填、不重投。迟到的撤回错误不能覆盖已经确认的送达。
 - `header.interaction` 给三种发送意图、withdraw、interrupt、cancel_queued、interrupt_spares_background、immediate_preserves_mcp 和 rewind_menu。界面按这些中立能力呈现，不能解读 Claude 的私有字段。
 
@@ -129,3 +129,6 @@
 
 
 #18 在同一崩溃矩阵追加三行：`withdraw/queued`（撤回并仅回填一次）、`interrupt/queued`（等待中控制仍受理、保留队列）、`interrupt/cancel-queue`（停止并仅回填一次）。另有控制窄接缝测试：Busy 不是终结、未知撤回不回填、迟到的撤回错误不覆盖送达。真 CLI/界面恢复证据见 [#18 验证记录](../../docs/verification/ticket-18.md)。
+
+
+撤回保存文字与附件引用。操作在途用 `return/<会话>/<命令 id>` 保留基准草稿附件，完成事务再交给当前稿或 `draft-saved` owner，并释放在途引用；原提示的 message 引用仍保留。多条排队输入合回草稿时按到达顺序追加正文、去重相同附件；若合并后超过单条消息的附件上限，需在编辑器删减到限制内再发送，不能静默丢附件。

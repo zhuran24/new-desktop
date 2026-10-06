@@ -1,4 +1,5 @@
 //! GPUI 适配层。能力视图经 Slots 登记，领域事实只来自 nd-wire。
+mod attachments;
 mod chat;
 pub mod composer;
 mod controls;
@@ -35,6 +36,8 @@ pub struct Desktop {
     send_intent: String,
     escape: nd_view_model::EscapeState,
     started: std::time::Instant,
+    uploading: usize,
+    images: std::collections::BTreeMap<String, Option<std::sync::Arc<Image>>>,
     device: String,
     draft_writes: std::collections::BTreeSet<String>,
     queued_send: Option<(String, String, u64, String)>,
@@ -152,6 +155,8 @@ impl Desktop {
             send_intent: "fold".into(),
             escape: Default::default(),
             started: std::time::Instant::now(),
+            uploading: 0,
+            images: Default::default(),
             device: format!("desktop-{}", uuid::Uuid::new_v4()),
             draft_writes: Default::default(),
             queued_send: None,
@@ -272,7 +277,7 @@ impl Render for Desktop {
         #[cfg(feature = "scenarios")]
         {
             let editor = self.composer.update(cx, |c, cx| c.snapshot(window, cx));
-            let report = serde_json::json!({"text":editor.text,"composing":editor.composing,
+            let report = serde_json::json!({"text":editor.text,"composing":editor.composing,"attachments": self.drafts.get(&self.draft_key()).map(|d| d.attachments()).unwrap_or_default(),
                 "saved": self.drafts.get(&self.draft_key()).is_some_and(|d| d.is_saved() && d.text() == editor.text)});
             if self.last_editor_report.as_ref() != Some(&report) {
                 println!("{}", serde_json::json!({"rendered_editor":report}));
@@ -304,6 +309,7 @@ impl Render for Desktop {
         let chat_sidebar = self.chat_sidebar(cx);
         let chat_content = self.chat_content(window, cx);
         let controls = self.chat_controls(cx);
+        let attachments = self.draft_attachments(cx);
         let draft_panel = (!self.creating).then(|| self.draft_panel(window, cx));
         let theme = &self.theme;
         div()
@@ -392,8 +398,24 @@ impl Render for Desktop {
                             )
                             .child(
                                 div()
+                                    .id("attachment-drop")
+                                    .on_drop(cx.listener(
+                                        |this, paths: &ExternalPaths, window, cx| {
+                                            this.upload_attachments(
+                                                paths
+                                                    .0
+                                                    .iter()
+                                                    .cloned()
+                                                    .map(nd_ui_core::AttachmentSource::Path)
+                                                    .collect(),
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    ))
                                     .p(px(theme.spacing.medium))
                                     .child(controls)
+                                    .child(attachments)
                                     .children(draft_panel)
                                     .child(self.composer.clone()),
                             ),

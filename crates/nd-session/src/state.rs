@@ -112,6 +112,8 @@ pub enum Issuer {
 /// 控制操作开始时看到的草稿基准；完成时版本已变化就走 #16 的另存稿。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftRestore {
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
     pub version: u64,
     pub text: String,
     pub device: String,
@@ -120,6 +122,8 @@ pub struct DraftRestore {
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
     pub id: String,
     pub text: String,
     pub intent: Intent,
@@ -160,11 +164,13 @@ impl Core {
         device: &str,
         base: u64,
         text: String,
+        attachments: Vec<nd_wire::Attachment>,
     ) -> nd_wire::DraftUpdated {
         let saved = if base != self.draft.version {
             self.draft.saved.push(nd_wire::SavedDraft {
                 id: id.into(),
                 base_version: base,
+                attachments,
                 text,
                 device: device.into(),
             });
@@ -172,6 +178,7 @@ impl Core {
         } else {
             self.draft.version += 1;
             self.draft.text = text;
+            self.draft.attachments = attachments;
             self.draft.device = device.into();
             None
         };

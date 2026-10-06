@@ -155,6 +155,18 @@
 | SEND-INTERRUPT | 普通 `interrupt`；perTaskStopAffordance 后保后台，ACK 与 result 分离；ADR 0008、R10-E1 | `escape_ends…`、`escape_preserves_background_bash_agent_and_workflow_until_their_results_arrive`；三类后台完成通知均到实际模型请求 | 声明失效时范围标为会停后台任务；不以空白 now 或关闭 stdin 代替 |
 | SEND-CANCEL-QUEUE | `system/init.capabilities` 声明 interrupt_cancel_queued_v1；`cancel_queued:true` 回 cancelled UUID 列表 | `explicit_stop_and_cancel_queue_restores_each_queued_message_once`；只恢复明确取消的消息 | 不声明就拒绝并隐藏入口；缺列表是 Unknown，不当成空队列或取消成功 |
 | SEND-E2B | `CLAUDE_AUTO_BACKGROUND_TASKS=1` 下立即发送使可后台化的前台 MCP 转后台；规格第 2 步 E2b | `e2b_send_now_moves_foreground_mcp_to_background_and_delivers_its_result`：真实 MCP 已执行且尚未放 FIFO，立即发送收到 background task，放行后结果回主对话，服务端无取消通知；正式启动模板固定启用该变量 | 若升级后此场景不成立，撤掉变量，能力表禁用保留前台 MCP，界面说明会中断；不以超时自动后台化代替 send-now 场景 |
-| SEND-E2B-AGENT | 同开关影响 Agent 后台策略；固定二进制 `$o` 源码偏移 215204979、Agent schema 215205094 附近 | `auto_background_keeps_an_explicit_foreground_agent_completable`：显式 false 在当前模板仍异步启动，主回合先继续，代理随后正常完成 | 不承诺 Agent 必定同步，也不把源码中的 120000 ms 分支当作该模板实测延迟；升级需重跑并记录实际策略 |
+| SEND-E2B-AGENT | 同开关影响 Agent 后台策略；固定二进制的开关读取 @215204979 与 Agent schema 中的异步策略说明 | `auto_background_keeps_an_explicit_foreground_agent_completable`：显式 false 在当前模板仍异步启动，主回合先继续，代理随后正常完成 | 不承诺 Agent 必定同步，也不把源码中的 120000 ms 分支当作该模板实测延迟；升级需重跑并记录实际策略 |
 
 E2b 本轮的无变量对照也能后台化，不能把结果归因为该变量的唯一作用。采用规格主方案是在启用变量的正式模板上验证行为成立。MCP 后台准入仍由 CLI 决定，能力说明只覆盖可后台化调用。没有新增应用写 CLI 原生存储的例外。
+## 附件输入（#17）
+
+固定 CLI 2.1.289，字节指纹同 #13。协议依据：`research/protocol.md` §3.3、`research/impl/INDEX.md` #17，以及本单真实产品主接缝请求。详细验证与平台退路见 [ticket-17](verification/ticket-17.md)。
+
+| 编号 | 依赖 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|
+| ATTACH-IMAGE | stream-json user.content 的 image/source{type:base64,media_type,data} 接受 PNG/JPEG/GIF/WebP；图片原字节进实际模型请求 | `attachments_reach_the_model_and_remain_in_the_conversation`、`jpeg_gif_and_webp_attachments_reach_the_model_with_their_original_bytes` | 不发送伪路径或静默丢图；受影响候选不放行，保留当前钉版 |
+| ATTACH-FILE | PDF 以 document/source{type:base64,media_type:application/pdf,data} 输入；普通 UTF-8 文件以标注名称的 text 块输入；可以没有额外正文 | `files_without_caption_reach_the_model_and_survive_restart_and_collection`：实际请求正文、PDF 原字节、纯附件创建/发送和重启后引用 | 非 UTF-8 或未支持的二进制格式明确拒绝，要求转换文件；候选改变 PDF 支持则不放行 |
+| DIFF-EDIT | Claude 的 Edit 工具块保留 name 和 input.file_path/old_string/new_string，供片段 diff 使用（出处：CLI 工具声明与本单实际 Read → Edit 往返） | `real_edit_tool_exposes_the_replaced_text_for_diff_display`；纯视图测试核片段行号与内容 | 缺少字段时保留原工具条目后备文字，不猜文件内容 |
+| ATTACH-SIZE | 大于旧看守单行界限的消息仍能经固定 CLI 到模型；正常回显照常结票 | `a_multi_megabyte_attachment_is_not_lost_at_the_watchdog_frame_boundary`：2,400,000 字节全文；原生粘贴场景核对多个内容块 | 编码后超过看守单行界限时在写前明确失败，正文及引用保留；不把确定未写出算成 Unknown |
+
+没有写 CLI 原生记录。新建与发送继续使用原动作、UUID 和收据契约，崩溃矩阵增加 `create-and-send/attachments` 和 `create/attachments-open-fails`；上传正文只经 Blobs HTTP，持久动作只存引用。

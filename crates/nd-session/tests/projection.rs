@@ -25,6 +25,7 @@ fn shown() -> impl Strategy<Value = Shown> {
             prop_oneof![Just("held"), Just("written"), Just("landed")]
         )
             .prop_map(|(i, state)| Shown::Prompt {
+                attachments: vec![],
                 id: format!("p{i}"),
                 text: "hi".into(),
                 intent: "fold".into(),

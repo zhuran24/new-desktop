@@ -29,7 +29,7 @@ def inner():
         handles.extend([stdout, stderr])
         args = ['/nd-desktop', '--socket', socket, '--state', f'/sandbox/state/{device}.json', '--quit-after', '45']
         if create:
-            args += ['--scenario-create', json.dumps({'cwd': '/sandbox/project', 'model': 'haiku', 'text': '请写代码'})]
+            args += ['--scenario-create', json.dumps({'cwd': '/sandbox/project', 'model': 'haiku', 'text': '请写代码', 'attachments': settings.get('attachments', False)})]
         if draft is not None:
             args += ['--scenario-draft', json.dumps(draft)]
         process = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=dict(os.environ, WAYLAND_DEBUG='client'))
@@ -50,6 +50,7 @@ def inner():
                 if value is not None and predicate(value):
                     return value
             time.sleep(0.03)
+        screenshot('timeout')
         raise AssertionError(f'{name} never reached expected state: {(out / (name + ".jsonl")).read_text()[-4000:]}')
 
     def block(snapshot):
@@ -118,6 +119,18 @@ def inner():
         light = wait('light', lambda s: block(s) is not None and block(s)['data']['complete'] is True)
         assert block(light) == block(finished)
         screenshot('light')
+        if settings.get('attachments'):
+            app.terminate()
+            app.wait(timeout=5)
+            settings['drafts'] = True
+            app = start('attached-draft', draft={'text': '待发送的材料', 'file': '/sandbox/pasted.txt'})
+            saved = wait('attached-draft', lambda s: s['text'] == '待发送的材料' and s['saved'] and len(s.get('attachments', [])) == 1)
+            app.kill()
+            assert app.wait(timeout=5) == -9
+            app = start('attached-draft-reopened')
+            wait('attached-draft-reopened', lambda s: s['text'] == '待发送的材料' and s['saved'] and s.get('attachments') == saved['attachments'])
+            screenshot('attached-draft-reopened')
+            settings['drafts'] = False
         for name in ['creating', 'reopened', 'light']:
             assert re.search(r'wl_surface#\d+\.attach\(wl_buffer#', (out / f'{name}.log').read_text()), name
         (out / 'result.json').write_text(json.dumps({'pass': True, 'session': finished['stream'].removeprefix('session/'),
@@ -143,7 +156,11 @@ def run(args, script=None):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None, 'session': args.session}))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None, 'session': args.session, 'attachments': args.attachments}))
+        if args.attachments:
+            shutil.copy(Path(__file__).resolve().parents[2] / 'nd-daemon/tests/fixtures/preview.png', work / 'pixel.png')
+            (work / 'pasted.txt').write_text('复制文件里的中文正文')
+            (work / 'dropped.txt').write_text('拖入文件里的独立正文')
         (work / 'dbus.conf').write_text('<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen><policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/></policy></busconfig>')
         (work / 'session.sh').write_text('#!/bin/sh\nexec /usr/bin/python /scenario.py --inner\n')
         (work / 'session.sh').chmod(0o700)
@@ -184,5 +201,6 @@ if __name__ == '__main__':
         parser.add_argument('--desktop', required=True)
         parser.add_argument('--socket', required=True)
         parser.add_argument('--output', required=True)
+        parser.add_argument('--attachments', action='store_true')
         parser.add_argument('--session', help='run the draft editor scenario for this session')
         run(parser.parse_args())

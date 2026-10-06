@@ -86,6 +86,7 @@ struct Inner {
     generation: u64,
     runtime: tokio::runtime::Handle,
     config: ClaudeBackendConfig,
+    blobs: Arc<nd_store::Blobs>,
     inboxes: Mutex<HashMap<SessionId, Inbox>>,
     carriers: Mutex<HashMap<CarrierId, Slot>>,
     model_query: tokio::sync::Mutex<()>,
@@ -116,6 +117,7 @@ impl ClaudeBackend {
         watchdogs: Arc<Watchdogs>,
         claims: Arc<Exclusivity>,
         generation: u64,
+        blobs: Arc<nd_store::Blobs>,
         config: ClaudeBackendConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -126,6 +128,7 @@ impl ClaudeBackend {
                 generation,
                 runtime: tokio::runtime::Handle::current(),
                 config,
+                blobs,
                 inboxes: Mutex::new(HashMap::new()),
                 carriers: Mutex::new(HashMap::new()),
                 model_query: tokio::sync::Mutex::new(()),
@@ -755,15 +758,63 @@ impl Actor {
                     Intent::AfterTurn => "later",
                     Intent::Interrupting => "now",
                 };
+                let blobs = self.inner.blobs.clone();
+                let message = msg.clone();
+                let content = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
+                    use base64::Engine;
+                    let mut content = vec![];
+                    if !message.text.is_empty() { content.push(json!({"type":"text","text":message.text})); }
+                    for attachment in &message.attachments {
+                        let bytes = blobs.get(&attachment.blob).map_err(|e| e.to_string())?;
+                        if attachment.media_type == "text/plain" {
+                            let text = String::from_utf8(bytes).map_err(|_| format!("{} 不是 UTF-8 文本", attachment.name))?;
+                            content.push(json!({"type":"text","text":format!("附件 {}：\n{}", serde_json::to_string(&attachment.name).unwrap(), text)}));
+                        } else {
+                            let kind = if attachment.media_type == "application/pdf" { "document" } else { "image" };
+                            content.push(json!({"type":kind,"source":{"type":"base64","media_type":attachment.media_type,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}}));
+                        }
+                    }
+                    Ok(content)
+                }).await;
+                let content = match content {
+                    Ok(Ok(content)) => content,
+                    error => {
+                        self.inner
+                            .deliver_facts(
+                                &self.session,
+                                &self.carrier,
+                                vec![done(
+                                    &ticket,
+                                    Outcome::failed(format!("读取附件失败：{error:?}")),
+                                )],
+                            )
+                            .await;
+                        return;
+                    }
+                };
                 let frame = json!({
                     "type": "user",
                     "uuid": uuid,
                     "session_id": self.bs,
                     "parent_tool_use_id": null,
-                    "message": {"role": "user", "content": [{"type": "text", "text": msg.text}]},
+                    "message": {"role": "user", "content": content},
                     "priority": priority,
                     "origin": {"kind": "human"},
                 });
+                // 在写出之前判定确定的超限；不能把一个从未写出的附件误标为交付不明。
+                if frame.to_string().len() > nd_watchdog_proto::MAX_FRAME / 4 {
+                    self.inner
+                        .deliver_facts(
+                            &self.session,
+                            &self.carrier,
+                            vec![done(
+                                &ticket,
+                                Outcome::failed("消息编码后过大，请减少附件或正文"),
+                            )],
+                        )
+                        .await;
+                    return;
+                }
                 self.pending.insert(uuid.clone(), ticket.clone());
                 #[cfg(feature = "scenarios")]
                 self.stop_fault(&msg.text);

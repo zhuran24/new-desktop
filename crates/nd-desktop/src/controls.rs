@@ -84,9 +84,10 @@ impl Desktop {
         draft.edit(current.text);
         let version = draft.version();
         let text = draft.text().to_owned();
+        let attachments = draft.attachments().to_vec();
         self.control(
             "session.withdraw",
-            json!({"session":key,"message":message,"draft":{"version":version,"text":text}}),
+            json!({"session":key,"message":message,"draft":{"version":version,"text":text,"attachments":attachments}}),
             cx,
         );
     }
@@ -100,9 +101,10 @@ impl Desktop {
         draft.edit(current.text);
         let version = draft.version();
         let text = draft.text().to_owned();
+        let attachments = draft.attachments().to_vec();
         self.control(
             "session.interrupt",
-            json!({"session":key,"queued":"cancel","draft":{"version":version,"text":text}}),
+            json!({"session":key,"queued":"cancel","draft":{"version":version,"text":text,"attachments":attachments}}),
             cx,
         );
     }

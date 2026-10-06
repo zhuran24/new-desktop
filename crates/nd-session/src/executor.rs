@@ -55,6 +55,7 @@ pub(crate) struct Shared {
 #[derive(Clone)]
 pub(crate) struct Deps {
     pub store: Arc<Store>,
+    pub blobs: Arc<nd_store::Blobs>,
     pub claims: Arc<Exclusivity>,
     pub backends: Backends,
     pub config: EngineConfig,
@@ -458,11 +459,28 @@ impl Executor {
                         json!({"need":["text", "expect.draft_version"]}),
                     ));
                 };
+                let attachments = match self.attachments(tx, command) {
+                    Ok(a) => a,
+                    Err(why) => return Ok(rejected("invalid_attachment", json!({"reason":why}))),
+                };
+                let owner = if expected.draft_version == self.core.draft.version {
+                    let owner = format!("draft/{}", self.id);
+                    for a in &self.core.draft.attachments {
+                        self.deps.blobs.release(tx, &a.blob, &owner)?;
+                    }
+                    owner
+                } else {
+                    format!("draft-saved/{}/{}", self.id, command.id)
+                };
+                for a in &attachments {
+                    self.deps.blobs.hold(tx, &a.blob, &owner)?;
+                }
                 let result = self.core.update_draft(
                     &command.id,
                     &command.device,
                     expected.draft_version,
                     args.text,
+                    attachments,
                 );
                 Ok(Receipt::Done {
                     value: json!(result),
@@ -474,10 +492,63 @@ impl Executor {
                 if !self.born {
                     return Ok(rejected("not_found", Value::Null));
                 }
-                self.send(command)
+                self.send(tx, command)
             }
             _ => Ok(rejected("not_found", Value::Null)),
         }
+    }
+
+    fn attachments(
+        &self,
+        tx: &Tx<'_>,
+        command: &Command,
+    ) -> Result<Vec<nd_wire::Attachment>, String> {
+        let attachments: Vec<nd_wire::Attachment> = serde_json::from_value(
+            command
+                .args
+                .get("attachments")
+                .cloned()
+                .unwrap_or(json!([])),
+        )
+        .map_err(|e| format!("附件引用格式错误：{e}"))?;
+        if attachments.len() > 8 {
+            return Err("每条消息最多 8 个附件".into());
+        }
+        let mut total = 0;
+        for a in &attachments {
+            a.validate()?;
+            if self
+                .deps
+                .blobs
+                .size(tx, &a.blob)
+                .map_err(|e| e.to_string())?
+                != Some(a.size)
+            {
+                return Err(format!(
+                    "附件 {} 缺失、大小不符或正在清理；请重新上传",
+                    a.name
+                ));
+            }
+            total += a.size;
+        }
+        if total > 16 * 1024 * 1024 {
+            return Err("每条消息的附件总大小不能超过 16 MiB".into());
+        }
+        Ok(attachments)
+    }
+
+    fn hold_attachments(
+        &self,
+        tx: &mut Tx<'_>,
+        command: &Command,
+        attachments: &[nd_wire::Attachment],
+    ) -> nd_store::Result<()> {
+        for a in attachments {
+            self.deps
+                .blobs
+                .hold(tx, &a.blob, &format!("message/{}/{}", self.id, command.id))?;
+        }
+        Ok(())
     }
 
     fn create(
@@ -495,7 +566,9 @@ impl Executor {
         let (Some(cwd), Some(text)) = (args["cwd"].as_str(), args["text"].as_str()) else {
             return Ok(rejected("invalid", json!({"need":["cwd","text"]})));
         };
-        if !cwd.starts_with('/') || text.trim().is_empty() {
+        if !cwd.starts_with('/')
+            || (text.trim().is_empty() && args["attachments"].as_array().is_none_or(Vec::is_empty))
+        {
             return Ok(rejected(
                 "invalid",
                 json!({"cwd":"须为绝对路径","text":"不能为空"}),
@@ -508,6 +581,11 @@ impl Executor {
         if !self.deps.backends.supports(&kind) {
             return Ok(rejected("unsupported", json!({"backend": backend})));
         }
+        let attachments = match self.attachments(tx, command) {
+            Ok(a) => a,
+            Err(why) => return Ok(rejected("invalid_attachment", json!({"reason":why}))),
+        };
+        self.hold_attachments(tx, command, &attachments)?;
         let optional = |key: &str| args[key].as_str().map(str::to_owned);
         self.core = Core {
             meta: Some(Meta {
@@ -531,6 +609,7 @@ impl Executor {
             tx,
             fx,
             OpSpec::Create(Create {
+                attachments,
                 text: text.to_owned(),
             }),
             Some(command.id.clone()),
@@ -541,8 +620,8 @@ impl Executor {
         })
     }
 
-    fn return_draft(&self, command: &Command) -> Result<state::DraftRestore, Receipt> {
-        let (version, text) = if let Some(draft) = command.args.get("draft") {
+    fn return_draft(&self, tx: &Tx<'_>, command: &Command) -> Result<state::DraftRestore, Receipt> {
+        let (version, text, attachments) = if let Some(draft) = command.args.get("draft") {
             let (Some(version), Some(text)) = (draft["version"].as_u64(), draft["text"].as_str())
             else {
                 return Err(rejected(
@@ -550,34 +629,91 @@ impl Executor {
                     json!({"need":["draft.version","draft.text"]}),
                 ));
             };
-            (version, text.to_owned())
+            let context = Command {
+                args: draft.clone(),
+                ..command.clone()
+            };
+            let attachments = self
+                .attachments(tx, &context)
+                .map_err(|why| rejected("invalid_attachment", json!({"reason":why})))?;
+            (version, text.to_owned(), attachments)
         } else {
-            (self.core.draft.version, self.core.draft.text.clone())
+            (
+                self.core.draft.version,
+                self.core.draft.text.clone(),
+                self.core.draft.attachments.clone(),
+            )
         };
         Ok(state::DraftRestore {
             version,
             text,
+            attachments,
             device: command.device.clone(),
         })
     }
 
-    fn refill_draft(&mut self, id: &str, restore: &state::DraftRestore, messages: &[Message]) {
+    fn pin_return(
+        &self,
+        tx: &mut Tx<'_>,
+        id: &str,
+        restore: &state::DraftRestore,
+        hold: bool,
+    ) -> nd_store::Result<()> {
+        let owner = format!("return/{}/{}", self.id, id);
+        for attachment in &restore.attachments {
+            if hold {
+                self.deps.blobs.hold(tx, &attachment.blob, &owner)?;
+            } else {
+                self.deps.blobs.release(tx, &attachment.blob, &owner)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn refill_draft(
+        &mut self,
+        tx: &mut Tx<'_>,
+        id: &str,
+        restore: &state::DraftRestore,
+        messages: &[Message],
+    ) -> nd_store::Result<()> {
         if messages.is_empty() {
-            return;
+            return Ok(());
         }
         let mut text = restore.text.clone();
+        let mut attachments = restore.attachments.clone();
         for message in messages {
-            if !text.is_empty() {
+            if !text.is_empty() && !message.text.is_empty() {
                 text.push_str("\n\n");
             }
             text.push_str(&message.text);
+            for attachment in &message.attachments {
+                if !attachments.contains(attachment) {
+                    attachments.push(attachment.clone());
+                }
+            }
+        }
+        let returned_id = format!("return/{id}");
+        let owner = if restore.version == self.core.draft.version {
+            let owner = format!("draft/{}", self.id);
+            for a in &self.core.draft.attachments {
+                self.deps.blobs.release(tx, &a.blob, &owner)?;
+            }
+            owner
+        } else {
+            format!("draft-saved/{}/{}", self.id, returned_id)
+        };
+        for a in &attachments {
+            self.deps.blobs.hold(tx, &a.blob, &owner)?;
         }
         self.core.update_draft(
-            &format!("return/{id}"),
+            &returned_id,
             &restore.device,
             restore.version,
             text,
+            attachments,
         );
+        Ok(())
     }
 
     fn restore_withdrawn(
@@ -592,7 +728,7 @@ impl Executor {
 
     fn withdraw(
         &mut self,
-        tx: &Tx<'_>,
+        tx: &mut Tx<'_>,
         command: &Command,
         fx: &mut Effects,
     ) -> nd_store::Result<Receipt> {
@@ -610,7 +746,7 @@ impl Executor {
         {
             return Ok(rejected("withdrawing", json!({"message":id})));
         }
-        let restore = match self.return_draft(command) {
+        let restore = match self.return_draft(tx, command) {
             Ok(r) => r,
             Err(receipt) => return Ok(receipt),
         };
@@ -618,6 +754,7 @@ impl Executor {
             let Some(original) = self.core.outbox.get(send).cloned() else {
                 return Ok(rejected("not_withdrawable", json!({"message":id})));
             };
+            self.pin_return(tx, &command.id, &restore, true)?;
             let ticket = Ticket(format!("control:{}", command.id));
             self.core.outbox.insert(
                 ticket.clone(),
@@ -646,7 +783,7 @@ impl Executor {
             self.show_message(tx, fx, &message, "withdrawing", None)?;
         } else {
             self.restore_withdrawn(tx, fx, &message)?;
-            self.refill_draft(&command.id, &restore, &[message]);
+            self.refill_draft(tx, &command.id, &restore, &[message])?;
         }
         Ok(Receipt::Done {
             value: json!({"withdrawal":command.id,"message":id}),
@@ -655,7 +792,7 @@ impl Executor {
 
     fn interrupt(
         &mut self,
-        tx: &Tx<'_>,
+        tx: &mut Tx<'_>,
         command: &Command,
         fx: &mut Effects,
     ) -> nd_store::Result<Receipt> {
@@ -681,7 +818,7 @@ impl Executor {
                     json!({"why":"后端未声明取消排队能力"}),
                 ));
             }
-            let restore = match self.return_draft(command) {
+            let restore = match self.return_draft(tx, command) {
                 Ok(r) => r,
                 Err(receipt) => return Ok(receipt),
             };
@@ -706,12 +843,15 @@ impl Executor {
                 self.restore_withdrawn(tx, fx, message)?;
             }
             if let Some(restore) = restore {
-                self.refill_draft(&command.id, &restore, &held);
+                self.refill_draft(tx, &command.id, &restore, &held)?;
             }
             return Ok(Receipt::Done {
                 value: json!({"idle":true}),
             });
         };
+        if let Some(restore) = &restore {
+            self.pin_return(tx, &command.id, restore, true)?;
+        }
         let ticket = Ticket(format!("control:{}", command.id));
         self.core.outbox.insert(
             ticket.clone(),
@@ -751,27 +891,40 @@ impl Executor {
         })
     }
 
-    fn send(&mut self, command: &Command) -> nd_store::Result<Receipt> {
+    fn send(&mut self, tx: &mut Tx<'_>, command: &Command) -> nd_store::Result<Receipt> {
         let status = self.core.meta().status;
         if status == Status::Withdrawn {
             return Ok(rejected("precondition", json!({"status": status.as_str()})));
         }
-        let Some(text) = command.args["text"]
-            .as_str()
-            .filter(|t| !t.trim().is_empty())
-        else {
+        let Some(text) = command.args["text"].as_str() else {
             return Ok(rejected("invalid", json!({"need":["text"]})));
         };
+        if text.trim().is_empty()
+            && command.args["attachments"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        {
+            return Ok(rejected(
+                "invalid",
+                json!({"reason":"正文和附件不能同时为空"}),
+            ));
+        }
         let intent = match command.args["intent"].as_str().unwrap_or("fold") {
             "fold" => Intent::Fold,
             "after_turn" => Intent::AfterTurn,
             "interrupting" => Intent::Interrupting,
             other => return Ok(rejected("invalid", json!({"intent": other}))),
         };
+        let attachments = match self.attachments(tx, command) {
+            Ok(a) => a,
+            Err(why) => return Ok(rejected("invalid_attachment", json!({"reason":why}))),
+        };
+        self.hold_attachments(tx, command, &attachments)?;
         self.core.arrivals += 1;
         self.core.messages.insert(
             command.id.clone(),
             Message {
+                attachments: attachments.clone(),
                 id: command.id.clone(),
                 text: text.to_owned(),
                 intent,
@@ -784,7 +937,14 @@ impl Executor {
         // 发送与清稿同一事务；旧界面、不同正文和重试均不能清掉后来编辑的草稿。
         if command.expect["draft_version"].as_u64() == Some(self.core.draft.version)
             && self.core.draft.text == text
+            && self.core.draft.attachments == attachments
         {
+            for a in &self.core.draft.attachments {
+                self.deps
+                    .blobs
+                    .release(tx, &a.blob, &format!("draft/{}", self.id))?;
+            }
+            self.core.draft.attachments.clear();
             self.core.draft.version += 1;
             self.core.draft.text.clear();
             self.core.draft.device = command.device.clone();
@@ -840,6 +1000,7 @@ impl Executor {
                         let shown = Shown::Prompt {
                             id: display,
                             text: msg.text.clone(),
+                            attachments: msg.attachments.clone(),
                             intent: intent_name(msg.intent).into(),
                             state: "written".into(),
                             native: Some(native),
@@ -1033,6 +1194,7 @@ impl Executor {
                 Shown::Prompt {
                     id: display,
                     text: msg.text.clone(),
+                    attachments: msg.attachments.clone(),
                     intent: intent_name(msg.intent).into(),
                     state: state.into(),
                     native,
@@ -1047,6 +1209,7 @@ impl Executor {
                 message,
                 restore,
             } => {
+                self.pin_return(tx, &id, &restore, false)?;
                 let state = match &outcome {
                     Outcome::Ok {
                         done: Done::Withdrawn { ok: true },
@@ -1062,7 +1225,7 @@ impl Executor {
                             )?;
                         }
                         self.restore_withdrawn(tx, fx, &message)?;
-                        self.refill_draft(&id, &restore, &[message.clone()]);
+                        self.refill_draft(tx, &id, &restore, &[message.clone()])?;
                         "withdrawn"
                     }
                     Outcome::Ok {
@@ -1134,7 +1297,8 @@ impl Executor {
                     self.restore_withdrawn(tx, fx, message)?;
                 }
                 if let Some(restore) = restore {
-                    self.refill_draft(&id, &restore, &held);
+                    self.refill_draft(tx, &id, &restore, &held)?;
+                    self.pin_return(tx, &id, &restore, false)?;
                 }
                 let state = match &outcome {
                     Outcome::Ok { .. } => "acknowledged",
@@ -1620,6 +1784,7 @@ impl Executor {
             let shown = Shown::Prompt {
                 id: display,
                 text: msg.text.clone(),
+                attachments: msg.attachments.clone(),
                 intent: intent_name(msg.intent).into(),
                 state: "pending".into(),
                 native: None,
@@ -1779,9 +1944,20 @@ impl Executor {
         };
         match (&op.spec, &op.phase) {
             (
-                OpSpec::Create(_),
+                OpSpec::Create(create),
                 Phase::Compensated { reason } | Phase::Rejected { code: reason, .. },
             ) => {
+                // 首条提示还没进入发送步骤时没有历史条目引用附件；撤掉种子一并释放。
+                // 已有提示的失败/交付不明仍保留附件，供用户核对和另发。
+                if !op.entries.contains_key("first") {
+                    for attachment in &create.attachments {
+                        self.deps.blobs.release(
+                            tx,
+                            &attachment.blob,
+                            &format!("message/{}/{}", self.id, self.core.meta().created_by),
+                        )?;
+                    }
+                }
                 if let Some(meta) = &mut self.core.meta {
                     meta.status = Status::Withdrawn;
                     meta.note = Some(reason.clone());
@@ -1834,6 +2010,7 @@ impl Executor {
                 Shown::Prompt {
                     id: m.id.clone(),
                     text: m.text.clone(),
+                    attachments: m.attachments.clone(),
                     intent: intent_name(m.intent).into(),
                     state: "failed".into(),
                     native: None,
@@ -1906,6 +2083,7 @@ impl Executor {
                             to: carrier.id.clone(),
                             msg: nd_backend::Msg {
                                 text: m.text.clone(),
+                                attachments: m.attachments.clone(),
                                 intent: m.intent,
                             },
                         },
@@ -1964,6 +2142,7 @@ impl Executor {
             Shown::Prompt {
                 id: m.id.clone(),
                 text: m.text.clone(),
+                attachments: m.attachments.clone(),
                 intent: intent_name(m.intent).into(),
                 state: state.into(),
                 native: None,

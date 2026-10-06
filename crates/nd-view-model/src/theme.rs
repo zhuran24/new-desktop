@@ -27,6 +27,8 @@ pub struct Colors {
     pub muted: u32,
     pub border: u32,
     pub accent: u32,
+    pub diff_added: u32,
+    pub diff_removed: u32,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Typography {
@@ -61,6 +63,8 @@ impl Theme {
                 muted: 0x555e6eff,
                 border: 0xd5dbe3ff,
                 accent: 0x235ac9ff,
+                diff_added: 0x126936ff,
+                diff_removed: 0xb42332ff,
             },
             ThemeMode::Dark => Colors {
                 background: 0x171a20ff,
@@ -69,6 +73,8 @@ impl Theme {
                 muted: 0xadb6c6ff,
                 border: 0x3a4250ff,
                 accent: 0x9bbaffff,
+                diff_added: 0x8bdda1ff,
+                diff_removed: 0xffa0a8ff,
             },
         };
         Self {

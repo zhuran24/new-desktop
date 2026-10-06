@@ -387,3 +387,6 @@ impl SyncReplica {
         Ok(())
     }
 }
+
+mod attachments;
+pub use attachments::AttachmentSource;
