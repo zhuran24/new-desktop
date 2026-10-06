@@ -51,6 +51,9 @@ def inner():
         return next((i for i in snapshot['items'] if i['kind'] == 'text'), None)
 
     def screenshot(name):
+        # 副本观测在 Render 开始时输出；给 GPUI 提交和 KWin 合成留出呈现窗口。
+        # 这是截图稳定等待，不是输入到上屏的延迟测量。
+        time.sleep(0.25)
         result = subprocess.run(['spectacle', '-b', '-n', '-f', '-o', str(out / f'{name}.png')], capture_output=True,
                                 timeout=10, env=dict(os.environ, QT_QPA_PLATFORM='wayland'))
         assert result.returncode == 0, result.stderr.decode()

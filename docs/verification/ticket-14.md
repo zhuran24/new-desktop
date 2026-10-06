@@ -16,15 +16,15 @@
 
 ## 自动检查
 
-交付基线：实现提交 `04b72aa`，合入 v1 `21d766c`（Already up to date）。测试在工作树 `ticket/14`，构建产物为 `/mnt/wd_external/nd-build/target/ticket-14`，6 jobs，独立 12 GiB/零 swap scope。性质测试使用 512 个样本、固定 seed 20261006。
+交付基线：实现提交 `04b72aa`，集成提交 `0633efc` 合入 v1 `74c4f02`（#15 谱系）；CLI 契约文档保留两单内容。测试在工作树 `ticket/14`，构建产物为 `/mnt/wd_external/nd-build/target/ticket-14`，6 jobs，独立 12 GiB/零 swap scope。性质测试使用 512 个样本、固定 seed 20261006。
 
-- `cargo test --workspace --locked`：149 passed，0 failed，1 ignored（#8 既有的显式真 CLI 现场测试）。
-- `scripts/test-scenarios.sh`：80 passed，0 failed，1 ignored（#6 会触发桌面通知的手动 OOM 项）。本单新增 3 项主接缝/原生场景；无真实模型端点。
+- `cargo test --workspace --locked`：161 passed，0 failed，1 ignored（#8 既有的显式真 CLI 现场测试）。
+- `scripts/test-scenarios.sh`：84 passed，0 failed，1 ignored（#6 会触发桌面通知的手动 OOM 项）。本单新增 3 项主接缝/原生场景；无真实模型端点。
 - `cargo clippy --workspace --all-targets --features nd-daemon/scenarios,nd-testkit/scenarios,nd-claude/scenarios,nd-desktop/scenarios --locked -- -D warnings`：通过。
 - 格式、diff 空白、Python 语法和 shell 语法检查通过；nd-wire/mod Schema 重生成后与提交内容无差异。
-- release 桌面、守护进程和看守构建完成（2m 17s）；桌面 SHA-256 `63879ae2145b6eb94f2c71c75caedac05b751c6ff6af58d1bb14cfeaed4617f5`，构建日志 `release.log`。
+- release 桌面、守护进程和看守构建完成（11.21s）；桌面 SHA-256 `63879ae2145b6eb94f2c71c75caedac05b751c6ff6af58d1bb14cfeaed4617f5`，构建日志 `release-merged.log`。
 
-现场日志目录 `/mnt/wd_external/nd-build/tmp/ticket-14/logs/`，原生最终证据 `/mnt/wd_external/nd-build/tmp/ticket-14/native-final/`（`result.json`、`streaming.png`、`dark.png`、`light.png`、`cleanup.json`、`hashes.txt`）。`result.json` 保存故障前/冷启动/完成三个快照；`cleanup.json` 记录专用单元和临时根已清理。场景使用临时 HOME/CLAUDE_CONFIG_DIR/XDG、bwrap 断网、真实 systemd/SQLite/CLI/mod/看守；原生窗口使用私有 KWin/D-Bus，没有向日常桌面注入输入。
+现场日志目录 `/mnt/wd_external/nd-build/tmp/ticket-14/logs/`，原生最终证据 `/mnt/wd_external/nd-build/tmp/ticket-14/native-presented/`（`result.json`、`streaming.png`、`dark.png`、`light.png`、`cleanup.json`、`hashes.txt`）。`result.json` 保存故障前/冷启动/完成三个快照；`cleanup.json` 记录专用单元和临时根已清理。截图在副本日志后等待呈现再采样，脚本改动后定向原生场景复验通过（`native-presented.log`）；截图等待不用于性能测量。场景使用临时 HOME/CLAUDE_CONFIG_DIR/XDG、bwrap 断网、真实 systemd/SQLite/CLI/mod/看守；原生窗口使用私有 KWin/D-Bus，没有向日常桌面注入输入。
 
 红绿证据 `red-01..07.log`、`green-01..07.log`：模型目录、侧栏、消息投影、跨 executor 命令与恢复、草稿修订、原生场景驱动、会话状态呈现。新增 API 的红灯为编译缺口；原生场景首轮红灯是缺少测试驱动脚本，不冒称捕获了恢复算法缺陷。真实 CLI 的 `haiku` 解析到带日期的模型 ID，场景路由按实际请求安排，产品没有写死此映射。
 
