@@ -15,4 +15,4 @@ limited() {
 limited cargo build -p nd-watchdog -p nd-daemon --features scenarios --locked
 export ND_TEST_WATCHDOG="$CARGO_TARGET_DIR/debug/nd-watchdog"
 export ND_TEST_DAEMON="$CARGO_TARGET_DIR/debug/nd-daemon"
-limited cargo test -p nd-daemon -p nd-testkit --features nd-daemon/scenarios,nd-testkit/scenarios --locked "$@"
+limited cargo test -p nd-daemon -p nd-testkit -p nd-claude --features nd-daemon/scenarios,nd-testkit/scenarios,nd-claude/scenarios --locked "$@"

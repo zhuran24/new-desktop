@@ -2,6 +2,19 @@
 
 日期：2026-10-06。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#5 的离线端点、#6 的 Workflow 流水和 #8 的只读记录契约已通过真 CLI 离线验收；#9 的转换契约区分格式回归与后续真实后端验证。
 
+## 条目格式
+
+规格「版本与升级」要求 New Desktop 用到的每一条 CLI 与 Codex 行为各写一条，升级关卡每次都跑这份清单。每条至少写清四件事：
+
+| 栏 | 写什么 |
+|---|---|
+| 依赖 | 依赖的具体行为，含没公开的内部机制；写到能判断“还成立吗”的粒度 |
+| 出处 | 适用的钉住版本及散列，规格行、研究报告或二进制内嵌 JS 的字节偏移，实测记录的位置 |
+| 自动验证 | 复验这条的测试名（默认套件或场景套件）；只有静态证据的写明“未实测”及原因 |
+| 不成立时的退路 | 规格给的退路；规格没定的写“建议”，不能写成已验收的恢复保证 |
+
+条目可以带编号（如 `MOD-CLEAR`），供关卡报告和后续工单引用；写 CLI 原生存储的例外另带“写完 CLI 能读回、能续接”的往返测试。按工单分节追加，只加不改；某条因升级失效时在原条目下注明版本与处理结果。
+
 ## 离线场景端点与真 CLI（#5）
 
 适用版本：固定 `/mnt/wd_external/nd-build/cli/claude-2.1.289`，SHA-256 `a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348`。测试入口为 `scripts/test-scenarios.sh`，实现与范围见 [nd-testkit](../crates/nd-testkit/README.md)。
@@ -71,3 +84,23 @@
 | 外部目录扫描和进程身份确认不足以封闭“检查后才出现写者”的窗口 | 父规格单写者及常开检测；R12 §2.3.1/§2.3.3 | 默认行为测试覆盖同 id 外部出现、消失、列表隐藏、半文件重读、后台周期补扫 | 后续发现后暂停；不增加每条传输路径各自的第二套准入，也不承诺 OS 文件锁 |
 
 本单没有 CLI 存储写入例外，最后自有叶子只接受自有流水证据，文件检查使用 #8 的纯解析库。`CliCommands::stop` 仅定义并实现短 id 命令边界，本单不调用它实施接管；stop/退出/注册项消失的实际状态机与验证属于 #64。完整验证与 owner 边界见 [验证记录](verification/ticket-12.md)。
+
+## mod 与 Claude 后端进程（#11）
+
+适用版本：固定 `/mnt/wd_external/nd-build/cli/claude-2.1.289`，SHA-256 `a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348`。场景测试都在 `crates/nd-claude/tests/`，经 `scripts/test-scenarios.sh` 运行：真看守进程、断网的 bwrap、临时 HOME/`CLAUDE_CONFIG_DIR`/XDG，只有模型端点换成离线伪端点。实现与时序见 [Claude 适配](../crates/nd-claude/README.md)、[两个 mod](../mods/README.md)。
+
+| 编号 | 依赖 | 出处 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|---|
+| MOD-LAUNCH | 启动模板被接受：stream-json 双向、`--verbose`、`--permission-prompt-tool stdio`、`--replay-user-messages`、`--include-partial-messages`、两个 `--plugin-dir`、`--settings` 内联 JSON、`--session-id`/`--resume`；不带 `--await-initialize` 时也不等 stdin，约 200 ms 内装载 mod、触发 `session.start` | 规格「进程」L231–232；本版本实跑 | `ready.rs`：`pinned_cli_is_ready_after_both_mods_report_the_preset_session_before_initialize`、`backend_gets_the_spec_template_…`（读 `/proc/<pid>/cmdline`） | 关卡不放行该版本，继续钉旧版；参数被拒的按版本改模板 |
+| MOD-ENV | 环境开关按名生效：`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`、`CLAUDE_CODE_FORK_SUBAGENT=1`、`CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true`、`CLAUDE_CODE_SDK_READS_SESSION_STATE=1`、`DISABLE_UPDATES=1`（关自动更新，B289@202660933）、`CLAUDE_CODE_PLUGIN_DIR_WATCH=0`（三态布尔，显式 false 不监视，B289@206370606）；`BUN_OPTIONS` 去掉 | 规格 L234；`research/impl/cli-protocol.md` §1 | `backend_gets_the_spec_template_…` 读 `/proc/<pid>/environ`；基础环境故意带 `BUN_OPTIONS` 预加载不存在的脚本 | 开关改名或失效时关卡不放行；fork、检查点各自的功能验收归 #22 及后续 |
+| MOD-DISABLE | `--settings` 的 `enabledPlugins` 把 `<名>@skills-dir` 设 false，只在本进程关掉四个旧 mod；与用户设置按键合并（用户关掉的仍关，其余 skills-dir mod 照常装载；原 U06） | ADR 0011；规格「两个 mod」 | `backend_gets_the_spec_template_…`：临时 `CLAUDE_CONFIG_DIR/skills/` 放同名小 mod 与对照 mod，按标记文件判断是否装载 | 建议：关卡不放行；不改 owner 的设置或 mod 文件 |
+| MOD-OPTIONS | `pluginConfigs.<mod 名>.options` 传给 `register(on, options)`；值须在 plugin.json 的 `userConfig` 声明 | `research/impl/mod-api.md` §3.2 | 所有场景：hello 里的 `run` 来自 options，mod 能连上 options 给的 socket | 建议：关卡不放行；拿不到 options 的 mod 报不了到，进程按 MOD-HELLO 降级只能聊天 |
+| MOD-STATIC（N5） | 静态检查：钩子须是文件顶层函数，可从本 mod 文件 `import`；`$` 只能传给同一文件的顶层函数、不能跨 import；不许 `import()`；manifest 带 `author` 无警告 | `claude plugin validate` 实测输出；`research/round9/mod-api-map-evidence/static-rules/` | `mods.rs`：`both_mods_pass_the_pinned_cli_static_check_…`（两个 mod 无警告通过，动作 mod 只挂 session.start）、`the_static_check_refuses_passing_dollar_across_an_import` | 规格 N5 退路：每个 mod 单文件分段，共享状态仍集中 |
+| MOD-HELLO（R10-E1） | 先等两个 hello 再写的 initialize 是 CLI 认的第一次：`agents` 进子代理请求的系统提示，`perTaskStopAffordance` 让 Esc 不停后台代理（不声明则同一 Esc 把它停掉：`task_updated killed`、`task_notification stopped`），`forwardSubagentText` 把子代理文字转到 stdout；之后再来的 initialize 不改一次性设置 | 规格 L232、L737；S:L511、S:L993 | `r10_e1.rs` 两个场景（含对照组） | 规格退路：这个进程不派 Codex 子代理，Esc 写明会停后台任务，回退与换后端走降级 |
+| MOD-DIALOG | `supportedDialogKinds` 与 agents、perTaskStopAffordance 同属第一次 initialize 的一次性设置（289 处理分支 B289@226802000 起依次应用这几项）；缺省按“画不了”处理 | S:L511；二进制静态读码 | 间接：`r10_e1.rs` 证明这次 initialize 是第一次。`request_user_dialog` 只在拒答回退等联网/特性开关路径出现，离线触发不了，未实测行为 | 第 2 步声明为空，不依赖它；界面加对话框种类时补实测，失败就不声明该种类 |
+| MOD-SESSION-ID | `$.session.id()`：新建等于 `--session-id`，续接等于 `--resume` 的 id | 本版本实跑（原 U03 的前两种；分叉的指定 id 归后续工单） | `ready.rs`：新建与 `a_resumed_backend_is_ready_…` | 已实现：hello 的 id 对不上不算报到，进程只能聊天；建议关卡不放行 |
+| MOD-CLEAR | `/clear`：`session.end`（`reason:"clear"`、旧 id，此时 `$.session.id()` 仍是旧 id）→ stdout `conversation_reset` → `classic.SessionStart`（`source:"clear"`、新 id，`$.session.id()` 已是新 id）；不再触发 `session.start`；之后 stdout 帧带新 id | 本版本实跑；`mod-api.md` §9（原 U03 的 clear 顺序） | `rebind.rs`：`clear_rebinds_both_mods_to_the_new_session_…`（长轮询 20 s 时 3 s 内完成重绑） | 退路已实现：两个 mod 每轮长轮询前重读 id，重绑最迟延到一个长轮询周期 |
+| MOD-HTTP | `$.http.fetch` 经 `socketPath` 走 unix socket，HTTP/1.1 往返正常；守护进程不在时调用报错而不是挂住，mod 每秒重试。单次 fetch 的 30 s 上限来自 `mod-api.md` §5，本单没有重测，长轮询取 25 s 留出余量 | `mod-api.md` §5、§8 | 所有场景；`restart.rs`：通道丢弃后 mod 自动重连 | 上限变短就缩短长轮询；UDS 不可用则 mod 报不了到，按 MOD-HELLO 降级 |
+| MOD-RELOAD | 模块文件变动后 `reload_plugins` 重载该模块：模块变量清零、`session.start` 再跑 | 本版本实跑（`research/round9/VERIFY.md` E1 是开着目录监视时的旧观察） | `reload.rs` | 退路已实现：代次不同的命令被拒，在途命令按可重发类别重排或记 Unknown |
+
+本节不写 CLI 原生存储（mod 只用协议与 `$`，没有用 `$.store`），也没有新增会话结构或派发操作，不加引擎崩溃矩阵行。mod 往返的录制格式与回放见 Claude 适配说明；已提交 2.1.289 的 `clear-rebind` 录制，默认测试套件回放。

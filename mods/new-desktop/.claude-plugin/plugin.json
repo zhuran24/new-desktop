@@ -1,0 +1,10 @@
+{
+  "name": "new-desktop",
+  "version": "0.1.0",
+  "description": "New Desktop 钩子 mod：经守护进程的 mod 通道报到、接命令、上报事实；不发起会引出模型请求的调用。",
+  "author": { "name": "New Desktop" },
+  "userConfig": {
+    "sock": { "type": "string", "title": "mod 通道", "description": "守护进程 mod 通道的 unix socket 路径", "default": "" },
+    "run": { "type": "string", "title": "后端进程编号", "description": "New Desktop 给这个后端进程的编号", "default": "" }
+  }
+}
