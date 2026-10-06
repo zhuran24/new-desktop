@@ -1,6 +1,6 @@
 # Claude 适配：拉起后端进程与 mod 通道
 
-日期：2026-10-06。`nd-claude` 按规格「进程」的启动模板拉起 Claude Code 后端进程（交给看守进程托管），开 mod 通道等两个 mod 报到，再写 initialize 判定就绪。mod 协议类型在 [`nd-mod-proto`](../nd-mod-proto/src/lib.rs)，两个 mod 在仓库根的 [`mods/`](../../mods/README.md)。实现遵循 ADR 0004、0005、0011、0013。会话引擎和后端端口（`BackendAdapter`）由后续工单接入，本 crate 不持有持久状态。
+日期：2026-10-06。`nd-claude` 按规格「进程」的启动模板拉起 Claude Code 后端进程（交给看守进程托管），开 mod 通道等两个 mod 报到，再写 initialize 判定就绪。mod 协议类型在 [`nd-mod-proto`](../nd-mod-proto/src/lib.rs)，两个 mod 在仓库根的 [`mods/`](../../mods/README.md)。实现遵循 ADR 0004、0005、0011、0013。`ClaudeBackend` 是后端端口 `BackendAdapter`（[`nd-backend`](../nd-backend/src/lib.rs)）的 Claude 实现，由守护进程装配给会话组件；本 crate 不持有持久状态，检查点由会话执行器随批次提交。
 
 ## 接口
 
@@ -60,6 +60,20 @@ argv 逐项传入，不拼 shell：`--output-format stream-json --input-format s
 
 已提交的真 CLI 夹具：[`tests/fixtures/mod/claude/2.1.289/clear-rebind.jsonl`](tests/fixtures/mod/claude/2.1.289/clear-rebind.jsonl)（两次报到、ping、`/clear` 重绑、旧 id 被拒），由 `clear_rebinds_both_mods_…` 场景在 `ND_TEST_EVIDENCE` 目录导出。
 
+## 后端端口的 Claude 实现（#13）
+
+`ClaudeBackend::new(claude, watchdogs, claims, generation, config)` 实现 `BackendAdapter`：
+
+- **拉起**（`Act::Open`）：`Claude::open`（新建用预定的后端会话 id，续接用 `--resume`）；成功后向独占登记报 `Up`（看守报的进程身份、这一代守护进程的控制代次），立即重扫一次 CLI 注册表，让自己的进程按身份认作自有；然后起这个承载位的任务，交 `Opened`（能力表原样存进 `adopt`，供重启接回）和 `Tasks{Drained}`（新进程没有后台任务）。失败时把还活着的进程结束掉，等看守单元清理完、独占登记记下它离开，再交 `Failed`。
+- **承载位任务**：持有看守连接，是唯一的 stdin 写入者。`Send` 写 `{type:"user", uuid:native_uuid(票), priority, origin:{kind:"human"}}`（并入→`next`，本回合后→`later`，打断→`now`）；看守流水里出现这一行的输入记录报 `Written`，CLI 回显同一 uuid 才报 `Landed`。写看守连接出错时换连接，按看守报的已写高水位判断：没写过就用同一输入序号重写（看守按序号去重），判断不了才交付不明。`End{Graceful|Finish}` 写控制请求 `end_session`，`Kill|Discard` 让看守杀进程。每 20 ms 读一页流水，经 `Conversation` 归一成事实交一批；批次带检查点 `{seq, convo}`（流水位置与状态机快照），会话提交后 `committed` 才给看守 ack。
+- **退出**：读到退出记录时，写出了还没回显的票交 `Unknown`，`End` 的票交 `Ended`；等看守单元清理完、向独占登记报 `Gone` 之后才报 `Exited`，所以之后的按需拉起不会撞上旧租约。看守也不在了时读完磁盘上剩下的流水，单元确实没了才按退出（码不明）收。
+- **重启接回**（`adopt`）：承载位的命令队列同步先占住，接回期间交来的票排着，任务起来后按序写出。进程还在：`Claude::adopt` 接回（不重发 initialize），从检查点续读，未结的发送在流水里有输入记录的等回显、没有的证明没写出（`Refused(Withheld)`，引擎另发）。进程不在：写过的交付不明、没写过的证明没写出，报 `Exited`。拉起中途被重启打断的票：从没拉起的证明没做，起了一半的结束掉后报失败。
+- `record_dir` 设了时，把读到的每页看守流水先追加到 `<run>.jsonl` 再处理（ack 之后流水会被看守回收）。守护进程的 `claude.record` 打开它，场景测试据此做录制回归。
+
+`convo::Conversation` 是对话的纯状态机：输入看守流水的记录，输出 `Convo` 事实——`Written`（我方 user 行的输入记录）、`Echo`（带原 uuid 的回显）、`TurnStarted`（主对话的 `system/init`）、`TurnEnded`（`result`，已核 `is_error`）、`Delta`（主对话 `stream_event` 的文字或思考增量，条目 id 是「API 消息 id:块序号」）、`Block`（完整块；工具结果是 `result:<工具调用 id>`）、`Lifecycle`、`Reply`、`Asked`、`Tasks`、`Exit`、`Gap`。子代理的帧不进主对话。收尾判据按 `task_started`、`task_notification`、`task_updated`、`background_tasks_changed` 记在跑的任务；流水丢过行或用过定时事项（`CronCreate`、`ScheduleWakeup`）时是 `Unknown`，不当成空。状态可序列化，随检查点提交，重启后接着用。
+
+对话的录制：主接缝场景 `a_recorded_conversation_replays_through_the_adapter_state_machine` 录下真 CLI 的一段对话（流式文字、工具调用与结果、两个回合），以看守夹具格式存为 [`tests/fixtures/conversation/claude/2.1.289/stream-tool-two-turns.jsonl`](tests/fixtures/conversation/claude/2.1.289/stream-tool-two-turns.jsonl)，事实存为同名 `.facts.json`（设 `ND_RECORD_FIXTURE=<目录>` 运行该场景时重写）。默认套件 `tests/conversation.rs` 回放比对事实，并用改造的输入证明只有原 uuid 的回显算落地、对话投影的最简版与增量版在每个前缀上一致。
+
 ## 测试
 
 默认套件（`cargo test --workspace`）跑协议生成物一致性、录制回放与夹具完整性，不启动 CLI。场景测试用真守护进程场景（独立 slice、bwrap 断网、临时 HOME/`CLAUDE_CONFIG_DIR`/XDG）、真看守进程、钉住的 CLI 2.1.289 和仓库里的两个 mod，只有模型端点换成离线伪端点：
@@ -77,4 +91,6 @@ scripts/test-scenarios.sh -- clear_rebinds   # 也可按测试名过滤
 | `restart.rs`、`reload.rs` | 适配器重启后 mod 重连并可按操作 id 查结果；模块重载换代次 |
 | `mods.rs` | 两个 mod 过 `claude plugin validate`；`$` 跨文件传递被静态检查拒绝（N5 的边界） |
 
-CLI 依赖逐条登记在 [CLI 契约清单](../../docs/cli-contracts.md) 的「mod 与 Claude 后端进程（#11）」一节。
+后端端口这一层的场景在守护进程的 `crates/nd-daemon/tests/sessions.rs`（经 nd-wire 驱动，见[会话组件说明](../nd-session/README.md)）。
+
+CLI 依赖逐条登记在 [CLI 契约清单](../../docs/cli-contracts.md) 的「mod 与 Claude 后端进程（#11）」「第一条 Claude 对话（#13）」两节。

@@ -390,10 +390,11 @@ impl Executor {
             }
             Work::Kick => Ok(None),
             Work::Tick => {
-                if self.idle_due() && self.core.ops.is_empty() {
-                    if let Some(carrier) = self.core.current.clone() {
-                        self.start_op(tx, fx, OpSpec::Reclaim(Reclaim { carrier }), None)?;
-                    }
+                if self.idle_due()
+                    && self.core.ops.is_empty()
+                    && let Some(carrier) = self.core.current.clone()
+                {
+                    self.start_op(tx, fx, OpSpec::Reclaim(Reclaim { carrier }), None)?;
                 }
                 Ok(None)
             }
@@ -1408,13 +1409,8 @@ impl Executor {
         let mut progress = false;
         for m in queued {
             let current = self.core.current_carrier().cloned();
-            let hold_reason = if structural {
-                Some("held")
-            } else if current.is_none() {
-                Some("held")
-            } else {
-                None
-            };
+            // 结构操作进行中，或还没有当前承载位（创建中）：代持。
+            let hold_reason = (structural || current.is_none()).then_some("held");
             if let Some(state) = hold_reason {
                 self.show_message(tx, fx, &m, state, None)?;
                 continue;

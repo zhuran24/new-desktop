@@ -54,6 +54,8 @@ pub enum Change {
     },
 }
 
+// 操作账的条目按键存在 BTreeMap 里，数量很小；动作体大是正常的，不为它多一层装箱。
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "entry", rename_all = "snake_case")]
 pub enum EntryBody {
@@ -151,6 +153,7 @@ pub struct OpRecord {
 }
 
 /// `run` 交给引擎的新步。
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Step {
     Act {
