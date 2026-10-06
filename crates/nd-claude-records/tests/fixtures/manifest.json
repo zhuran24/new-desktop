@@ -1,0 +1,20 @@
+{
+  "cli_version": "2.1.289 (Claude Code)",
+  "fixture_sha256": "efb0d84de2f427e9cd8c16b80f3037f3ec7445c9cfe8d3a3bf1fb8fe3d863a0a",
+  "session_id": "84d5cc12-6826-45e7-b3cf-a4d42ceaeba4",
+  "prompts": {
+    "alpha": "d3974e54-9e94-44db-b44f-3f0f107976d3",
+    "beta": "511eb979-1f1f-4796-8bda-4a0afbf4e918",
+    "gamma": "8278c693-389f-43ce-aaaa-ae6bf9fce824",
+    "delta": "a353e706-bf3b-4ce7-9e0f-fe96e0c29dd4",
+    "omega": "ec3dddb4-abce-48cd-b0e4-ac05de12c858"
+  },
+  "compact_boundaries": [
+    "96b41d87-3c1a-40a5-bedd-43edbe2f3259",
+    "1b12fdca-fbca-4b1f-ba24-7999e3d54624"
+  ],
+  "resumed_model_request": 8,
+  "model_requests": 9,
+  "cli_sha256": "a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348",
+  "isolation": "bwrap --unshare-all; empty environment; temporary HOME/config/XDG; nd-test-records.slice; MemoryMax=12G; no host home or run mount"
+}
