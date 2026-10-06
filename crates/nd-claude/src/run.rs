@@ -130,22 +130,7 @@ impl Claude {
             .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
             .await
             .ok_or("run unregistered while waiting for hellos")?;
-        let missing: Vec<&str> = ModName::ALL
-            .iter()
-            .filter(|m| !binding.mods.contains_key(m))
-            .map(|m| m.as_str())
-            .collect();
-        let readiness = if missing.is_empty() {
-            Readiness::Full
-        } else {
-            Readiness::ChatOnly {
-                why: format!(
-                    "{} 没有在 {} 毫秒内报到后端会话 {session}",
-                    missing.join("、"),
-                    self.config.hello_timeout.as_millis()
-                ),
-            }
-        };
+        let readiness = readiness(&binding, &session, self.config.hello_timeout);
         let id = format!("nd-init-{run}");
         let mut request = json!({
             "subtype": "initialize",
@@ -160,31 +145,13 @@ impl Claude {
         link.write(1, &frame.to_string()).await?;
         let (initialize, cursor) = await_response(&mut link, &id, self.config.init_timeout).await?;
         self.channel.settle(run);
-        let features = Feature::ALL
-            .iter()
-            .map(|f| {
-                (
-                    *f,
-                    match &readiness {
-                        Readiness::Full => Availability::Available,
-                        Readiness::ChatOnly { why } => {
-                            Availability::Unsupported { why: why.clone() }
-                        }
-                    },
-                )
-            })
-            .collect();
         Ok(ClaudeRun {
             ready: Ready {
                 run: run.to_owned(),
                 backend_session_id: session,
                 identity: launched.identity,
                 hellos: binding.mods,
-                caps: Caps {
-                    readiness,
-                    features,
-                    interrupt_spares_background: init.per_task_stop_affordance,
-                },
+                caps: caps(readiness, init.per_task_stop_affordance),
                 initialize,
             },
             link,
@@ -192,6 +159,80 @@ impl Claude {
             cursor,
             channel: self.channel.clone(),
         })
+    }
+
+    /// 守护进程重启后接回仍在运行的后端进程：不重发 initialize（CLI 只认第一次），
+    /// 等两个 mod 重连、按要求重报 hello。`previous` 是拉起时记下的能力。
+    /// 原来就只能聊天的仍只能聊天；mod 没回来的降为只能聊天。
+    pub async fn adopt(&self, run: &str, session: &str, previous: Caps) -> Result<ClaudeRun> {
+        self.channel.register(run, session);
+        self.channel.settle(run);
+        let link = self.watchdogs.link(run).await?;
+        let binding = self
+            .channel
+            .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
+            .await
+            .ok_or("run unregistered while waiting for hellos")?;
+        let caps = match readiness(&binding, session, self.config.hello_timeout) {
+            Readiness::ChatOnly { why } if previous.readiness == Readiness::Full => caps(
+                Readiness::ChatOnly { why },
+                previous.interrupt_spares_background,
+            ),
+            _ => previous,
+        };
+        let cursor = link.hello.high;
+        let next_in = link.hello.written + 1;
+        Ok(ClaudeRun {
+            ready: Ready {
+                run: run.to_owned(),
+                backend_session_id: session.to_owned(),
+                identity: link.hello.identity.clone(),
+                hellos: binding.mods,
+                caps,
+                initialize: Value::Null,
+            },
+            link,
+            next_in,
+            cursor,
+            channel: self.channel.clone(),
+        })
+    }
+}
+
+fn readiness(binding: &Binding, session: &str, waited: Duration) -> Readiness {
+    let missing: Vec<&str> = ModName::ALL
+        .iter()
+        .filter(|m| !binding.mods.contains_key(m))
+        .map(|m| m.as_str())
+        .collect();
+    if missing.is_empty() {
+        Readiness::Full
+    } else {
+        Readiness::ChatOnly {
+            why: format!(
+                "{} 没有在 {} 毫秒内报到后端会话 {session}",
+                missing.join("、"),
+                waited.as_millis()
+            ),
+        }
+    }
+}
+
+fn caps(readiness: Readiness, interrupt_spares_background: bool) -> Caps {
+    let features = Feature::ALL
+        .iter()
+        .map(|f| {
+            let availability = match &readiness {
+                Readiness::Full => Availability::Available,
+                Readiness::ChatOnly { why } => Availability::Unsupported { why: why.clone() },
+            };
+            (*f, availability)
+        })
+        .collect();
+    Caps {
+        readiness,
+        features,
+        interrupt_spares_background,
     }
 }
 
@@ -318,6 +359,31 @@ impl ClaudeRun {
             timeout,
         )
         .await
+    }
+    /// 按当前绑定把命令放进 mod 的队列，返回操作 id。
+    pub fn send(&self, module: ModName, action: Action) -> String {
+        let binding = self.binding();
+        let mod_gen = binding
+            .mods
+            .get(&module)
+            .map(|h| h.mod_gen.clone())
+            .unwrap_or_default();
+        let op_id = uuid::Uuid::new_v4().to_string();
+        self.channel.send(
+            &self.ready.run,
+            module,
+            Command {
+                op_id: op_id.clone(),
+                expected_backend_session_id: binding.backend_session_id,
+                expected_mod_gen: mod_gen,
+                action,
+            },
+        );
+        op_id
+    }
+    /// 等某条命令的结论；None 表示到时限仍无结论。
+    pub async fn result(&self, op_id: &str, timeout: Duration) -> Option<CommandResult> {
+        self.channel.result(&self.ready.run, op_id, timeout).await
     }
     /// 带指定期望身份发命令（核对过时 id 的拒绝）。
     pub async fn command_as(

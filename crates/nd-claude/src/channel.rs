@@ -17,7 +17,7 @@ use nd_mod_proto::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
-    os::unix::fs::FileTypeExt,
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -130,15 +130,19 @@ impl Run {
 
 struct Inner {
     runs: Mutex<HashMap<String, Run>>,
-    changed: Notify,
+    changed: Arc<Notify>,
     poll_timeout: Duration,
     socket: PathBuf,
+    /// 绑定时 socket 文件的（设备，inode）：只删自己建的那个，不删后来者替换上的。
+    inode: (u64, u64),
     stop: tokio::sync::watch::Sender<bool>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
-        let _ = std::fs::remove_file(&self.socket);
+        if std::fs::symlink_metadata(&self.socket).is_ok_and(|m| (m.dev(), m.ino()) == self.inode) {
+            let _ = std::fs::remove_file(&self.socket);
+        }
     }
 }
 
@@ -171,12 +175,14 @@ impl ModChannel {
             Err(e) => return Err(e),
         }
         let listener = SameUid(UnixListener::bind(socket)?);
+        let meta = std::fs::symlink_metadata(socket)?;
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let inner = Arc::new(Inner {
             runs: Mutex::new(HashMap::new()),
-            changed: Notify::new(),
+            changed: Arc::new(Notify::new()),
             poll_timeout,
             socket: socket.to_owned(),
+            inode: (meta.dev(), meta.ino()),
             stop,
         });
         let router = Router::new()
@@ -322,16 +328,26 @@ async fn hello(State(inner): State<Shared>, Json(hello): Json<Hello>) -> Respons
     Json(reply).into_response()
 }
 
-async fn next(State(inner): State<Shared>, Query(query): Query<NextQuery>) -> Response {
-    let Some(inner) = inner.upgrade() else {
+/// 长轮询：有命令、要重报或到时限才回。等待期间不持有通道状态，
+/// 适配器被丢弃（守护进程停止）时立刻结束，mod 随后重连新的守护进程。
+async fn next(State(weak): State<Shared>, Query(query): Query<NextQuery>) -> Response {
+    let Some((changed, mut stop, deadline)) = weak.upgrade().map(|inner| {
+        (
+            inner.changed.clone(),
+            inner.stop.subscribe(),
+            tokio::time::Instant::now() + inner.poll_timeout,
+        )
+    }) else {
         return unknown_run();
     };
-    let deadline = tokio::time::Instant::now() + inner.poll_timeout;
     loop {
-        let notified = inner.changed.notified();
+        let notified = changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
         let answer = {
+            let Some(inner) = weak.upgrade() else {
+                return unknown_run();
+            };
             let mut runs = inner.runs.lock().unwrap();
             let Some(run) = runs.get_mut(&query.run) else {
                 return unknown_run();
@@ -372,12 +388,12 @@ async fn next(State(inner): State<Shared>, Query(query): Query<NextQuery>) -> Re
         if let Some(answer) = answer {
             return Json(answer).into_response();
         }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
-            return Json(Next {
-                commands: vec![],
-                rehello: false,
-            })
-            .into_response();
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                return Json(Next { commands: vec![], rehello: false }).into_response();
+            }
+            _ = stop.wait_for(|s| *s) => return unknown_run(),
         }
     }
 }
