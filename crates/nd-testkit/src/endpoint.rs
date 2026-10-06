@@ -147,6 +147,13 @@ impl ClaudeEndpoint {
             .or_default()
             .push_back(reply);
     }
+    /// Model-wide plan for a dynamically generated agent ID whose reply waits for its gate.
+    pub fn enqueue_any_agent_held(&self, model: &str, mut reply: ModelReply) -> ResponseGate {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reply.gate = Some(rx);
+        self.enqueue_any_agent(model, reply);
+        ResponseGate(tx)
+    }
     pub fn enqueue_held(&self, route: Route, mut reply: ModelReply) -> ResponseGate {
         let (tx, rx) = tokio::sync::oneshot::channel();
         reply.gate = Some(rx);
