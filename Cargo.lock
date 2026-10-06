@@ -4177,11 +4177,13 @@ name = "nd-claude"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "nd-backend",
  "nd-claims",
  "nd-mod-proto",
  "nd-runs",
  "nd-session",
+ "nd-store",
  "nd-testkit",
  "nd-watchdog-proto",
  "nd-wire",
@@ -4236,6 +4238,7 @@ name = "nd-daemon"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "fs2",
  "futures",
  "nd-backend",
@@ -4275,6 +4278,7 @@ dependencies = [
  "nd-wire",
  "serde_json",
  "tokio",
+ "url",
  "uuid",
 ]
 

@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/zhuran24/new-desktop"
 
 [workspace.dependencies]
+url = "2"
 nd-claims = { path = "crates/nd-claims" }
 nd-composer = { path = "crates/nd-composer" }
 nd-watchdog-proto = { path = "crates/nd-watchdog-proto" }

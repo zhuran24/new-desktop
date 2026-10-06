@@ -7,7 +7,9 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub const VERSION: u32 = 1;
-pub const MAX_FRAME: usize = 8 * 1024 * 1024;
+// 附件最多 16 MiB；base64、JSON 转义和看守信封仍须装得下。
+// 单行界限为 MAX_FRAME / 4（32 MiB），读回批次仍受此帧界限约束。
+pub const MAX_FRAME: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {

@@ -49,6 +49,7 @@ struct Step {
 
 struct Scenario {
     name: &'static str,
+    uploads: Vec<Vec<u8>>,
     script: Vec<(ActKind, Reply)>,
     idle_ms: u64,
     steps: Vec<Step>,
@@ -78,6 +79,10 @@ async fn run(scenario: &Scenario, crash: Option<(Fault, usize)>) -> (Harness, Sn
         fault.clone().map(|f| f as Arc<dyn Faults>),
     ))
     .await;
+    let blobs = nd_store::Blobs::open(h.dir.path().join("blobs"), h.store.clone()).unwrap();
+    for bytes in &scenario.uploads {
+        blobs.put(bytes).unwrap();
+    }
     for (kind, reply) in &scenario.script {
         h.adapter.script(kind.clone(), reply.clone());
     }
@@ -243,6 +248,7 @@ async fn draft_conflict_and_send_consumption_recover_at_every_commit_point() {
     };
     matrix(Scenario {
         name: "send/draft-conflict-consume-retry",
+        uploads: vec![],
         script: vec![],
         idle_ms: 3_600_000,
         steps: vec![
@@ -291,6 +297,7 @@ async fn draft_conflict_and_send_consumption_recover_at_every_commit_point() {
 async fn create_reaches_active_or_is_compensated_at_every_commit_point() {
     matrix(Scenario {
         name: "create/ok",
+        uploads: vec![],
         script: vec![],
         idle_ms: 3_600_000,
         steps: vec![Step {
@@ -309,6 +316,7 @@ async fn create_reaches_active_or_is_compensated_at_every_commit_point() {
 async fn a_create_that_cannot_start_is_withdrawn_at_every_commit_point() {
     matrix(Scenario {
         name: "create/open-fails",
+        uploads: vec![],
         script: vec![(ActKind::Open, Reply::Fail("工作目录不存在".into()))],
         idle_ms: 3_600_000,
         steps: vec![Step {
@@ -324,6 +332,7 @@ async fn a_create_that_cannot_start_is_withdrawn_at_every_commit_point() {
 async fn a_create_whose_first_message_is_unknown_is_partial_at_every_commit_point() {
     matrix(Scenario {
         name: "create/partial",
+        uploads: vec![],
         script: vec![(ActKind::Send, Reply::Unknown("进程退出，没等到回显".into()))],
         idle_ms: 3_600_000,
         steps: vec![Step {
@@ -342,6 +351,7 @@ async fn idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_eve
     let session = session_id_for("matrix-idle");
     matrix(Scenario {
         name: "reclaim+launch",
+        uploads: vec![],
         script: vec![],
         idle_ms: 60,
         steps: vec![
@@ -373,9 +383,15 @@ async fn idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_eve
 
 #[tokio::test(flavor = "multi_thread")]
 async fn confirmed_loss_and_user_resend_are_atomic_at_every_commit_point() {
+    use sha2::{Digest, Sha256};
+    let bytes = b"resend attachment";
+    let blob = format!("{:x}", Sha256::digest(bytes));
+    let attachments =
+        json!([{"blob":blob,"name":"resend.txt","media_type":"text/plain","size":bytes.len()}]);
     let session = session_id_for("matrix-resend");
     matrix(Scenario {
         name: "send/lost-and-user-resend",
+        uploads: vec![bytes.to_vec()],
         script: vec![
             (ActKind::Send, Reply::Ok),
             (ActKind::Send, Reply::Lost("证实未消费".into())),
@@ -390,7 +406,7 @@ async fn confirmed_loss_and_user_resend_are_atomic_at_every_commit_point() {
                 command: command(
                     "matrix-lost",
                     "session.send",
-                    json!({"session":session,"text":"重发的消息"}),
+                    json!({"session":session,"text":"重发的消息","attachments":attachments}),
                 ),
                 until: |s| {
                     s.items.iter().any(|i| {
@@ -413,6 +429,19 @@ async fn confirmed_loss_and_user_resend_are_atomic_at_every_commit_point() {
         ],
         check: |h, s| {
             assert_eq!(applied_counts(h).get("send:重发的消息"), Some(&1));
+            for id in ["matrix-lost", "matrix-resend-once"] {
+                let item = s.items.iter().find(|i| i.data["message"] == id).unwrap();
+                assert_eq!(item.data["attachments"][0]["name"], "resend.txt");
+            }
+            for (_, act) in h.adapter.received() {
+                if let nd_backend::Act::Send { msg, .. } = act
+                    && msg.text == "重发的消息"
+                {
+                    assert_eq!(msg.attachments.len(), 1);
+                    assert_eq!(msg.attachments[0].name, "resend.txt");
+                    assert_eq!(msg.attachments[0].size, 17);
+                }
+            }
             assert_eq!(
                 s.items
                     .iter()
@@ -421,6 +450,138 @@ async fn confirmed_loss_and_user_resend_are_atomic_at_every_commit_point() {
                     .data["state"],
                 "resent"
             );
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attachment_create_and_send_recover_at_every_commit_point() {
+    use sha2::{Digest, Sha256};
+    let bytes = b"matrix attachment";
+    let blob = format!("{:x}", Sha256::digest(bytes));
+    let attachments =
+        json!([{"blob":blob,"name":"材料.txt","media_type":"text/plain","size":bytes.len()}]);
+    let id = "matrix-attachments";
+    let mut first = create(id, "带附件的首条");
+    first.args["attachments"] = attachments.clone();
+    matrix(Scenario {
+        name: "create-and-send/attachments",
+        uploads: vec![bytes.to_vec()],
+        script: vec![], idle_ms:3_600_000,
+        steps: vec![
+            Step { command:first, until:|s| status_is(s,"active") },
+            Step { command:command("matrix-attached-send", "session.send", json!({"session":session_id_for(id),"text":"第二个附件","attachments":attachments})), until:|s| prompt(s,"第二个附件").is_some_and(|p| p.data["state"] == "landed") },
+        ],
+        check: |h,s| {
+            for text in ["带附件的首条", "第二个附件"] {
+                let a = &prompt(s,text).unwrap().data["attachments"][0];
+                assert_eq!(a["name"], "材料.txt");
+                assert_eq!(applied_counts(h).get(&format!("send:{text}")), Some(&1));
+            }
+            for (_, act) in h.adapter.received() {
+                if let nd_backend::Act::Send { msg, .. } = act {
+                    assert_eq!(msg.attachments.len(),1);
+                    assert_eq!(msg.attachments[0].size,17);
+                }
+            }
+        },
+    }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attachment_creation_compensation_releases_unused_uploads_at_every_commit_point() {
+    use sha2::{Digest, Sha256};
+    let bytes = b"unused matrix upload";
+    let blob = format!("{:x}", Sha256::digest(bytes));
+    let mut first = create("matrix-attached-failure", "带附件的失败创建");
+    first.args["attachments"] =
+        json!([{"blob":blob,"name":"材料.txt","media_type":"text/plain","size":bytes.len()}]);
+    matrix(Scenario {
+        name: "create/attachments-open-fails",
+        uploads: vec![bytes.to_vec()],
+        script: vec![(ActKind::Open, Reply::Fail("没有工作目录".into()))],
+        idle_ms: 3_600_000,
+        steps: vec![Step {
+            command: first,
+            until: |s| status_is(s, "withdrawn"),
+        }],
+        check: |h, _| {
+            assert!(h.adapter.applied().is_empty());
+            let blobs = nd_store::Blobs::open(h.dir.path().join("blobs"), h.store.clone()).unwrap();
+            assert_eq!(blobs.collect(Duration::ZERO).unwrap(), 1);
+        },
+    })
+    .await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_draft_conflict_and_send_consumption_recover_at_every_commit_point() {
+    use sha2::{Digest, Sha256};
+    let bytes = b"matrix draft attachment";
+    let attachments = json!([{"blob":format!("{:x}",Sha256::digest(bytes)),"name":"draft.txt","size":bytes.len(),"media_type":"text/plain"}]);
+    let session = session_id_for("matrix-draft-create");
+    let update = |id: &str, version: u64, text: &str| nd_wire::Command {
+        id: id.into(),
+        device: id.into(),
+        name: "session.draft.update".into(),
+        args: json!({"session":session,"text":text,"attachments":attachments}),
+        expect: json!({"draft_version":version}),
+    };
+    let send = nd_wire::Command {
+        id: "matrix-draft-send".into(),
+        device: "a".into(),
+        name: "session.send".into(),
+        args: json!({"session":session,"text":"胜出的草稿","attachments":attachments}),
+        expect: json!({"draft_version":1}),
+    };
+    matrix(Scenario {
+        name: "send/attached-draft-conflict-consume-retry",
+        uploads: vec![bytes.to_vec()],
+        script: vec![],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-draft-create", "你好"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: update("matrix-draft-a", 0, "胜出的草稿"),
+                until: |s| item(s, "draft").data["version"] == 1,
+            },
+            Step {
+                command: update("matrix-draft-b", 0, "落败稿"),
+                until: |s| {
+                    item(s, "draft").data["saved"]
+                        .as_array()
+                        .is_some_and(|a| a.len() == 1)
+                },
+            },
+            Step {
+                command: send.clone(),
+                until: |s| prompt(s, "胜出的草稿").is_some_and(|i| i.data["state"] == "landed"),
+            },
+            Step {
+                command: update("matrix-draft-new", 2, "后来编辑"),
+                until: |s| item(s, "draft").data["version"] == 3,
+            },
+            Step {
+                command: send,
+                until: |s| item(s, "draft").data["text"] == "后来编辑",
+            },
+        ],
+        check: |h, s| {
+            let d = &item(s, "draft").data;
+            assert_eq!(d["attachments"][0]["name"], "draft.txt");
+            assert_eq!(d["saved"][0]["attachments"][0]["name"], "draft.txt");
+            assert_eq!(
+                prompt(s, "胜出的草稿").unwrap().data["attachments"][0]["name"],
+                "draft.txt"
+            );
+            assert_eq!(d["text"], "后来编辑");
+            assert_eq!(d["version"], 3);
+            assert_eq!(d["saved"].as_array().unwrap().len(), 1);
+            assert_eq!(d["saved"][0]["text"], "落败稿");
+            assert_eq!(applied_counts(h).get("send:胜出的草稿"), Some(&1));
         },
     })
     .await;

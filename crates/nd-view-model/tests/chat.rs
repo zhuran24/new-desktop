@@ -306,3 +306,22 @@ fn delivery_unknown_is_explained_and_only_confirmed_non_delivery_offers_resend()
     assert_eq!(view.messages[1].resend.as_deref(), Some("l"));
     assert_eq!(view.messages[2].resend, None);
 }
+
+#[test]
+fn attachment_edits_participate_in_draft_receipt_revision() {
+    let mut draft = nd_view_model::Draft::default();
+    let a = nd_wire::Attachment {
+        blob: "a".repeat(64),
+        name: "图.png".into(),
+        media_type: "image/png".into(),
+        size: 42,
+    };
+    draft.attach(a.clone());
+    let submitted = draft.revision();
+    draft.detach(0);
+    assert!(!draft.accept(submitted));
+    draft.attach(a.clone());
+    assert_eq!(draft.attachments(), &[a]);
+    assert!(draft.accept(draft.revision()));
+    assert!(draft.attachments().is_empty());
+}

@@ -1,6 +1,6 @@
 # New Desktop
 
-Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI；Codex app-server 的适配在后续工单接入。当前可经 GPUI 桌面或 `ndctl new/send` 新建 Claude 会话和流式对话。桌面提供目录输入、后端模型列表、侧栏状态、Markdown/代码块和界面重开恢复。底座包含组件内核、同步流与持久命令收据、配置与存储、记录解析与转换、看守进程、独占登记和持久操作引擎。
+Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI；Codex app-server 的适配在后续工单接入。当前可经 GPUI 桌面或 `ndctl new/send` 新建 Claude 会话和流式对话。桌面提供目录输入、后端模型列表、侧栏状态、Markdown/代码块、附件、diff 和界面重开恢复。底座包含组件内核、同步流与持久命令收据、配置与存储、记录解析与转换、看守进程、独占登记和持久操作引擎。
 
 领域用语见 [GLOSSARY.md](GLOSSARY.md)，架构决定见 [docs/adr](docs/adr/)。
 

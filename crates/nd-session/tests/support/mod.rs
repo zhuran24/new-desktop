@@ -44,8 +44,11 @@ impl Harness {
         let claims = open_claims(&dir, &store);
         ready(&claims);
         let adapter = ScriptedAdapter::new(claims.clone());
+        let blobs =
+            Arc::new(nd_store::Blobs::open(dir.path().join("blobs"), store.clone()).unwrap());
         let sessions = Sessions::new(
             store.clone(),
+            blobs,
             claims.clone(),
             Backends::new().with(adapter.clone()),
             config.clone(),
@@ -192,8 +195,11 @@ impl Harness {
         }
         ready(&claims);
         let adapter = survivor.attach(claims.clone());
+        let blobs =
+            Arc::new(nd_store::Blobs::open(dir.path().join("blobs"), store.clone()).unwrap());
         let sessions = Sessions::new(
             store.clone(),
+            blobs,
             claims.clone(),
             Backends::new().with(adapter.clone()),
             config.clone(),
