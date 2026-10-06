@@ -4,12 +4,14 @@
 //!   给侧栏的会话列表。
 //! - 每个装载中的会话一个执行器，串行处理它的全部输入（界面命令、后端批次、独占登记的变化），
 //!   一个输入一个事务；操作写成纯函数 `run(&View, &mut Journal)`，每个输入之后从头重跑。
-//! - 发送台、对话投影是执行器内部的 fold；对外只有 nd-wire 的命令、快照与事件。
+//! - 谱系、发送台、对话投影是执行器内部的 fold；界面经 nd-wire 的命令、快照与事件。
+//!   谱系另有可直接测试的纯函数接口，不另立组件。
 //!
 //! 后端经 [`nd_backend::Backends`]；跨会话的独占经 [`nd_claims::Exclusivity`]，在执行器的事务里放行。
 mod executor;
 mod feed;
 pub mod journal;
+pub mod lineage;
 pub mod ops;
 pub mod projection;
 pub mod scripted;

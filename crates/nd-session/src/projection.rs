@@ -16,6 +16,9 @@ pub const NAMESPACE: &str = "session";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "shown", rename_all = "snake_case")]
 pub enum Shown {
+    Lineage {
+        data: Value,
+    },
     Header {
         data: Value,
     },
@@ -78,6 +81,7 @@ impl Shown {
     /// 条目 id；增量与它的完整条目同 id。
     pub fn id(&self) -> String {
         match self {
+            Shown::Lineage { .. } => "lineage".into(),
             Shown::Header { .. } => "header".into(),
             Shown::Prompt { id, .. } => format!("prompt/{id}"),
             Shown::Block { item } => format!("block/{}", item.id),
@@ -94,6 +98,12 @@ impl Shown {
     fn render(&self, seq: u64, accumulated: Option<&str>) -> Item {
         let id = self.id();
         let (kind, mut data, title, text) = match self {
+            Shown::Lineage { data } => (
+                "lineage",
+                data.clone(),
+                "对话谱系".to_owned(),
+                format!("{} 轮", data["rounds"].as_array().map_or(0, Vec::len)),
+            ),
             Shown::Header { data } => (
                 "header",
                 data.clone(),

@@ -322,6 +322,13 @@ pub enum FactBody {
         native: String,
     },
     TurnStarted,
+    /// 已确认的实际回合与用户输入原生位置；不代替 Landed 的送达证据。
+    TurnMapped {
+        turn: String,
+        natives: Vec<String>,
+        complete: bool,
+        last_assistant: Option<String>,
+    },
     /// 一个回合结束。`ok` 已核 `is_error`；不代表模型回答了哪条消息，也不结票。
     TurnEnded {
         ok: bool,

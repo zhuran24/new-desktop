@@ -6,6 +6,7 @@ use crate::{
     EngineConfig, Fault, Listing,
     feed::Feed,
     journal::{Change, Entry, EntryBody, Halt, Journal, OpRecord, Phase, Step, View},
+    lineage::{Event as LineageEvent, NativePosition},
     ops::{Create, Launch, OpSpec, Reclaim},
     projection::{Projection, Shown},
     state::{self, Carrier, Core, Issuer, Message, Meta, OutRow, Status},
@@ -516,6 +517,22 @@ impl Executor {
         })
     }
 
+    fn ensure_lineage(&mut self, carrier: &nd_backend::CarrierId) -> nd_store::Result<()> {
+        if self.core.lineage.current().is_none() {
+            let c = &self.core.carriers[carrier];
+            self.core.lineage = self
+                .core
+                .lineage
+                .fold(&LineageEvent::Root {
+                    segment: format!("segment/{}", self.id),
+                    carrier: carrier.clone(),
+                    backend_session: c.bs.clone(),
+                })
+                .map_err(aborted)?;
+        }
+        Ok(())
+    }
+
     fn batch(
         &mut self,
         tx: &mut Tx<'_>,
@@ -547,6 +564,25 @@ impl Executor {
                         };
                         self.show(tx, fx, shown)?;
                     }
+                }
+                FactBody::TurnMapped {
+                    turn,
+                    natives,
+                    complete,
+                    last_assistant,
+                } => {
+                    self.ensure_lineage(&batch.carrier)?;
+                    self.core.lineage = self
+                        .core
+                        .lineage
+                        .fold(&LineageEvent::TurnObserved {
+                            carrier: batch.carrier.clone(),
+                            key: turn,
+                            natives,
+                            complete,
+                            last_assistant,
+                        })
+                        .map_err(aborted)?;
                 }
                 FactBody::TurnStarted => {
                     if let Some(c) = self.core.carriers.get_mut(&batch.carrier) {
@@ -656,6 +692,7 @@ impl Executor {
                     c.checkpoint = None;
                     c.turn_running = false;
                 }
+                self.ensure_lineage(carrier)?;
             }
             (Act::End { carrier, .. }, Outcome::Ok { .. }) => {
                 if let Some(c) = self.core.carriers.get_mut(carrier) {
@@ -666,6 +703,29 @@ impl Executor {
                 }
             }
             _ => {}
+        }
+        if let (
+            Act::Send { to, .. },
+            Some(display),
+            Outcome::Ok {
+                done: Done::Landed { native },
+            },
+        ) = (&row.act, &row.display, &outcome)
+        {
+            self.ensure_lineage(to)?;
+            self.core.lineage = self
+                .core
+                .lineage
+                .fold(&LineageEvent::Landed {
+                    message: display.clone(),
+                    ticket: ticket.clone(),
+                    position: NativePosition {
+                        carrier: to.clone(),
+                        backend_session: self.core.carriers[to].bs.clone(),
+                        native: native.clone(),
+                    },
+                })
+                .map_err(aborted)?;
         }
         if let (Act::Send { msg, .. }, Some(display)) = (&row.act, row.display.clone())
             && !matches!(
@@ -1549,6 +1609,23 @@ impl Executor {
     fn persist(&mut self, tx: &Tx<'_>, fx: &mut Effects) -> nd_store::Result<()> {
         let header = header(&self.core);
         self.show(tx, fx, Shown::Header { data: header })?;
+        let lineage = &self.core.lineage;
+        let rounds: Vec<_> = lineage
+            .current()
+            .map(|id| lineage.turns(id).expect("current segment"))
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(i, turn)| {
+                let mut value = serde_json::to_value(turn).expect("round value");
+                value["n"] = json!(i + 1);
+                value
+            })
+            .collect();
+        let data = json!({"current": lineage.current(), "rounds": rounds, "topology": lineage.topology(),
+            "origin": lineage.origin(), "edges": lineage.edges(), "switches": lineage.switches(), "carriers": lineage.carriers(),
+            "segments": lineage.topology().iter().map(|n| lineage.segment(&n.segment).unwrap()).collect::<Vec<_>>()});
+        self.show(tx, fx, Shown::Lineage { data })?;
         state::save(tx, &self.core)
     }
 }

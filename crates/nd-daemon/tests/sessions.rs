@@ -459,6 +459,9 @@ async fn a_create_whose_backend_died_after_the_first_message_was_written_is_part
         })
         .await;
     assert_eq!(header(&written)["status"], "preparing");
+    // 已拉起的后端会话属于根段；没等到回显的首条提示还不是轮。
+    assert_eq!(lineage(&written)["segments"].as_array().unwrap().len(), 1);
+    assert!(lineage(&written)["rounds"].as_array().unwrap().is_empty());
     let pid = cli_pid(&fx, &written).await;
     signal(pid, rustix::process::Signal::KILL);
     let snapshot = fx
@@ -783,5 +786,179 @@ async fn a_backend_that_died_is_relaunched_on_the_next_message() {
     );
     assert_eq!(prompt(&after, "还在吗").unwrap().data["state"], "landed");
     assert!(request_text(&endpoint.requests()[1].body).contains("第一轮"));
+    fx.close();
+}
+
+fn lineage(snapshot: &Snapshot) -> &Value {
+    &snapshot
+        .items
+        .iter()
+        .find(|i| i.id == "lineage")
+        .expect("lineage snapshot")
+        .data
+}
+
+#[tokio::test]
+async fn human_rounds_map_to_cli_uuids_and_survive_restart() {
+    let fx = Fixture::start("nd15-rounds", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("第一轮回答"));
+    let session = fx
+        .create("rounds-create", "/sandbox/project", "第一条提示")
+        .await;
+    let first = fx
+        .wait(&session, "first round complete", |s| {
+            texts(s) == ["第一轮回答"] && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    let round = lineage(&first)["rounds"][0].clone();
+    assert_eq!(round["n"], 1);
+    assert_eq!(round["complete"], true);
+    assert_eq!(
+        round["positions"][0]["native"],
+        prompt(&first, "第一条提示").unwrap().data["native"]
+    );
+    let bs = header(&first)["process"]["backend_session"]
+        .as_str()
+        .unwrap();
+    let record: Vec<Value> = fx
+        .transcript(bs)
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert!(
+        record
+            .iter()
+            .any(|r| r["type"] == "user" && r["uuid"] == round["positions"][0]["native"])
+    );
+    assert!(
+        record
+            .iter()
+            .any(|r| r["type"] == "assistant" && r["uuid"] == round["last_assistant"]["native"])
+    );
+    fx.scenario.kill_daemon().unwrap();
+    let recovered = fx.peek(&session).await;
+    assert_eq!(lineage(&recovered), lineage(&first));
+    let pid = cli_pid(&fx, &recovered).await;
+    signal(pid, rustix::process::Signal::STOP);
+    endpoint.enqueue(fx.main(), ModelReply::text("第二轮回答"));
+    fx.send("rounds-send", &session, "第二条提示").await;
+    let written = fx
+        .wait(&session, "written before echo", |s| {
+            prompt(s, "第二条提示").is_some_and(|p| p.data["state"] == "written")
+        })
+        .await;
+    assert_eq!(lineage(&written)["rounds"].as_array().unwrap().len(), 1);
+    signal(pid, rustix::process::Signal::CONT);
+    let ended = fx
+        .wait(&session, "second round complete", |s| {
+            texts(s) == ["第一轮回答", "第二轮回答"]
+                && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    let rounds = lineage(&ended)["rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(rounds[0], round);
+    assert_eq!(rounds[1]["n"], 2);
+    assert_eq!(rounds[1]["messages"], json!(["rounds-send"]));
+    assert_eq!(
+        rounds[1]["positions"][0]["native"],
+        prompt(&ended, "第二条提示").unwrap().data["native"]
+    );
+    assert_ne!(rounds[0]["id"], rounds[1]["id"]);
+    fx.close();
+}
+
+#[tokio::test]
+async fn coalesced_cli_prompts_share_one_navigation_round() {
+    let fx = Fixture::start("nd15-coalesced", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("准备好了"));
+    let session = fx
+        .create("coalesce-create", "/sandbox/project", "准备")
+        .await;
+    let first = fx
+        .wait(&session, "first round done", |s| {
+            texts(s) == ["准备好了"] && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    let pid = cli_pid(&fx, &first).await;
+    signal(pid, rustix::process::Signal::STOP);
+    endpoint.enqueue(fx.main(), ModelReply::text("两条一起回答"));
+    fx.send("coalesce-a", &session, "同时写出的第一条").await;
+    fx.send("coalesce-b", &session, "同时写出的第二条").await;
+    let written = fx
+        .wait(&session, "both written", |s| {
+            ["同时写出的第一条", "同时写出的第二条"]
+                .iter()
+                .all(|text| prompt(s, text).is_some_and(|p| p.data["state"] == "written"))
+        })
+        .await;
+    assert_eq!(lineage(&written)["rounds"].as_array().unwrap().len(), 1);
+    signal(pid, rustix::process::Signal::CONT);
+    let ended = fx
+        .wait(&session, "coalesced round done", |s| {
+            texts(s) == ["准备好了", "两条一起回答"]
+                && has_header(s, |h| h["process"]["turn_running"] == false)
+        })
+        .await;
+    let rounds = lineage(&ended)["rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 2, "{rounds:#?}");
+    assert_eq!(rounds[1]["messages"], json!(["coalesce-a", "coalesce-b"]));
+    let natives: Vec<_> = ["同时写出的第一条", "同时写出的第二条"]
+        .iter()
+        .map(|text| prompt(&ended, text).unwrap().data["native"].clone())
+        .collect();
+    assert_eq!(
+        rounds[1]["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["native"].clone())
+            .collect::<Vec<_>>(),
+        natives
+    );
+    assert_eq!(endpoint.requests().len(), 2);
+    let request = request_text(&endpoint.requests()[1].body);
+    assert!(request.contains("同时写出的第一条") && request.contains("同时写出的第二条"));
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_running_round_keeps_its_identity_when_the_daemon_restarts() {
+    let fx = Fixture::start("nd15-running", 3_600_000).await;
+    let answer = "流式回答跨过守护进程重启以后仍然属于同一轮".repeat(5);
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::streaming_text(&answer, 1, 80));
+    let session = fx
+        .create("running-round", "/sandbox/project", "慢慢回答")
+        .await;
+    let running = fx
+        .wait(&session, "running round indexed", |s| {
+            s.items
+                .iter()
+                .find(|i| i.id == "lineage")
+                .is_some_and(|i| i.data["rounds"][0]["complete"] == false)
+        })
+        .await;
+    let id = lineage(&running)["rounds"][0]["id"].clone();
+    fx.scenario.kill_daemon().unwrap();
+    let ended = fx
+        .wait(&session, "same round complete after restart", |s| {
+            s.items
+                .iter()
+                .find(|i| i.id == "lineage")
+                .is_some_and(|i| i.data["rounds"][0]["complete"] == true)
+        })
+        .await;
+    let rounds = lineage(&ended)["rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0]["id"], id);
+    assert_eq!(
+        rounds[0]["positions"],
+        lineage(&running)["rounds"][0]["positions"]
+    );
+    assert_eq!(fx.scenario.endpoint().requests().len(), 1);
     fx.close();
 }
