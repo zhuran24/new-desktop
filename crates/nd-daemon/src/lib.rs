@@ -277,6 +277,7 @@ impl Engine {
             ("system".into(), 1),
             ("sessions".into(), 1),
             ("session".into(), 1),
+            ("models".into(), 1),
         ]);
         if self.runs.is_some() {
             names.insert("runs".into(), 1);
@@ -734,6 +735,14 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                 let Ok(req) = serde_json::from_str::<Request>(&text) else { break; };
                 // 会话的命令与流不经全局锁：命令要等会话执行器提交，流各自转发。
                 let req = match req {
+                    Request::Models { id, backend, cwd } if greeted => {
+                        let response = match sessions.models(&backend, cwd.into()).await {
+                            Ok(models) => WireResponse::Reply { id, value: serde_json::to_value(models).unwrap(), error: None },
+                            Err(error) => WireResponse::Reply { id, value: Value::Null, error: Some(error) },
+                        };
+                        if !enqueue(&outgoing, response) { break; }
+                        continue;
+                    }
                     Request::Execute { id, command } if greeted && command.name.starts_with("session.") => {
                         let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { reason: "没有这个会话命令".into() });
                         if !enqueue(&outgoing, WireResponse::CommandReply { id, result }) { break; }

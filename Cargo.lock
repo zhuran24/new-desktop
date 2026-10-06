@@ -4150,6 +4150,7 @@ name = "nd-backend"
 version = "0.1.0"
 dependencies = [
  "nd-claims",
+ "nd-wire",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4183,6 +4184,7 @@ dependencies = [
  "nd-session",
  "nd-testkit",
  "nd-watchdog-proto",
+ "nd-wire",
  "rustix",
  "serde",
  "serde_json",
@@ -4273,6 +4275,7 @@ dependencies = [
  "nd-wire",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

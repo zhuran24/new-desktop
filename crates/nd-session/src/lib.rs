@@ -257,6 +257,16 @@ impl Sessions {
     pub fn listing(&self) -> &Arc<Listing> {
         &self.deps.listing
     }
+    pub async fn models(
+        &self,
+        backend: &str,
+        cwd: std::path::PathBuf,
+    ) -> Result<Vec<nd_wire::Model>, String> {
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            return Err("工作目录必须是已存在的绝对路径".into());
+        }
+        self.deps.backends.models(backend, cwd).await
+    }
 
     /// 守护进程启动时：装载有活进程、有进行中操作或有未结票的会话，交端口对账。
     pub fn recover(&self) -> nd_store::Result<Vec<SessionId>> {

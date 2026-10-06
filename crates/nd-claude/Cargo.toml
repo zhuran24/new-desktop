@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+nd-wire.workspace = true
 nd-mod-proto.workspace = true
 nd-backend.workspace = true
 nd-claims.workspace = true

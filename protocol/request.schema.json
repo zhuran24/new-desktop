@@ -5,6 +5,32 @@
     {
       "type": "object",
       "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "type": {
+          "type": "string",
+          "const": "models"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "backend",
+        "cwd"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "namespaces": {
           "type": "object",
           "additionalProperties": {

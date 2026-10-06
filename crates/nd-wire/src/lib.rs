@@ -6,6 +6,15 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// 后端实时给出的模型选项；value 原样用于 session.create，不从显示名称推导。
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct Model {
+    pub value: String,
+    pub label: String,
+    pub description: String,
+    pub disabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct Fallback {
     pub title: String,
@@ -34,6 +43,11 @@ pub struct Cursor {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    Models {
+        id: u64,
+        backend: String,
+        cwd: String,
+    },
     Hello {
         version: u32,
         namespaces: BTreeMap<String, u32>,

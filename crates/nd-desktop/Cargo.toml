@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+uuid.workspace = true
 nd-composer.workspace = true
 gpui-kit.workspace = true
 nd-view-model.workspace = true

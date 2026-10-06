@@ -314,6 +314,15 @@ impl Scenario {
         let mut args = this.service_args(&this.services[0], true);
         args.extend(this.sandbox_args(&daemon)?);
         if this.watchdog_config.is_some() {
+            // 短命的模型目录查询由真适配器在守护进程 cgroup 里直接拉起。
+            args.extend(
+                [
+                    "--ro-bind",
+                    "/mnt/wd_external/nd-build/cli/claude-2.1.289",
+                    "/cli",
+                ]
+                .map(str::to_owned),
+            );
             let bus = format!("/run/user/{}/bus", rustix::process::geteuid().as_raw());
             args.retain(|s| s != "--unshare-all");
             let at = args.iter().position(|s| s == "/usr/bin/bwrap").unwrap() + 1;
