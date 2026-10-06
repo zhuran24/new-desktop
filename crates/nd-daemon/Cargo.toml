@@ -13,6 +13,11 @@ nd-kernel.workspace = true
 nd-wire.workspace = true
 nd-config.workspace = true
 nd-store.workspace = true
+nd-ledger.workspace = true
+nd-session.workspace = true
+nd-backend.workspace = true
+nd-claims.workspace = true
+nd-claude.workspace = true
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,6 +35,8 @@ workspace = true
 [dev-dependencies]
 tokio-tungstenite.workspace = true
 tempfile.workspace = true
+nd-testkit.workspace = true
+toml.workspace = true
 
 [features]
-scenarios = []
+scenarios = ["nd-claude/scenarios"]

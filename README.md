@@ -1,6 +1,6 @@
 # New Desktop
 
-Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 Codex app-server。当前代码包含组件内核、本机守护进程、同步流与持久命令收据、配置与存储底座、Claude 记录解析及对话转换库；后端会话和桌面外壳由后续工单接入。
+Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 Codex app-server。当前代码包含组件内核、本机守护进程、同步流与持久命令收据、配置与存储底座、Claude 记录解析及对话转换库、看守进程、独占登记，以及第一条 Claude 对话（会话名册与持久操作引擎、Claude 适配、`ndctl new/send`）；桌面界面的对话区等由后续工单接入。
 
 领域用语见 [GLOSSARY.md](GLOSSARY.md)，架构决定见 [docs/adr](docs/adr/)。
 
@@ -19,7 +19,10 @@ Rust 守护进程与原生桌面界面，后端使用官方 Claude Code CLI 和 
 | [`crates/nd-claude-records`](crates/nd-claude-records/README.md) | Claude 主记录选链、字节偏移索引、历史分页；只读纯库 |
 | [`crates/nd-convert`](crates/nd-convert/README.md) | Claude/Codex 经中间条目互转、损失清单与中立设置换算；纯库 |
 | `crates/nd-mod-proto` | mod 协议的 Rust 类型、JSON Schema 与两个 mod 的 TypeScript 生成器 |
-| [`crates/nd-claude`](crates/nd-claude/README.md) | Claude 后端进程的启动模板、mod 通道、就绪判定与 mod 往返录制 |
+| [`crates/nd-claude`](crates/nd-claude/README.md) | Claude 后端进程的启动模板、mod 通道、就绪判定、对话状态机与后端端口的 Claude 实现，mod 往返与看守流水的录制 |
+| `crates/nd-ledger` | 命令收据账本：去重、墓碑、查询；事务由调用方拥有 |
+| `crates/nd-backend` | 后端端口：后端无关的动作、结果、事实与 `BackendAdapter`，按后端种类路由 |
+| [`crates/nd-session`](crates/nd-session/README.md) | 会话名册与持久操作引擎：新建、发送台、对话投影、按需拉起与闲置回收；引擎崩溃矩阵 |
 | [`mods/`](mods/README.md) | 带进每个 Claude 后端进程的钩子 mod 与动作 mod（TypeScript） |
 | `ime-lab/variants/*` | 独立实验工作区，不参与产品的 workspace 测试 |
 

@@ -318,6 +318,35 @@ impl ClaudeRun {
         self.next_in += 1;
         Ok(seq)
     }
+    /// 看守连接断了（传输错误后连接作废）：换一条新连接，输入序号接着看守报的已写高水位。
+    pub fn relink(&mut self, link: WatchLink) {
+        self.next_in = link.hello.written + 1;
+        self.link = link;
+    }
+    /// 下一行 stdin 的输入序号。看守按输入序号去重：同一序号重写不会写两次。
+    pub fn next_input(&self) -> u64 {
+        self.next_in
+    }
+    /// 流水游标：下一次 `read` 从它之后读。
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+    /// 守护进程重启后从已提交的检查点接着读。
+    pub fn seek(&mut self, cursor: u64) {
+        self.cursor = cursor;
+    }
+    /// 给看守确认：这之前的流水已经进了已提交的检查点，可以回收。
+    pub async fn ack(&mut self, seq: u64) -> Result<()> {
+        self.link.ack(seq).await
+    }
+    /// 结束后端进程（关 stdin、TERM 或 KILL）。
+    pub async fn finish(&mut self, action: nd_watchdog_proto::Finish) -> Result<()> {
+        self.link.finish(action).await
+    }
+    /// 从头读一段流水，不动游标（恢复对账时查输入记录用）。
+    pub async fn read_from(&mut self, after: u64, limit: usize) -> Result<Vec<Record>> {
+        self.link.read(after, limit).await
+    }
     /// 读 initialize 回应之后的看守流水，游标随之前进。
     pub async fn read(&mut self, limit: usize) -> Result<Vec<Record>> {
         let records = self.link.read(self.cursor, limit).await?;

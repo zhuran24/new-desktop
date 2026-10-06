@@ -150,10 +150,22 @@ pub struct Command {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Receipt {
-    Done { value: Value },
-    Accepted { op: String },
-    Rejected { code: String, now: Value },
-    Unknown { now: Value },
+    Done {
+        value: Value,
+    },
+    /// 起了一个要等的操作。`stream`：能看到它进度的流（例如新建会话的 `session/<id>`）；只加不改的可选字段。
+    Accepted {
+        op: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream: Option<String>,
+    },
+    Rejected {
+        code: String,
+        now: Value,
+    },
+    Unknown {
+        now: Value,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]

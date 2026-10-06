@@ -104,3 +104,20 @@
 | MOD-RELOAD | 模块文件变动后 `reload_plugins` 重载该模块：模块变量清零、`session.start` 再跑 | 本版本实跑（`research/round9/VERIFY.md` E1 是开着目录监视时的旧观察） | `reload.rs` | 退路已实现：代次不同的命令被拒，在途命令按可重发类别重排或记 Unknown |
 
 本节不写 CLI 原生存储（mod 只用协议与 `$`，没有用 `$.store`），也没有新增会话结构或派发操作，不加引擎崩溃矩阵行。mod 往返的录制格式与回放见 Claude 适配说明；已提交 2.1.289 的 `clear-rebind` 录制，默认测试套件回放。
+
+## 第一条 Claude 对话（#13）
+
+固定 2.1.289 与 SHA-256 同 #5。主接缝场景在 `crates/nd-daemon/tests/sessions.rs`（真守护进程、真 CLI 与两个 mod、看守、systemd、SQLite，只换模型端点），经 `scripts/test-scenarios.sh` 运行；录制回归在 `crates/nd-claude/tests/conversation.rs`，夹具 `crates/nd-claude/tests/fixtures/conversation/claude/2.1.289/stream-tool-two-turns.jsonl` 由主接缝场景 `a_recorded_conversation_replays_through_the_adapter_state_machine` 录下（设 `ND_RECORD_FIXTURE` 时重写）。实现见 [Claude 适配](../crates/nd-claude/README.md)、[会话组件](../crates/nd-session/README.md)。
+
+| 编号 | 依赖 | 出处 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|---|
+| CONV-ECHO | `--replay-user-messages` 下，CLI 读到 stdin 的 user 行才回显 `type:user,isReplay:true,uuid:<原 uuid>`；回显在这条消息的模型请求之前；CLI 记录文件里这一行用同一个 uuid。写进管道、`command_lifecycle`、`result.user_message_uuid` 都不是回显 | 规格 L231；`research/impl/cli-protocol.md` §6（289 对照 `research/round9/verify/runs/e3-289-default/frames-A.jsonl:4,8`）；本版本实跑 | `a_message_counts_as_landed_only_when_the_cli_echoes_its_uuid`（后端停住时只到「已写出」，零模型请求；恢复后回显原 uuid，记录文件含它）；录制回归 `only_an_echo_with_the_original_uuid_counts_as_landing` | 只认回显：没有回显就停在「已写出」，进程退出则交付不明、不自动重发；关卡不放行改了回显语义的版本 |
+| CONV-STREAM | `--include-partial-messages`：`stream_event` 的 `message_start.message.id` 给 API 消息 id，`content_block_delta.index` 与随后同一消息的 `assistant` 帧按块的先后一一对应（每个完整块一条 `assistant` 帧，在 `content_block_stop` 之前到）；子代理的帧带 `parent_tool_use_id` | 本版本录制（见夹具）；cli-protocol §4 | `ndctl_creates_a_session_and_streams_the_reply`（增量越来越长、最后整块替换、同一个条目）；`recorded_conversation_replays_to_the_committed_facts`（每块的增量连起来等于完整块） | 对不上时增量仍只是临时显示，完整块到了照样整体替换；关卡跑录制回归 |
+| CONV-TURN | 主对话每个回合开头一条 `system/init`（无 `parent_tool_use_id`）；`result` 结束回合，`subtype:"success"` 且 `is_error` 不为真才算成功，`result` 不结任何一条消息；工具结果是不带 `isReplay` 的 user 帧，`content` 里 `tool_result{tool_use_id}` | P §5.1；cli-protocol §4；本版本录制 | `a_recorded_conversation_replays_through_the_adapter_state_machine`、录制回归（两个回合、工具调用与结果配对） | 回合状态只影响显示与闲置判断；看不清时按在跑处理，不回收 |
+| CONV-TASKS | 后台 Bash 起来时 stdout 有 `system/task_started{task_id}`，结束有 `task_notification`；任务结束后 CLI 自己把结果交给主对话的模型（多一次模型请求） | 本版本实跑 | `a_backend_with_a_running_background_task_is_not_reclaimed`（有任务时会话头 `drain:busy`、闲置期满不回收；放行 FIFO 后模型收到结果、之后回收） | 任务表拿不到、流水丢过行、用过定时事项（`CronCreate`、`ScheduleWakeup`）时收尾判据是 Unknown，不回收；R10-E3 的钩子判据在第 4 步接 |
+| CONV-END | 控制请求 `end_session`：CLI 回成功后退出，看守记退出码、单元清理 | `case"end_session"` 分派 B289@216828319、处理 B289@227273232；本版本实跑 | `an_idle_backend_is_reclaimed_and_the_next_message_resumes_it`（回收后看守报 Gone） | 不退出时回收操作失败、进程留着；建议关卡不放行 |
+| CONV-RESUME | 用新建时预定的后端会话 id `--resume` 拉起：同一个后端会话，stdout 不重放旧历史，下一次模型请求带着之前的全部对话 | P §6；本版本实跑 | `an_idle_backend_is_reclaimed_and_the_next_message_resumes_it`（第二次请求含第一轮的提示与回答） | 续接失败时按需拉起失败、代持的消息报失败；会话本身不撤 |
+| CONV-REGISTRY | CLI 写进 `CLAUDE_CONFIG_DIR/sessions/<pid>.json` 的 pid、procStart、pidDomain 与看守报的身份一致，守护进程据此把自己的后端进程认作自有，不当同一后端会话的外部写入者 | #12 的注册表条目；本版本实跑 | 全部会话场景：每次发送都经独占登记的 `Write` 放行才写出 | 认不出时发送停在「等独占」，关卡不放行 |
+| CONV-PRIORITY | 发送意图映射到 user 行的 `priority`：并入→`next`，本回合后→`later`，打断→`now` | P §5.2；cli-protocol §6 | 本单场景只用默认的并入；三种落点由 #18 验 | #18 定；不成立按规格退路 |
+
+本单没有写 CLI 原生存储。新增的结构操作（新建、按需拉起、闲置回收）的崩溃矩阵行在 [会话组件说明](../crates/nd-session/README.md#引擎崩溃矩阵)。场景构建另有一个故障点：守护进程运行目录下的 `backend-fault.json`（`{"contains":"<标记>"}`）让含标记的那条消息写出前把后端进程停住（SIGSTOP），只在 `scenarios` 构建里读，用一次就删。

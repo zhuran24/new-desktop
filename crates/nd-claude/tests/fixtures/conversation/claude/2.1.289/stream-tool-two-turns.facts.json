@@ -1,0 +1,270 @@
+[
+  [
+    {
+      "convo": "written",
+      "uuid": "8bbb9518-5d44-435a-af28-c83760afc30e"
+    }
+  ],
+  [],
+  [
+    {
+      "convo": "lifecycle",
+      "uuid": "8bbb9518-5d44-435a-af28-c83760afc30e",
+      "state": "queued"
+    }
+  ],
+  [
+    {
+      "convo": "lifecycle",
+      "uuid": "8bbb9518-5d44-435a-af28-c83760afc30e",
+      "state": "started"
+    }
+  ],
+  [
+    {
+      "convo": "turn_started"
+    }
+  ],
+  [],
+  [
+    {
+      "convo": "echo",
+      "uuid": "8bbb9518-5d44-435a-af28-c83760afc30e"
+    }
+  ],
+  [],
+  [],
+  [],
+  [
+    {
+      "convo": "tasks",
+      "drain": {
+        "drain": "drained"
+      }
+    },
+    {
+      "convo": "block",
+      "item": {
+        "id": "msg_nd_1:0",
+        "kind": "tool_use",
+        "text": "Bash {\"command\":\"echo ND_TOOL_OK\",\"description\":\"say ok\"}",
+        "raw": {
+          "id": "toolu_rec_1",
+          "input": {
+            "command": "echo ND_TOOL_OK",
+            "description": "say ok"
+          },
+          "name": "Bash",
+          "type": "tool_use"
+        }
+      }
+    }
+  ],
+  [],
+  [],
+  [],
+  [
+    {
+      "convo": "block",
+      "item": {
+        "id": "result:toolu_rec_1",
+        "kind": "tool_result",
+        "text": "ND_TOOL_OK",
+        "raw": {
+          "content": "ND_TOOL_OK",
+          "is_error": false,
+          "tool_use_id": "toolu_rec_1",
+          "type": "tool_result"
+        }
+      }
+    }
+  ],
+  [],
+  [],
+  [],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_2:0",
+      "kind": "text",
+      "text": "命令"
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_2:0",
+      "kind": "text",
+      "text": "跑完"
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_2:0",
+      "kind": "text",
+      "text": "了："
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_2:0",
+      "kind": "text",
+      "text": "ND"
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_2:0",
+      "kind": "text",
+      "text": "_T"
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_2:0",
+      "kind": "text",
+      "text": "OO"
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_2:0",
+      "kind": "text",
+      "text": "L_"
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_2:0",
+      "kind": "text",
+      "text": "OK"
+    }
+  ],
+  [
+    {
+      "convo": "block",
+      "item": {
+        "id": "msg_nd_2:0",
+        "kind": "text",
+        "text": "命令跑完了：ND_TOOL_OK",
+        "raw": {
+          "text": "命令跑完了：ND_TOOL_OK",
+          "type": "text"
+        }
+      }
+    }
+  ],
+  [],
+  [],
+  [],
+  [
+    {
+      "convo": "turn_ended",
+      "ok": true,
+      "subtype": "success",
+      "error": null,
+      "uuids": [
+        "8bbb9518-5d44-435a-af28-c83760afc30e"
+      ]
+    }
+  ],
+  [
+    {
+      "convo": "written",
+      "uuid": "c2dcd113-067a-49d8-a5f4-706d4940060d"
+    }
+  ],
+  [
+    {
+      "convo": "lifecycle",
+      "uuid": "c2dcd113-067a-49d8-a5f4-706d4940060d",
+      "state": "queued"
+    }
+  ],
+  [
+    {
+      "convo": "lifecycle",
+      "uuid": "8bbb9518-5d44-435a-af28-c83760afc30e",
+      "state": "completed"
+    }
+  ],
+  [
+    {
+      "convo": "lifecycle",
+      "uuid": "c2dcd113-067a-49d8-a5f4-706d4940060d",
+      "state": "started"
+    }
+  ],
+  [
+    {
+      "convo": "turn_started"
+    }
+  ],
+  [],
+  [
+    {
+      "convo": "echo",
+      "uuid": "c2dcd113-067a-49d8-a5f4-706d4940060d"
+    }
+  ],
+  [],
+  [],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_3:0",
+      "kind": "text",
+      "text": "第二"
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_3:0",
+      "kind": "text",
+      "text": "轮的"
+    }
+  ],
+  [
+    {
+      "convo": "delta",
+      "item": "msg_nd_3:0",
+      "kind": "text",
+      "text": "回答"
+    }
+  ],
+  [
+    {
+      "convo": "block",
+      "item": {
+        "id": "msg_nd_3:0",
+        "kind": "text",
+        "text": "第二轮的回答",
+        "raw": {
+          "text": "第二轮的回答",
+          "type": "text"
+        }
+      }
+    }
+  ],
+  [],
+  [],
+  [],
+  [
+    {
+      "convo": "turn_ended",
+      "ok": true,
+      "subtype": "success",
+      "error": null,
+      "uuids": [
+        "c2dcd113-067a-49d8-a5f4-706d4940060d"
+      ]
+    }
+  ]
+]

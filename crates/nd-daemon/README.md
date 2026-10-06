@@ -1,6 +1,6 @@
 # 守护进程、同步流与命令收据
 
-日期：2026-10-06。状态：#3、#4 已实现。当前提供本机 `global` 流、配置与存储底座、持久命令收据、可选诊断组件和 `ndctl`；尚未接入后端会话。
+日期：2026-10-06。状态：#3、#4、#13 已实现。当前提供本机 `global` 流、配置与存储底座、持久命令收据、可选诊断组件、Claude 会话（新建、流式对话、按需拉起与闲置回收）和 `ndctl`。
 
 ## 启动与路径
 
@@ -24,6 +24,47 @@ ndctl --socket /path/to/instance/runtime/nd.sock get global
 ```
 
 `get` 打印完整快照后退出；`watch` 首行也是完整快照，之后每行是更新后的完整副本。`page` 经同一协议的只读查询路径。无需 GPUI。
+
+## 会话与 Claude 后端
+
+配了 `watchdogs` 与 `claude` 两节时，守护进程有 Claude 后端：每个后端进程由看守进程托管，会话由会话组件持有（[会话组件说明](../nd-session/README.md)）。没配时会话命令回 `unsupported`。
+
+```toml
+[watchdogs]                       # 看守托管（#6）
+root = "/run/user/1000/new-desktop/runs"
+watchdog = "/home/me/.local/bin/nd-watchdog"
+unit_prefix = "nd-run"
+slice = "nd-backends.slice"
+
+[claude]
+cli = "/path/to/pinned/claude"    # 钉住的 CLI，按后端进程看到的路径写
+hook_mod = "/path/to/mods/new-desktop"
+action_mod = "/path/to/mods/new-desktop-actions"
+config_dir = "/home/me/.claude"   # CLI 的配置目录：独占登记扫描它的 sessions/ 与 jobs/
+# socket = "…/mod.sock"           # mod 通道，默认运行目录下的 mod.sock（约 100 字节以内）
+inherit_env = true                # 后端进程的基础环境取守护进程继承的环境；BUN_OPTIONS 总会去掉
+# env = { KEY = "value" }         # 追加或覆盖的环境变量
+hello_timeout_ms = 10000          # 等两个 mod 报到；超时算拉起成功、只能聊天
+record = false                    # 录 mod 往返与看守流水（场景测试用）
+
+[sessions]
+idle_reclaim_ms = 900000          # 当前进程闲置多久回收，默认 15 分钟
+tick_ms = 1000                    # 闲置检查间隔
+```
+
+`claude`、`watchdogs` 两节在启动时读，改了要重启守护进程才生效。启动次序：独占登记进入恢复中 → 看守托管报每个还在的后端进程的身份 → 名册装载有活进程或未完操作的会话、适配器接回（续读流水、对账未结的票）→ 独占登记身份已知、第一次扫描完成 → 放行；放行之前起操作的命令照常受理，操作等着。
+
+```bash
+ndctl new --cwd ~/proj --model claude-haiku-4-5 --follow "你好"
+ndctl send <会话 id> --follow "接着说"
+ndctl send <会话 id> --intent after_turn "这一回合结束再看这条"
+ndctl watch session/<会话 id>
+ndctl page sessions
+```
+
+`new` 发 `session.create`（命令 id 自动生成），首行打印 `{command, session, reply}`；`--follow` 之后订阅 `session/<id>`，每个变了的条目打一行 `{"item":…}`（流式文字会以 `complete:false`、越来越长的同一条目出现），直到这一轮安静下来（没有没结论的消息、回合结束），或会话撤掉、部分完成。`--timeout` 秒数默认 120。命令与条目格式见会话组件说明。
+
+协议上：`hello` 多协商 `sessions`、`session` 两个命名空间；`global` 快照带侧栏的会话条目和撤掉会话的一次性提示；`get sessions` 分页取列表；`subscribe {stream:"session/<id>"}` 每条连接每个会话流一个转发任务，没有这个会话回 `error{code:"not_found"}`，转发落后或队列满就断开连接；会话命令不经守护进程的全局锁，等会话执行器提交后回收据。订阅某个会话流期间算「有人在看」，这个会话的后端进程不闲置回收。
 
 ## 配置与组件
 

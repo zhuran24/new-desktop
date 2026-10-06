@@ -69,6 +69,49 @@ struct CommandsConfig {
 impl Section for CommandsConfig {
     const NAME: &'static str = "commands";
 }
+/// Claude 后端：钉住的 CLI、两个 mod、CLI 的配置目录（独占登记扫描它的注册表）。没配就没有 Claude 后端。
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct ClaudeSection {
+    cli: PathBuf,
+    hook_mod: PathBuf,
+    action_mod: PathBuf,
+    config_dir: PathBuf,
+    #[serde(default)]
+    socket: Option<PathBuf>,
+    /// 后端进程的基础环境取守护进程继承的环境；测试关掉它，只用 `env`。
+    #[serde(default = "yes")]
+    inherit_env: bool,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default = "hello_ms")]
+    hello_timeout_ms: u64,
+    #[serde(default = "poll_ms")]
+    poll_timeout_ms: u64,
+    #[serde(default = "init_ms")]
+    init_timeout_ms: u64,
+    #[serde(default)]
+    record: bool,
+}
+fn yes() -> bool {
+    true
+}
+fn hello_ms() -> u64 {
+    10_000
+}
+fn poll_ms() -> u64 {
+    25_000
+}
+fn init_ms() -> u64 {
+    30_000
+}
+#[derive(Clone, Deserialize)]
+struct SessionsConfig {
+    idle_reclaim_ms: u64,
+    tick_ms: u64,
+}
+impl Section for SessionsConfig {
+    const NAME: &'static str = "sessions";
+}
 #[derive(Clone, Deserialize)]
 struct WireConfig {
     send_queue: usize,
@@ -80,6 +123,15 @@ impl Section for WireConfig {
 fn validate_config(value: &Value) -> nd_config::Result<()> {
     serde_json::from_value::<Option<nd_runs::Config>>(value["watchdogs"].clone())
         .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
+    serde_json::from_value::<Option<ClaudeSection>>(value["claude"].clone())
+        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
+    let sessions: SessionsConfig = serde_json::from_value(value["sessions"].clone())
+        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
+    if sessions.idle_reclaim_ms == 0 || !(1..=60_000).contains(&sessions.tick_ms) {
+        return Err(nd_config::Error::Invalid(
+            "闲置回收时限须大于 0，检查间隔须为 1..60000ms".into(),
+        ));
+    }
     serde_json::from_value::<DiagnosticsConfig>(value["diagnostics"].clone())
         .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
     let storage: StorageConfig = serde_json::from_value(value["storage"].clone())
@@ -107,6 +159,7 @@ fn validate_config(value: &Value) -> nd_config::Result<()> {
     Ok(())
 }
 struct Engine {
+    sessions: Arc<nd_session::Sessions>,
     runs: Option<nd_runs::Watchdogs>,
     runs_config: Option<nd_runs::Config>,
     blobs: Arc<nd_store::Blobs>,
@@ -128,6 +181,7 @@ impl Engine {
         config: Arc<Config>,
         blobs: Arc<nd_store::Blobs>,
         store: Arc<nd_store::Store>,
+        sessions: Arc<nd_session::Sessions>,
         _root: &Path,
     ) -> Result<Self> {
         store.write(|tx| {
@@ -175,6 +229,7 @@ impl Engine {
         let diagnostics = kernel.require(diagnostics);
         let (events, _) = broadcast::channel(128);
         let mut this = Self {
+            sessions,
             runs: None,
             runs_config: None,
             blobs,
@@ -218,7 +273,11 @@ impl Engine {
         Ok(())
     }
     fn names(&self) -> BTreeMap<String, u32> {
-        let mut names = BTreeMap::from([("system".into(), 1)]);
+        let mut names = BTreeMap::from([
+            ("system".into(), 1),
+            ("sessions".into(), 1),
+            ("session".into(), 1),
+        ]);
         if self.runs.is_some() {
             names.insert("runs".into(), 1);
         }
@@ -238,6 +297,7 @@ impl Engine {
                 text: self.config_error.clone().unwrap_or("守护进程已就绪".into()),
             },
         }];
+        items.extend(self.sessions.listing().items());
         if let Some(optional) = self.diagnostics.with(|p| p.snapshot()) {
             items.extend(optional);
         }
@@ -386,6 +446,108 @@ impl Paths {
         })
     }
 }
+/// 组装会话组件，次序照恢复的依赖：独占登记（恢复中）→ 看守托管报身份 → 适配器与名册装载会话、
+/// 对账 → 独占登记身份已知、第一次扫描完成 → 放行。会话的命令在放行之前起操作会等着。
+async fn assemble_sessions(
+    config: &Config,
+    store: &Arc<nd_store::Store>,
+    paths: &Paths,
+) -> Result<Arc<nd_session::Sessions>> {
+    let value = config.snapshot().value;
+    let watchdogs_config: Option<nd_runs::Config> =
+        serde_json::from_value(value["watchdogs"].clone())?;
+    let claude: Option<ClaudeSection> = serde_json::from_value(value["claude"].clone())?;
+    let sessions_config: SessionsConfig = serde_json::from_value(value["sessions"].clone())?;
+    let keep: u64 = value["commands"]["receipt_keep_ms"]
+        .as_u64()
+        .unwrap_or(604800000);
+    let registry_root = claude
+        .as_ref()
+        .map(|c| c.config_dir.clone())
+        .unwrap_or_else(|| paths.data.join("no-claude-registry"));
+    let claims = {
+        let store = store.clone();
+        Arc::new(
+            tokio::task::spawn_blocking(move || {
+                nd_claims::Exclusivity::open(store, nd_claims::RegistryConfig::new(registry_root))
+            })
+            .await??,
+        )
+    };
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut backends = nd_backend::Backends::new();
+    if let Some(watchdogs_config) = watchdogs_config {
+        let watchdogs = Arc::new(nd_runs::Watchdogs::new(watchdogs_config)?);
+        // 看守托管先报每个还在的后端进程的身份。
+        for found in watchdogs.recover().await? {
+            let claims = claims.clone();
+            tokio::task::spawn_blocking(move || {
+                claims.observe_watchdog(&found, generation, nd_claims::BackendKind::Claude)
+            })
+            .await??;
+        }
+        if let Some(claude) = claude {
+            let mut cfg = nd_claude::ClaudeConfig::new(
+                claude.cli,
+                claude.hook_mod,
+                claude.action_mod,
+                claude
+                    .socket
+                    .unwrap_or_else(|| paths.runtime.join("mod.sock")),
+            );
+            cfg.env = if claude.inherit_env {
+                std::env::vars().collect()
+            } else {
+                BTreeMap::new()
+            };
+            cfg.env.extend(claude.env);
+            cfg.hello_timeout = Duration::from_millis(claude.hello_timeout_ms);
+            cfg.poll_timeout = Duration::from_millis(claude.poll_timeout_ms);
+            cfg.init_timeout = Duration::from_millis(claude.init_timeout_ms);
+            cfg.record = claude.record;
+            let record = claude.record;
+            let adapter = nd_claude::ClaudeBackend::new(
+                nd_claude::Claude::new(cfg, watchdogs.clone())?,
+                watchdogs,
+                claims.clone(),
+                generation,
+                nd_claude::ClaudeBackendConfig {
+                    record_dir: record.then(|| paths.data.join("recordings")),
+                    ..Default::default()
+                },
+            );
+            backends = backends.with(adapter);
+        }
+    }
+    let sessions = nd_session::Sessions::new(
+        store.clone(),
+        claims.clone(),
+        backends,
+        nd_session::EngineConfig {
+            receipt_keep_ms: keep,
+            idle_reclaim: Duration::from_millis(sessions_config.idle_reclaim_ms),
+            tick: Duration::from_millis(sessions_config.tick_ms),
+            check_purity: cfg!(feature = "scenarios"),
+            faults: None,
+        },
+    )?;
+    sessions.recover()?;
+    // 两层恢复：身份已知 → 第一次注册表扫描完成；之后放行不再回 Recovering。
+    tokio::task::spawn_blocking(move || -> nd_store::Result<()> {
+        claims.observe(nd_claims::Observed::Recovered)?;
+        // 扫描失败（半文件、读不了）时登记停在 Checking，由它自己的线程按时重扫；不挡守护进程起来。
+        if let Err(e) = claims.refresh() {
+            eprintln!("CLI 注册表第一次扫描没完成：{e}");
+        }
+        Ok(())
+    })
+    .await??;
+    Ok(sessions)
+}
+
 pub async fn run(root: &Path) -> Result<()> {
     run_at(Paths::isolated(root)).await
 }
@@ -404,7 +566,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     let (_watcher, mut changes) = source.watch()?;
     let config = Arc::new(Config::open(
         source,
-        json!({"watchdogs":null,"diagnostics":{"enabled":true},"commands":{"receipt_keep_ms":604800000},"wire":{"send_queue":128,"send_timeout_ms":5000},"storage":{"blob_grace_seconds":86400,"gc_interval_seconds":3600}}),
+        json!({"watchdogs":null,"claude":null,"sessions":{"idle_reclaim_ms":900000,"tick_ms":1000},"diagnostics":{"enabled":true},"commands":{"receipt_keep_ms":604800000},"wire":{"send_queue":128,"send_timeout_ms":5000},"storage":{"blob_grace_seconds":86400,"gc_interval_seconds":3600}}),
         validate_config,
     )?);
     let store = Arc::new(nd_store::Store::open(paths.data.join("state.sqlite"), 4)?);
@@ -412,9 +574,18 @@ pub async fn run_at(paths: Paths) -> Result<()> {
         paths.data.join("blobs"),
         store.clone(),
     )?);
+    let sessions = assemble_sessions(&config, &store, &paths).await?;
     let state = Arc::new(Mutex::new(
-        Engine::open(config.clone(), blobs.clone(), store.clone(), &paths.data).await?,
+        Engine::open(
+            config.clone(),
+            blobs.clone(),
+            store.clone(),
+            sessions.clone(),
+            &paths.data,
+        )
+        .await?,
     ));
+    let mut listing_changes = sessions.listing().changes();
     let mut storage_config = config.section::<StorageConfig>()?;
     let collector = tokio::spawn(async move {
         while let Ok(current) = storage_config.get() {
@@ -461,6 +632,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
             tokio::select! {
                 _ = changed => {},
                 _ = timeout => {},
+                _ = listing_changes.changed() => {},
                 change = changes.recv() => {
                     if change.is_none() { break; }
                     let result = config.refresh();
@@ -545,13 +717,65 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
     let mut greeted = false;
     let mut subscribed = false;
     let mut events = state.lock().await.events.subscribe();
+    let sessions = state.lock().await.sessions.clone();
+    // 会话流各有一个转发任务；队列满或落后太多就断开，界面重连后恢复。
+    let (overflow, mut overflowed) = tokio::sync::mpsc::channel::<()>(1);
+    let mut forwards: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
     loop {
         tokio::select! {
-            _ = &mut writer => return,
+            _ = &mut writer => {
+                for forward in forwards.values() { forward.abort(); }
+                return;
+            },
+            _ = overflowed.recv() => break,
             frame = incoming.next() => {
                 let Some(Ok(frame)) = frame else { break; };
                 let Message::Text(text) = frame else { if matches!(frame, Message::Close(_)) { break; } else { continue; } };
                 let Ok(req) = serde_json::from_str::<Request>(&text) else { break; };
+                // 会话的命令与流不经全局锁：命令要等会话执行器提交，流各自转发。
+                let req = match req {
+                    Request::Execute { id, command } if greeted && command.name.starts_with("session.") => {
+                        let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { reason: "没有这个会话命令".into() });
+                        if !enqueue(&outgoing, WireResponse::CommandReply { id, result }) { break; }
+                        continue;
+                    }
+                    Request::Subscribe { stream, since } if greeted && stream.starts_with("session/") => {
+                        let id = nd_backend::SessionId(stream["session/".len()..].to_owned());
+                        let subscription = match sessions.subscribe(&id, since) {
+                            Ok(Some(subscription)) => subscription,
+                            Ok(None) => {
+                                if !enqueue(&outgoing, WireResponse::Error { code: "not_found".into(), message: format!("没有会话 {id}") }) { break; }
+                                continue;
+                            }
+                            Err(e) => {
+                                if !enqueue(&outgoing, WireResponse::Error { code: "unavailable".into(), message: e.to_string() }) { break; }
+                                continue;
+                            }
+                        };
+                        if let Some(old) = forwards.remove(&stream) { old.abort(); }
+                        let (first, replay, mut feed, guard) = subscription.into_parts();
+                        let mut ok = true;
+                        for event in replay {
+                            ok &= enqueue(&outgoing, WireResponse::Event { event });
+                        }
+                        ok &= enqueue(&outgoing, first);
+                        if !ok { break; }
+                        let queue = outgoing.clone();
+                        let overflow = overflow.clone();
+                        forwards.insert(stream, tokio::spawn(async move {
+                            let _watching = guard;
+                            loop {
+                                match feed.recv().await {
+                                    Ok(event) => if !enqueue(&queue, WireResponse::Event { event }) { let _ = overflow.try_send(()); break; },
+                                    Err(broadcast::error::RecvError::Lagged(_)) => { let _ = overflow.try_send(()); break; },
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        }));
+                        continue;
+                    }
+                    other => other,
+                };
                 let mut replay = vec![];
                 let response = {
                     let mut engine = state.lock().await;
@@ -576,7 +800,9 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                             } else { WireResponse::Snapshot { snapshot: engine.snapshot.clone() } }
                         },
                         Request::Get { id, res, page } if greeted => {
-                            let result = if res == "system" {
+                            let result = if res == "sessions" {
+                                page_items(engine.sessions.listing().items(), &page)
+                            } else if res == "system" {
                                 page_items(engine.snapshot.items.iter().filter(|i| i.namespace == "system").cloned().collect(), &page)
                             } else if res == "runs" {
                                 match &engine.runs {
@@ -621,6 +847,9 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                 Err(_) => break
             }
         }
+    }
+    for (_, forward) in forwards {
+        forward.abort();
     }
     let _ = close.send(());
     let _ = writer.await;

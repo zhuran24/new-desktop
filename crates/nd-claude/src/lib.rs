@@ -4,13 +4,17 @@
 //! 和 mod 通道（unix socket 上的 HTTP 长轮询）。会话引擎、后端端口由后续工单接入。
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+pub mod backend;
 pub mod channel;
+pub mod convo;
 pub mod fixture;
 pub mod launch;
 pub mod protocol;
 pub mod run;
 
+pub use backend::{ClaudeBackend, ClaudeBackendConfig};
 pub use channel::{Binding, CommandResult, ModChannel, Recorded};
+pub use convo::{Conversation, Convo};
 pub use launch::{ClaudeConfig, OLD_MODS, Open, Start, launch_spec, settings};
 pub use protocol::{Fact, ModEvent, ModState};
 pub use run::{Availability, Caps, Claude, ClaudeRun, Feature, InitOptions, Readiness, Ready};
