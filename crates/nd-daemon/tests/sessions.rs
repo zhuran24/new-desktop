@@ -1778,7 +1778,7 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
         .unwrap();
     let model = models.iter().find(|m| m.value == "haiku").unwrap();
     let answer = "# 中文回答\n\n```rust\nfn main() { println!(\"你好\"); }\n```\n流式尾巴";
-    fx.scenario.endpoint().enqueue(
+    let finish = fx.scenario.endpoint().enqueue_finish_held(
         Route::new(None, "claude-haiku-4-5-20251001"),
         ModelReply::streaming_text(answer, 1, 90),
     );
@@ -1829,6 +1829,17 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
     });
     let block = partial.items.iter().find(|i| i.kind == "text").unwrap();
     let identity = header(&partial)["process"]["run"].clone();
+    // 正文全部到达后仍扣住结束帧，重连是否发生在流式期间不靠速度决定。
+    fx.wait(
+        stream.trim_start_matches("session/"),
+        "body before cold reopen",
+        |s| {
+            s.items
+                .iter()
+                .any(|i| i.id == block.id && i.data["text"] == answer)
+        },
+    )
+    .await;
     // 丢掉全部界面副本与命令连接；新实例只能靠冷快照恢复累积内容。
     drop(feed);
     drop(client);
@@ -1837,6 +1848,10 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
         panic!("cold snapshot missing")
     };
     let resumed = cold.items.iter().find(|i| i.id == block.id).unwrap();
+    assert_eq!(
+        resumed.data["complete"], false,
+        "cold snapshot must precede the end frame"
+    );
     assert!(
         resumed.data["text"]
             .as_str()
@@ -1844,9 +1859,15 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
             .starts_with(block.data["text"].as_str().unwrap())
     );
     assert_eq!(header(&cold)["process"]["run"], identity);
+    finish.release();
     let session = stream.trim_start_matches("session/");
     let finished = fx
-        .wait(session, "complete Markdown", |s| texts(s) == [answer])
+        .wait(session, "complete Markdown", |s| {
+            texts(s) == [answer]
+                && s.items
+                    .iter()
+                    .any(|i| i.id == block.id && i.data["complete"] == true)
+        })
         .await;
     assert_eq!(
         finished.items.iter().filter(|i| i.id == block.id).count(),
