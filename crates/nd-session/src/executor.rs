@@ -364,6 +364,7 @@ impl Executor {
                 self.reload();
                 if let Some(reply) = reply {
                     let _ = reply.send(CommandReply::Unavailable {
+                        code: None,
                         reason: e.to_string(),
                     });
                 }
@@ -391,6 +392,7 @@ impl Executor {
         }
         if let Some(reply) = reply {
             let _ = reply.send(value.unwrap_or(CommandReply::Unavailable {
+                code: None,
                 reason: "no reply".into(),
             }));
         }

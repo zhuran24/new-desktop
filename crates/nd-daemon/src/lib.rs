@@ -382,6 +382,7 @@ impl Engine {
                 result
             }
             Err(e) => nd_wire::CommandReply::Unavailable {
+                code: None,
                 reason: e.to_string(),
             },
         }
@@ -785,13 +786,13 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                         let sessions = sessions.clone();
                         let outgoing = outgoing.clone();
                         tokio::spawn(async move {
-                            let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { reason: "没有这个会话命令".into() });
+                            let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { code: None, reason: "没有这个会话命令".into() });
                             enqueue(&outgoing, WireResponse::CommandReply { id, result });
                         });
                         continue;
                     }
                     Request::Execute { id, command } if greeted && command.name.starts_with("session.") => {
-                        let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { reason: "没有这个会话命令".into() });
+                        let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { code: None, reason: "没有这个会话命令".into() });
                         if !enqueue(&outgoing, WireResponse::CommandReply { id, result }) { break; }
                         continue;
                     }

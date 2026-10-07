@@ -11,6 +11,49 @@ use std::{path::Path, time::Duration};
 const MODEL: &str = "claude-haiku-4-5";
 
 #[tokio::test]
+async fn an_unavailable_command_does_not_block_other_desktop_commands_or_retry_forever() {
+    let fx = Fixture::start("command-unavailable", 3_600_000).await;
+    let client = nd_ui_core::CommandClient::start(fx.socket()).unwrap();
+    let unavailable = Command {
+        id: "unsupported-command".into(),
+        device: "desktop".into(),
+        name: "session.not_implemented".into(),
+        args: json!({"session":"missing"}),
+        expect: json!({}),
+    };
+    let blocked_client = client.clone();
+    let blocked = tokio::spawn(async move { blocked_client.command(unavailable).await });
+    // A real read on a separate connection confirms the daemon is processing work.
+    fx.ui().await.subscribe("global").await.unwrap();
+    let accepted = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.command(Command {
+            id: "independent-command".into(),
+            device: "desktop".into(),
+            name: "diagnostics.set_note".into(),
+            args: json!({"text":"still responsive"}),
+            expect: json!({"revision":0}),
+        }),
+    )
+    .await
+    .expect("one retrying command must not monopolize the command client")
+    .unwrap();
+    assert!(matches!(
+        accepted,
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
+    let reply = tokio::time::timeout(Duration::from_secs(5), blocked)
+        .await
+        .expect("persistent unavailability must be returned to the caller")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(reply, CommandReply::Unavailable { .. }));
+    fx.close();
+}
+
+#[tokio::test]
 async fn backend_exit_ends_the_running_round_before_the_next_prompt_resumes() {
     let fx = Fixture::start("round-backend-exit", 3_600_000).await;
     fx.scenario

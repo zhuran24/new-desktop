@@ -302,6 +302,14 @@ pub enum Receipt {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableCode {
+    Recovering,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandReply {
@@ -313,6 +321,8 @@ pub enum CommandReply {
     /// 明确未受理、没有新收据，只有这一种情况可自动同 id 重试。
     Unavailable {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<UnavailableCode>,
     },
     /// 仅同步副本产生：断线后查不到收据，不能自动重发正文。
     DeliveryUnknown,

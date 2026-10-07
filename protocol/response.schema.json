@@ -257,6 +257,16 @@
           "description": "明确未受理、没有新收据，只有这一种情况可自动同 id 重试。",
           "type": "object",
           "properties": {
+            "code": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UnavailableCode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "reason": {
               "type": "string"
             },
@@ -532,6 +542,13 @@
         "epoch",
         "cursor",
         "items"
+      ]
+    },
+    "UnavailableCode": {
+      "type": "string",
+      "enum": [
+        "recovering",
+        "unknown"
       ]
     }
   }

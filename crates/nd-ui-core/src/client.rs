@@ -40,8 +40,13 @@ impl CommandClient {
             .spawn(move || {
                 runtime.block_on(async move {
                     while let Some(work) = rx.recv().await {
+                        let wait = if matches!(&work, Work::Deliver(..)) {
+                            DELIVERY_WAIT
+                        } else {
+                            Duration::from_secs(5)
+                        };
                         let work = match work {
-                            Work::Deliver(command, mut done) => {
+                            Work::Deliver(command, mut done) | Work::Command(command, mut done) => {
                                 let path = path.clone();
                                 tokio::spawn(async move {
                                     let result = async {
@@ -53,7 +58,7 @@ impl CommandClient {
                                         .map_err(|_| "连接守护进程超时".to_owned())?
                                         .map_err(|e| e.to_string())?;
                                         let result = ui
-                                            .command_waiting(&command, DELIVERY_WAIT)
+                                            .command_waiting(&command, wait)
                                             .await
                                             .map_err(|e| e.to_string());
                                         let _ = tokio::time::timeout(
@@ -94,9 +99,6 @@ impl CommandClient {
                                     Work::Blob(_, done) => {
                                         let _ = done.send(Err(why));
                                     }
-                                    Work::Command(_, done) => {
-                                        let _ = done.send(Err(why));
-                                    }
                                     Work::Models(_, _, done) => {
                                         let _ = done.send(Err(why));
                                     }
@@ -106,7 +108,9 @@ impl CommandClient {
                                     Work::Receipt(_, done) => {
                                         let _ = done.send(Err(why));
                                     }
-                                    Work::Deliver(..) => unreachable!("另起任务处理"),
+                                    Work::Command(..) | Work::Deliver(..) => {
+                                        unreachable!("另起任务处理")
+                                    }
                                 }
                                 continue;
                             }
@@ -139,17 +143,7 @@ impl CommandClient {
                                 let _ = done
                                     .send(ui.receipt(&command_id).await.map_err(|e| e.to_string()));
                             }
-                            Work::Command(command, mut done) => {
-                                // 界面取消等待后停止未受理命令的退避循环；已受理的效果不撤销。
-                                tokio::select! {
-                                    biased;
-                                    _ = done.closed() => {},
-                                    result = ui.command(&command) => {
-                                        let _ = done.send(result.map_err(|e| e.to_string()));
-                                    }
-                                }
-                            }
-                            Work::Deliver(..) => unreachable!("另起任务处理"),
+                            Work::Command(..) | Work::Deliver(..) => unreachable!("另起任务处理"),
                             Work::Models(backend, cwd, done) => {
                                 let result = tokio::time::timeout(
                                     Duration::from_secs(50),

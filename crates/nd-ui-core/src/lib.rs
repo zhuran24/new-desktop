@@ -156,7 +156,17 @@ impl SyncReplica {
         let mut attempt = 0u32;
         loop {
             match self.command_once(command, wait).await {
-                Ok(nd_wire::CommandReply::Unavailable { .. }) => {
+                Ok(result @ nd_wire::CommandReply::Unavailable { .. }) => {
+                    let recovering = matches!(
+                        &result,
+                        nd_wire::CommandReply::Unavailable {
+                            code: Some(nd_wire::UnavailableCode::Recovering),
+                            ..
+                        }
+                    );
+                    if !recovering && attempt >= 4 {
+                        return Ok(result);
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(5)))
                         .await;
                     attempt = attempt.saturating_add(1);

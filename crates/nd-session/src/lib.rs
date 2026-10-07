@@ -403,6 +403,7 @@ impl Sessions {
                     Ok(nd_wire::ReceiptLookup::Conflict) => CommandReply::Conflict,
                     Ok(nd_wire::ReceiptLookup::Expired) => CommandReply::Expired,
                     _ => CommandReply::Unavailable {
+                        code: Some(nd_wire::UnavailableCode::Recovering),
                         reason: "守护进程恢复中，命令未受理".into(),
                     },
                 },
@@ -414,6 +415,7 @@ impl Sessions {
             Ok(None) => return Some(self.reject_without_session(command, "not_found")),
             Err(e) => {
                 return Some(CommandReply::Unavailable {
+                    code: None,
                     reason: e.to_string(),
                 });
             }
@@ -429,6 +431,7 @@ impl Sessions {
             .is_err()
         {
             return Some(CommandReply::Unavailable {
+                code: None,
                 reason: "会话执行器已停".into(),
             });
         }
@@ -444,6 +447,7 @@ impl Sessions {
                 Ok(nd_wire::ReceiptLookup::Conflict) => CommandReply::Conflict,
                 Ok(nd_wire::ReceiptLookup::Expired) => CommandReply::Expired,
                 _ => CommandReply::Unavailable {
+                    code: None,
                     reason: "会话执行器已停，命令没有受理".into(),
                 },
             },
@@ -477,6 +481,7 @@ impl Sessions {
                 })
             })
             .unwrap_or_else(|e| CommandReply::Unavailable {
+                code: None,
                 reason: e.to_string(),
             })
     }
