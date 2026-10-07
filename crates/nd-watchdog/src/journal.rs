@@ -106,7 +106,7 @@ impl Journal {
         };
         if let Some(gap) = self.emergency.take() {
             if self.store(gap.clone()).is_err() {
-                self.emergency = Some(gap);
+                self.remember_loss(gap.seq, gap.end_seq);
             } else {
                 let _ = std::fs::remove_file(self.directory.join("lost.json"));
             }
@@ -127,6 +127,19 @@ impl Journal {
             return Err("journal storage failed: LostLines".into());
         }
         Ok(())
+    }
+    fn remember_loss(&mut self, seq: u64, end_seq: u64) {
+        self.stats.lost_lines = true;
+        let gap = self.emergency.get_or_insert(Record {
+            seq,
+            end_seq,
+            ms: 0,
+            event: Event::Gap {
+                reason: GapReason::LostLines,
+            },
+        });
+        gap.seq = gap.seq.min(seq);
+        gap.end_seq = gap.end_seq.max(end_seq);
     }
     fn store(&mut self, record: Record) -> Result<()> {
         let overflow = self.stats.retained_bytes >= self.limits.hard_bytes;
@@ -180,15 +193,31 @@ impl Journal {
             segment.size
         };
         let bytes = serde_json::to_vec(&row)?;
-        file.seek(SeekFrom::Start(offset))?;
-        if let Err(e) = file.write_all(&bytes).and_then(|_| file.write_all(b"\n")) {
+        let size = offset + bytes.len() as u64 + 1;
+        if let Err(e) = file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(&bytes))
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.set_len(size))
+        {
+            // 合并重写已覆盖旧 Gap；失败损失范围从旧起点算，不能只标新序号。
             let _ = file.set_len(offset);
+            self.stats.retained_bytes = self.stats.retained_bytes - segment.size + offset;
+            if segment.overflow {
+                self.stats.overflow_bytes = self.stats.overflow_bytes - segment.size + offset;
+            }
+            segment.size = offset;
+            segment.end = row.seq.saturating_sub(1);
             self.active = None;
             self.tail = None;
+            if offset == 0
+                && let Some(empty) = self.segments.pop_back()
+            {
+                let _ = std::fs::remove_file(empty.path);
+            }
+            self.remember_loss(row.seq, row.end_seq);
             return Err(e.into());
         }
-        let size = offset + bytes.len() as u64 + 1;
-        file.set_len(size)?;
         self.stats.retained_bytes = self.stats.retained_bytes - segment.size + size;
         if segment.overflow {
             self.stats.overflow_bytes = self.stats.overflow_bytes - segment.size + size;

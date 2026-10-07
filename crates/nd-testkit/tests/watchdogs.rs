@@ -725,3 +725,103 @@ async fn reconnect_allocates_after_an_input_that_is_still_blocked_in_the_pipe() 
     assert_eq!(output, ["A:200000", "B:1"]);
     scenario.close().unwrap();
 }
+
+#[tokio::test]
+async fn a_failed_gap_extension_preserves_the_entire_previous_gap_range() {
+    use nd_watchdog_proto::{Event, GapReason};
+    let scenario = Scenario::start(options("gap-write-failure")).await.unwrap();
+    let mut config = scenario.watchdog_config().unwrap();
+    // 只对本场景看守忽略 SIGXFSZ，让真实文件限额失败返回 EFBIG；不替换 Journal。
+    config.launcher.extend(["/usr/bin/python3", "-c", "import os,signal,sys; signal.signal(signal.SIGXFSZ,signal.SIG_IGN); os.execv(sys.argv[1],sys.argv[1:])"].map(str::to_owned));
+    let runs = nd_runs::Watchdogs::new(config).unwrap();
+    let script = "import pathlib,time\nfor _ in range(9): print('{\"type\":\"stream_event\"}',flush=True)\nwhile not pathlib.Path('/sandbox/extend-gap').exists(): time.sleep(.01)\nprint('{\"type\":\"stream_event\"}',flush=True)\nwhile not pathlib.Path('/sandbox/recover-gap').exists(): time.sleep(.01)\nprint('recovered',flush=True)\ntime.sleep(60)";
+    let mut spec = scenario
+        .watchdog_spec("gap", "/usr/bin/python3", &["-u", "-c", script])
+        .unwrap();
+    spec.limits.soft_bytes = 0;
+    runs.launch("gap", spec).await.unwrap();
+    let mut link = runs.link("gap").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if link
+                .read(0, 100)
+                .await
+                .unwrap()
+                .last()
+                .is_some_and(|r| r.end_seq == 9)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let path = std::fs::read_dir(runs.directory("gap").unwrap().join("spool"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let size = path.metadata().unwrap().len();
+    let limit = std::process::Command::new("prlimit")
+        .args([
+            "--pid",
+            &link.hello.watchdog.pid.to_string(),
+            &format!("--fsize={size}:unlimited"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        limit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&limit.stderr)
+    );
+    std::fs::write(scenario.root().join("extend-gap"), "").unwrap();
+    let rows = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = link.read(0, 100).await.unwrap();
+            if rows.last().is_some_and(|r| r.end_seq == 10) {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.first().unwrap().seq,
+        1,
+        "failed rewrite must not erase earlier gap coverage: {rows:?}"
+    );
+    assert!(matches!(
+        rows.last().unwrap().event,
+        Event::Gap {
+            reason: GapReason::LostLines
+        }
+    ));
+    let restored = std::process::Command::new("prlimit")
+        .args([
+            "--pid",
+            &link.hello.watchdog.pid.to_string(),
+            "--fsize=unlimited:unlimited",
+        ])
+        .status()
+        .unwrap();
+    assert!(restored.success());
+    std::fs::write(scenario.root().join("recover-gap"), "").unwrap();
+    let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = link.read(0, 100).await.unwrap();
+            if rows.last().is_some_and(|r| r.end_seq == 11) {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!((recovered[0].seq, recovered[0].end_seq), (1, 10));
+    assert!(matches!(&recovered[1].event, Event::Out { line } if line == "recovered"));
+    scenario.close().unwrap();
+}
