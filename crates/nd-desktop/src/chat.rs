@@ -743,6 +743,7 @@ impl Desktop {
             .flex_col()
             .gap(px(t.spacing.medium))
             .child(div().text_color(rgba(t.colors.muted)).child(view.header))
+            .child(self.session_settings_view(cx))
             .children(items)
             .into_any_element()
     }

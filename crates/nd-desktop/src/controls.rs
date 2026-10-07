@@ -5,6 +5,61 @@ use nd_wire::{Command, CommandReply, Receipt};
 use serde_json::{Value, json};
 
 impl Desktop {
+    /// 在 Kit 清除 marked range 之前处理目录/标题输入框的 Esc。
+    pub(crate) fn install_auxiliary_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        let window_id = window.window_handle().window_id();
+        self.subscriptions
+            .push(cx.intercept_keystrokes(move |event, window, cx| {
+                if event.keystroke.key != "escape"
+                    || window.window_handle().window_id() != window_id
+                {
+                    return;
+                }
+                let _ = weak.update(cx, |this, cx| {
+                    let focused = [&this.directory, &this.title_editor]
+                        .into_iter()
+                        .any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+                    if !focused {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    if !std::mem::replace(&mut this.auxiliary_escape_held, true) {
+                        this.auxiliary_escape(window, cx);
+                    }
+                });
+            }));
+        for input in [&self.directory, &self.title_editor] {
+            self.subscriptions.push(cx.subscribe(
+                input,
+                |this, _, event: &gpui_kit::component::input::InputEvent, _| {
+                    if matches!(event, gpui_kit::component::input::InputEvent::Blur) {
+                        this.auxiliary_escape_held = false;
+                    }
+                },
+            ));
+        }
+    }
+    fn auxiliary_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for input in [&self.directory, &self.title_editor] {
+            if !input.read(cx).focus_handle(cx).is_focused(window) {
+                continue;
+            }
+            let cancelled = input.update(cx, |input, cx| {
+                if let Some(marked) = input.marked_text_range(window, cx) {
+                    input.replace_text_in_range(Some(marked), "", window, cx);
+                    input.unmark_text(window, cx);
+                    true
+                } else {
+                    false
+                }
+            });
+            if cancelled {
+                return;
+            }
+        }
+        self.escape_pressed(cx);
+    }
     fn interaction(&self) -> Value {
         self.session_snapshot
             .as_ref()
@@ -21,12 +76,13 @@ impl Desktop {
         });
         match self.escape.press(
             self.started.elapsed().as_millis() as u64,
-            self.state.active_panel.is_some(),
+            self.state.active_panel.is_some() || self.settings_open,
             running,
             caps["rewind_menu"] == true,
         ) {
             Escape::ClosePanel => {
                 self.state.active_panel = None;
+                self.settings_open = false;
             }
             Escape::RewindMenu => {
                 self.state.active_panel = Some("rewind".into());
@@ -234,13 +290,16 @@ impl Desktop {
                                 this.withdraw_message(id,window,cx);
                             }
                             "escape" => { let composer = this.composer.clone(); composer.update(cx,|c,cx|c.scenario_escape(window,cx)); }
-                            "panel" => this.state.active_panel = Some("settings".into()),
+                            "panel" => this.open_session_settings(window,cx),
+                            "title-preedit" => this.title_editor.update(cx,|input,cx| { input.focus(window,cx); input.replace_and_mark_text_in_range(None,"ni",Some(2..2),window,cx); }),
+                            "title-escape" => this.auxiliary_escape(window,cx),
                             _ => panic!("unknown native scenario action"),
                         }
                         cx.notify();
                     }
                     let state = this.composer.update(cx,|c,cx|c.snapshot(window,cx));
-                    let observation = json!({"action":last_action,"text":state.text,"panel":this.state.active_panel,"intent":this.send_intent,"warning":this.warning});
+                    let title_composing = this.title_editor.update(cx,|input,cx| input.marked_text_range(window,cx).is_some());
+                    let observation = json!({"title_composing":title_composing,"action":last_action,"text":state.text,"panel":this.state.active_panel,"settings_open":this.settings_open,"intent":this.send_intent,"warning":this.warning});
                     if observation != last_observation { println!("{}",json!({"native_controls":observation})); last_observation = observation; }
                 }).is_err() { break; }
             }

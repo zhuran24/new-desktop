@@ -27,8 +27,9 @@ pub fn sidebar(snapshot: &Snapshot, state: &ViewState) -> Vec<SessionRow> {
                 selected: session.is_some() && session == state.selected_session,
                 id: item.id.clone(),
                 session,
-                title: item.data["cwd"]
+                title: item.data["title"]
                     .as_str()
+                    .or_else(|| item.data["cwd"].as_str())
                     .unwrap_or(&item.fallback.title)
                     .into(),
                 model: item.data["model"].as_str().unwrap_or_default().into(),

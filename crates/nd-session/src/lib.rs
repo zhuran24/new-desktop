@@ -50,6 +50,7 @@ pub trait Faults: Send + Sync {
 
 #[derive(Clone)]
 pub struct EngineConfig {
+    pub auto_title: bool,
     pub receipt_keep_ms: u64,
     /// 当前进程闲置多久回收；规格默认 15 分钟，测试用配置缩短。
     pub idle_reclaim: Duration,
@@ -62,6 +63,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            auto_title: true,
             receipt_keep_ms: 7 * 24 * 3600 * 1000,
             idle_reclaim: Duration::from_secs(15 * 60),
             tick: Duration::from_secs(1),
@@ -169,11 +171,16 @@ fn list_item(core: &state::Core) -> Item {
             "cwd": meta.cwd,
             "backend": format!("{:?}", meta.kind).to_lowercase(),
             "model": meta.model,
+            "title":meta.title,
             "note": meta.note,
             "process_alive": alive,
         }),
         fallback: Fallback {
-            title: meta.cwd.display().to_string(),
+            title: meta
+                .title
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| meta.cwd.display().to_string()),
             text: if label.is_empty() {
                 meta.status.as_str().into()
             } else {
@@ -359,6 +366,8 @@ impl Sessions {
             | "session.resend"
             | "session.draft.update"
             | "session.withdraw"
+            | "session.configure"
+            | "session.rename"
             | "session.interrupt" => match command.args["session"].as_str() {
                 Some(id) => SessionId(id.to_owned()),
                 None => return Some(self.reject_without_session(command, "invalid")),

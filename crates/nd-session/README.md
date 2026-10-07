@@ -168,3 +168,28 @@
 
 
 恢复控制以本会话来源追平为准：来源未 Recovered 时 interrupt/withdraw 也回无收据 unavailable；来源已追平即使其他会话或独占登记仍在恢复，也允许这两类控制。普通发送/草稿/重发继续使用全局写入闸门。PendingTicket.unknown 区分对账与执行：Unknown 控制不能重放；连续流水证实未写出时只澄清 Lost。迟到控制回应可经 Clarified 更新原结果，回填及引用只结算一次，未知期间保留基准附件引用。成功撤回不产生 session.resend 资格。
+## 会话设置和标题
+
+公共命令均由 `Sessions::execute` 路由，经同一收据账本、会话事务和后端发件箱：
+
+```json
+{"id":"model-change-1","device":"desktop","name":"session.configure","args":{"session":"s-…","setting":{"model":"opus"}},"expect":{"settings_revision":0}}
+{"id":"rename-1","device":"desktop","name":"session.rename","args":{"session":"s-…","title":"新的标题"},"expect":{"title_revision":0}}
+```
+
+`LiveSetting` 一次一项：model、effort、permission_mode 或 ultracode。两条命令返回 Accepted，进展与终态在会话 op 条目中；同 id 同内容重试仍回原收据。修订号不匹配回 conflict；旧命令未带对应修订号时保留兼容入口，新界面必须带当前会话头的值。
+
+Configure 等当前回合结束后应用，期间新消息代持；进程已回收则先续接。只有后端控制接受且回读成功才更新已应用值。权限和模型由元数据保留，effort 意图进入中立 Profile，ultracode 通过 OpenSpec.live_settings 按 CLI 规则恢复。当前模型不支持 effort 时仍保留用户选择，供续接后切回支持的模型。
+
+会话头增加 `title/title_source/title_revision/settings_revision/settings/caps/pending_setting`。settings 只提供运行时 applied、模型目录和权限模式目录；不将 get_settings 的全部配置源广播给界面。caps 经过后端端口约束，Codex 的 ultracode 永远为 false。侧栏的 title 与会话头同一事务更新。
+
+自动标题默认启用，可设 `[sessions] auto_title = false`。第一条至少 10 个字符的非斜杠人类提示完成后尝试一次；失败或 CLI 返回空标题保留首条摘要。自动标题操作不占结构槽位，不阻塞后续对话；手动标题优先。标题可能额外发一次当前模型请求。自定义标题走原生 rename，AI 标题用生成接口的返回值；没有直接写记录文件。
+
+新增崩溃矩阵行均在 `tests/matrix.rs`：
+
+| 操作、场景 | 断言 |
+|---|---|
+| configure-and-title/success | 改模型与手动标题在每个提交点恢复；原生步骤不重复生效 |
+| configure-and-title/refused | 后端拒绝时保留旧模型、旧标题，操作收场 |
+| title/generate | 自动生成与落定在每个提交点恢复，不重复生成 |
+| title/fallback | 不支持生成时保留首条摘要，不自动再次请求 |

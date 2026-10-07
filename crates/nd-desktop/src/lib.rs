@@ -5,6 +5,7 @@ pub mod composer;
 mod controls;
 mod drafts;
 mod history;
+mod settings;
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
@@ -32,6 +33,10 @@ pub struct Desktop {
     session_feed: Option<Task<()>>,
     scroll: ScrollHandle,
     directory: Entity<InputState>,
+    title_editor: Entity<InputState>,
+    settings_open: bool,
+    auxiliary_escape_held: bool,
+    settings_sending: bool,
     models: Vec<nd_wire::Model>,
     model: Option<String>,
     model_cwd: Option<String>,
@@ -156,6 +161,10 @@ impl Desktop {
             session_feed: None,
             scroll: ScrollHandle::new(),
             directory,
+            title_editor: cx.new(|cx| InputState::new(window, cx).placeholder("会话标题")),
+            settings_open: false,
+            auxiliary_escape_held: false,
+            settings_sending: false,
             models: vec![],
             model: None,
             model_cwd: None,
@@ -191,6 +200,7 @@ impl Desktop {
             #[cfg(feature = "scenarios")]
             last_editor_report: None,
         };
+        this.install_auxiliary_escape(window, cx);
         this.connect_chat(window, cx);
         Ok(this)
     }
@@ -337,6 +347,11 @@ impl Render for Desktop {
         let draft_panel = (!self.creating).then(|| self.draft_panel(window, cx));
         let theme = &self.theme;
         div()
+            .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| {
+                if event.keystroke.key == "escape" {
+                    this.auxiliary_escape_held = false;
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && !event.is_held {
                     this.escape_pressed(cx);

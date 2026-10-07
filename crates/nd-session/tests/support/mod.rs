@@ -19,6 +19,7 @@ pub struct Harness {
 
 pub fn config() -> EngineConfig {
     EngineConfig {
+        auto_title: false,
         tick: Duration::from_millis(20),
         check_purity: true,
         ..EngineConfig::default()

@@ -179,3 +179,20 @@ E2b 本轮的无变量对照也能后台化，不能把结果归因为该变量�
 | ATTACH-SIZE | 大于旧看守单行界限的消息仍能经固定 CLI 到模型；正常回显照常结票 | `a_multi_megabyte_attachment_is_not_lost_at_the_watchdog_frame_boundary`：2,400,000 字节全文；原生粘贴场景核对多个内容块 | 编码后超过看守单行界限时在写前明确失败，正文及引用保留；不把确定未写出算成 Unknown |
 
 没有写 CLI 原生记录。新建与发送继续使用原动作、UUID 和收据契约，崩溃矩阵增加 `create-and-send/attachments` 和 `create/attachments-open-fails`；上传正文只经 Blobs HTTP，持久动作只存引用。
+
+## 会话设置与标题（#21）
+
+固定 Claude Code 2.1.289，SHA-256 同 #13。协议出处：`research/impl/cli-protocol.md` §7、`research/round3/CLI-BEHAVIOR.md` §1.2–1.3；以本单真 CLI 离线场景为当前版本结论。完整证据与复验命令见 [ticket-21](verification/ticket-21.md)。
+
+| 编号 | 依赖 | 自动验证 | 不成立时的退路 |
+|---|---|---|---|
+| SETTINGS-MODEL | `set_model{model}` 后续回合生效；自定义模型会额外发 `max_tokens:1` 的验证请求；`get_settings.applied.model` 返回解析后的模型名 | `settings_model_changes_the_next_turn_and_survives_restart`：扣住当前回合，设置期间代持新输入，放行后核正式请求模型与历史，区分验证请求 | 控制错误保留旧显示值并显示操作失败；接受后回读失败记交付不明，不声称撤回；升级关卡不放行 |
+| SETTINGS-FLAGS | `apply_flag_settings{settings:{effortLevel}}` 与 `get_settings.applied.effort`；按模型目录提供的档位展示，实际控制已验 high/medium/max | `settings_effort_changes_clear_ultracode_and_support_max`；实际下一请求 `output_config.effort=max`；`settings_are_read_on_open_and_permissions_and_effort_survive_reclaim` 验 high 与续接 | 拒绝时不更新已应用值；目录或回读缺失时不猜档位。用户已选择的 effort 独立保留，暂不支持的模型不会把它清掉 |
+| SETTINGS-ULTRACODE | `apply_flag_settings{settings:{ultracode:true/false}}`；分别读 `ultracodeRequested/ultracodeAvailable/ultracode`。开关本身不改 effort；改变 effort 档位会关闭 ultracode | `settings_effort_and_ultracode_follow_cli_availability_and_preserve_effort`、`settings_effort_changes_clear_ultracode_and_support_max`：Opus 开关、effort 不变、切 Haiku 后 requested=true/available=false/applied=false；初始 Haiku 拒绝操作 | 缺字段或 available=false 时 caps=false、隐藏开关；Codex 在后端端口无条件禁用。候选版本入口或语义不成立时不开放该能力 |
+| SETTINGS-PERMISSION | `set_permission_mode{mode}` 使用 CLI 模式名；不改变启动授权、账号资格或策略限制 | `settings_are_read_on_open_and_permissions_and_effort_survive_reclaim`、`settings_stale_clients_conflict_and_cli_rejection_preserves_applied_values`：acceptEdits 生效、续接保留；无效模式被真实 CLI 拒绝且不改旧值 | 失败保留旧值，CLI 原因显示在操作条目；auto/bypass 等资格仍由 CLI 拒绝，不绕过 |
+| TITLE-GENERATE | `generate_session_title{description,persist:true}`；当前会话模型返回 JSON `{"title":"…"}`，CLI 回 `{title}`，持久写 ai-title；没有自定义标题事件 | `settings_ai_title_is_generated_once_and_return_value_updates_the_sidebar`、`settings_inflight_ai_title_survives_restart_and_never_overwrites_manual_title`：返回值更新、CLI 原生持久条目、重启不重复请求、手动优先 | 不支持、返回 null、失败、进程退出时保留首条消息摘要；一次自动尝试，不自动重复生成 |
+| TITLE-RENAME | `rename_session{title,source:"host"}`，由 `system/session_title_changed` 更新自定义标题 | `settings_manual_title_updates_sidebar_and_survives_resume`：侧栏、重启、同一后端会话续接 | 拒绝空名、控制字符和超过 200 个字符的标题；失败保留原值；不直接写 CLI JSONL |
+
+录制：`crates/nd-claude/tests/fixtures/settings/claude/2.1.289/flags.jsonl`，由设置主接缝的 `ND_RECORD_SETTINGS` 开关保存真实控制往返；`settings_recording.rs` 直接喂协议状态机。特别保留 effective.ultracode=true 而 applied.ultracodeRequested=false 的样本：界面必须读 applied，不能把配置层字段当成运行时状态。
+
+设置是绝对赋值，恢复允许幂等重申后回读。AI 标题可能发模型请求，恢复时先查检查点和真实输入流水：已写出只接回应，证据不完整则报不明，不重发生成。新增操作的四行崩溃矩阵见会话组件说明。本单没有新增直接写 CLI 存储的例外。

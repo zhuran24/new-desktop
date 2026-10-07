@@ -11,6 +11,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "scenarios")]
     let mut scenario_create = None::<serde_json::Value>;
     #[cfg(feature = "scenarios")]
+    let mut scenario_settings = None::<serde_json::Value>;
+    #[cfg(feature = "scenarios")]
     let mut scenario_draft = None::<serde_json::Value>;
     #[cfg(feature = "scenarios")]
     let mut scenario_history = None::<serde_json::Value>;
@@ -21,6 +23,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "scenarios")]
             "--scenario-controls" => {
                 scenario_controls = Some(args.next().ok_or("missing controls")?.into())
+            }
+            #[cfg(feature = "scenarios")]
+            "--scenario-settings" => {
+                scenario_settings = Some(serde_json::from_str(
+                    &args.next().ok_or("missing settings plan")?,
+                )?);
             }
             #[cfg(feature = "scenarios")]
             "--scenario-history" => {
@@ -115,6 +123,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cx.new(|cx| {
                     let desktop = Desktop::new(socket, state, save, warning, window, cx)
                         .expect("start nd-wire worker");
+                    #[cfg(feature = "scenarios")]
+                    if let Some(plan) = scenario_settings {
+                        Desktop::scenario_settings(plan, window, cx);
+                    }
                     #[cfg(feature = "scenarios")]
                     if let Some(plan) = scenario_create {
                         Desktop::scenario_create(plan, window, cx);
