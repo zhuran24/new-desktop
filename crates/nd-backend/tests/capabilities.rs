@@ -3,22 +3,18 @@ use nd_backend::{BackendKind, session_capabilities};
 
 #[test]
 fn ultracode_is_denied_for_codex_and_missing_capability_reports() {
-    assert_eq!(
-        session_capabilities(
+    assert!(
+        !session_capabilities(
             &BackendKind::Codex,
             &SettingCaps {
                 ultracode: true,
                 ..Default::default()
             }
         )
-        .ultracode,
-        false
+        .ultracode
     );
-    assert_eq!(
-        session_capabilities(&BackendKind::Claude, &SettingCaps::default()).ultracode,
-        false
-    );
-    assert_eq!(
+    assert!(!session_capabilities(&BackendKind::Claude, &SettingCaps::default()).ultracode);
+    assert!(
         session_capabilities(
             &BackendKind::Claude,
             &SettingCaps {
@@ -26,7 +22,6 @@ fn ultracode_is_denied_for_codex_and_missing_capability_reports() {
                 ..Default::default()
             }
         )
-        .ultracode,
-        true
+        .ultracode
     );
 }

@@ -124,7 +124,7 @@ struct ClaudeCheckpoint {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum SavedControl {
-    Control((Ticket, Act)),
+    Control(Box<(Ticket, Act)>),
     LegacySetting(Ticket),
 }
 
@@ -678,7 +678,7 @@ impl Inner {
                             &issued.ticket,
                             Outcome::Ok {
                                 done: Done::Opened {
-                                    settings,
+                                    settings: Box::new(settings),
                                     bs,
                                     run: run.clone(),
                                     readiness,
@@ -1563,7 +1563,9 @@ impl Actor {
             controls: Some(
                 self.controls
                     .iter()
-                    .map(|(id, control)| (id.clone(), SavedControl::Control(control.clone())))
+                    .map(|(id, control)| {
+                        (id.clone(), SavedControl::Control(Box::new(control.clone())))
+                    })
                     .collect(),
             ),
             settings_controls: self.settings_controls.clone(),

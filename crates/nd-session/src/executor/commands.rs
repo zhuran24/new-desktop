@@ -98,12 +98,11 @@ impl Executor {
                     return Ok(rejected("invalid_setting", Value::Null));
                 };
                 if matches!(setting, nd_wire::LiveSetting::Ultracode(_))
-                    && nd_backend::session_capabilities(
+                    && !nd_backend::session_capabilities(
                         &self.core.meta().kind,
                         &self.core.meta().settings.caps,
                     )
                     .ultracode
-                        != true
                 {
                     return Ok(rejected(
                         "unsupported",

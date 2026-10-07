@@ -332,7 +332,7 @@ impl From<TitleRecord> for Title {
     fn from(record: TitleRecord) -> Self {
         Self {
             carrier: record.carrier,
-            request: record.request.unwrap_or_else(|| {
+            request: record.request.unwrap_or({
                 if record.generate {
                     TitleRequest::Generate {
                         description: record.title,

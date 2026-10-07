@@ -290,7 +290,7 @@ impl ScriptedAdapter {
                 vec![
                     done(Outcome::Ok {
                         done: Done::Opened {
-                            settings,
+                            settings: Box::new(settings),
                             bs: spec.origin.backend_session().clone(),
                             run: run.clone(),
                             readiness: Readiness::Full,

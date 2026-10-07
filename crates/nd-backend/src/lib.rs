@@ -429,7 +429,7 @@ pub enum Done {
     },
     Opened {
         #[serde(default)]
-        settings: LiveSettings,
+        settings: Box<LiveSettings>,
         bs: BackendSessionId,
         run: RunId,
         readiness: Readiness,

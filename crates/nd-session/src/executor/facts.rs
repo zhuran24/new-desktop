@@ -312,7 +312,7 @@ impl Executor {
                     c.turn = None;
                 }
                 let meta = self.core.meta.as_mut().unwrap();
-                meta.settings = settings.clone();
+                meta.settings = settings.as_ref().clone();
                 if let Some(mode) = &settings.permission_mode {
                     meta.permission_mode = Some(mode.clone());
                 }
