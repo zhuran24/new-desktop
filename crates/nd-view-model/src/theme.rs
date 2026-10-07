@@ -177,7 +177,7 @@ mod hex_color {
         let text = String::deserialize(deserializer)?;
         let digits = text
             .strip_prefix('#')
-            .filter(|s| s.len() == 8 && s.is_ascii());
+            .filter(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit()));
         digits
             .and_then(|s| u32::from_str_radix(s, 16).ok())
             .ok_or_else(|| D::Error::custom("颜色必须为 #RRGGBBAA"))

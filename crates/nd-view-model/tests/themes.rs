@@ -136,7 +136,12 @@ fn malformed_incomplete_and_unsafe_theme_values_have_actionable_errors() {
             assert!(error.contains(key), "{error}");
         }
     }
-    for text in ["{", "{}", &OCEAN.replace("#123456ff", "#oops")] {
+    for text in [
+        "{",
+        "{}",
+        &OCEAN.replace("#123456ff", "#oops"),
+        &OCEAN.replace("#123456ff", "#+1234567"),
+    ] {
         assert!(ThemeDocument::parse(text).is_err());
     }
 }
