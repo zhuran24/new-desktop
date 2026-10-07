@@ -84,6 +84,8 @@ struct Effects {
     hand: Vec<Ticket>,
     /// 收据等动作有结果的命令：这个事务里落了收据，提交后回给还在等的连接。
     replies: Vec<(String, CommandReply)>,
+    /// 拒收尚未落账；让同步副本区分恢复等待与普通 unavailable。
+    unavailable_code: Option<nd_wire::UnavailableCode>,
 }
 
 /// 收据等动作有结果的命令（规格「收据时点」）：`!` 命令、总结、派 fork 型子代理。
@@ -381,7 +383,7 @@ impl Executor {
                 self.reload();
                 if let Some(reply) = reply {
                     let _ = reply.send(CommandReply::Unavailable {
-                        code: None,
+                        code: fx.unavailable_code,
                         reason: e.to_string(),
                     });
                 }
@@ -530,6 +532,7 @@ impl Executor {
                     nd_ledger::Begin::Invalid => nd_ledger::invalid(),
                     nd_ledger::Begin::New => {
                         if self.recovering() {
+                            fx.unavailable_code = Some(nd_wire::UnavailableCode::Recovering);
                             return Err(aborted("守护进程恢复中，命令未受理"));
                         }
                         match self.invoke_command(tx, &command, fx)? {
@@ -556,6 +559,7 @@ impl Executor {
                         self.recovering()
                     };
                     if recovering {
+                        fx.unavailable_code = Some(nd_wire::UnavailableCode::Recovering);
                         return Err(aborted("守护进程恢复中，命令未受理"));
                     }
                     self.command(tx, &command, fx)
