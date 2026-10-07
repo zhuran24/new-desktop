@@ -1041,3 +1041,107 @@ fn never_opened_releases_only_the_reservation_created_by_that_cause() {
         .unwrap();
     assert_eq!(claims.lease(&bs).unwrap(), None);
 }
+
+#[test]
+fn steady_state_writes_do_not_accumulate_persistent_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let store = Arc::new(nd_store::Store::open(&path, 2).unwrap());
+    let claims = support::ready(store.clone(), dir.path());
+    let child = ShortProcess::start();
+    let bs = BackendSessionId::claude("steady");
+    claims
+        .observe(Observed::Up {
+            run: "r".into(),
+            identity: child.identity(),
+            generation: 1,
+            kind: BackendKind::Claude,
+        })
+        .unwrap();
+    claims
+        .observe(Observed::Holding {
+            run: "r".into(),
+            generation: 1,
+            at: 1,
+            now: vec![Held {
+                bs: bs.clone(),
+                session: "s".into(),
+                last_leaf: None,
+            }],
+        })
+        .unwrap();
+    for n in 0..2000 {
+        assert!(matches!(
+            store
+                .write(|tx| claims.admit(
+                    tx,
+                    &format!("write-{n}"),
+                    &Act::Write {
+                        session: "s".into(),
+                        bs: bs.clone()
+                    }
+                ))
+                .unwrap(),
+            Admit::Go(_)
+        ));
+    }
+    drop(claims);
+    drop(store);
+    assert!(
+        std::fs::metadata(&path).unwrap().len() < 256 * 1024,
+        "writes create no new ownership, so their admission must not grow the persistent database"
+    );
+}
+
+#[test]
+fn legacy_claims_reopen_with_reservations_and_exited_run_fences_intact() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
+    let bs = BackendSessionId::claude("legacy");
+    let act = Act::Open {
+        session: "s".into(),
+        bs: NewBs::Known(bs.clone()),
+        via: "pending".into(),
+    };
+    // Frozen v1 storage format is an input fixture; assertions use Exclusivity only.
+    let old = json!({"causes":{"open":act}, "grants":{"open":{
+        "act":act,"pass":{"route":"Fresh"},"active":true,"recheck":false,"bound":null,"reserved":bs
+    }},"gone":["dead-run"],"leases":{
+        serde_json::to_string(&bs).unwrap(): {"bs":bs,"run":"pending","session":"s","unknown":false,"confirmed":false}
+    }});
+    store
+        .write(|tx| {
+            tx.execute_batch(
+                "CREATE TABLE claims_state(id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            )?;
+            tx.execute("INSERT INTO claims_state VALUES(1,?1)", [old.to_string()])?;
+            Ok(())
+        })
+        .unwrap();
+    let claims = support::ready(store.clone(), dir.path());
+    assert!(matches!(
+        store.write(|tx| claims.admit(tx, "open", &act)).unwrap(),
+        Admit::Go(_)
+    ));
+    assert_eq!(claims.lease(&bs).unwrap().unwrap().run, "pending");
+    assert_eq!(
+        claims
+            .peek(&Act::Open {
+                session: "s".into(),
+                bs: NewBs::Known(bs.clone()),
+                via: "dead-run".into()
+            })
+            .unwrap(),
+        Admit::No(Refusal::RunGone("dead-run".into()))
+    );
+    claims
+        .observe(Observed::NeverOpened {
+            cause: "open".into(),
+        })
+        .unwrap();
+    assert_eq!(claims.lease(&bs).unwrap(), None);
+    drop(claims);
+    let claims = support::ready(store.clone(), dir.path());
+    assert!(store.write(|tx| claims.bind(tx, "open", &bs)).is_err());
+}

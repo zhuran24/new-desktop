@@ -58,3 +58,5 @@ scripts/test-claims-live.sh
 ```
 
 默认测试用真 SQLite、真短命进程以及真实 CLI 生成的注册表/记录副本，只脚本化 `CliCommands`。现场脚本在 bwrap 断网命名空间里运行两条钉版 CLI，验证自有排除、同 id 冲突、真实 agents 输出和清理；使用临时 HOME/config/XDG 与独立受限 slice，不加载 owner 配置或凭据。原始夹具的来源清单在 `tests/fixtures/`；执行证据保留在 E 盘。验证结论见 [ticket-12](../../docs/verification/ticket-12.md)。
+
+稳态 `Write` 每次重新裁决，不保存历史 cause 或 grant。`Open` 预留按 cause 建索引、按 run 清理，已退出 run 的身份单独建索引；旧 v1 的整块 JSON 在打开时事务迁移。退出身份保留用于拒绝迟到的 Up/Holding，不参与每次状态 JSON 的解码与重写。
