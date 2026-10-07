@@ -1,6 +1,6 @@
 //! 可选诊断组件；持久备注用于标注本机诊断状态。
 use super::NamespaceProvider;
-use nd_kernel::Lifecycle;
+use nd_kernel::RegistrationKind;
 use nd_wire::{Fallback, Item};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc};
@@ -10,8 +10,11 @@ pub(super) fn migrate(tx: &mut nd_store::Tx<'_>) -> nd_store::Result<()> {
         INSERT OR IGNORE INTO diagnostic_note VALUES(1,'',0);")?;
     Ok(())
 }
+#[derive(Clone)]
 pub(super) struct Diagnostics {
     pub(super) store: Arc<nd_store::Store>,
+    pub(super) config: Arc<crate::Config>,
+    pub(super) fault_root: std::path::PathBuf,
 }
 impl Diagnostics {
     fn note(&self) -> nd_store::Result<Value> {
@@ -22,7 +25,6 @@ impl Diagnostics {
         )?)
     }
 }
-impl Lifecycle for Diagnostics {}
 impl NamespaceProvider for Diagnostics {
     fn names(&self) -> BTreeMap<String, u32> {
         BTreeMap::from([("diagnostics".into(), 1)])
@@ -46,7 +48,31 @@ impl NamespaceProvider for Diagnostics {
             Err("not_found".into())
         }
     }
-    fn execute(
+    fn registrations(&self) -> Vec<(RegistrationKind, &'static str)> {
+        vec![
+            (RegistrationKind::Command, "diagnostics.inspect"),
+            (RegistrationKind::Command, "diagnostics.set_note"),
+            (RegistrationKind::Subscription, "diagnostics"),
+        ]
+    }
+    fn execute(&self, command: nd_wire::Command) -> Option<crate::namespaces::Execution> {
+        let this = self.clone();
+        Some(crate::namespaces::Execution {
+            detached: false,
+            result: Box::pin(async move {
+                crate::namespaces::durable_command(
+                    &this.store,
+                    &this.config,
+                    &this.fault_root,
+                    &command,
+                    |tx| this.effect(tx, &command),
+                )
+            }),
+        })
+    }
+}
+impl Diagnostics {
+    fn effect(
         &self,
         tx: &mut nd_store::Tx<'_>,
         command: &nd_wire::Command,
