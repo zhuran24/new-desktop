@@ -40,8 +40,8 @@ impl Executor {
                 FactBody::TitleChanged { title } => {
                     if self.core.current.as_ref() == Some(&batch.carrier) {
                         let meta = self.core.meta.as_mut().unwrap();
-                        meta.title = Some(title);
-                        meta.title_source = Some("manual".into());
+                        meta.title.text = Some(title);
+                        meta.title.source = Some(state::TitleSource::Manual);
                     }
                 }
                 FactBody::Recovered => {
@@ -311,9 +311,9 @@ impl Executor {
                 },
             ) => {
                 let meta = self.core.meta.as_mut().unwrap();
-                if meta.title_source.as_deref() != Some("manual") {
-                    meta.title = Some(title.clone());
-                    meta.title_source = Some("ai".into());
+                if meta.title.source != Some(state::TitleSource::Manual) {
+                    meta.title.text = Some(title.clone());
+                    meta.title.source = Some(state::TitleSource::Ai);
                 }
             }
             (

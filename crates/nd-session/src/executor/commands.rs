@@ -51,11 +51,11 @@ impl Executor {
             "session.withdraw" if self.born => self.withdraw(tx, command, fx),
             "session.rename" => {
                 if let Some(expected) = command.expect.get("title_revision")
-                    && expected.as_u64() != Some(self.core.meta().title_revision)
+                    && expected.as_u64() != Some(self.core.meta().title.revision)
                 {
                     return Ok(rejected(
                         "conflict",
-                        json!({"title_revision":self.core.meta().title_revision}),
+                        json!({"title_revision":self.core.meta().title.revision}),
                     ));
                 }
                 let Some(title) = command.args["title"].as_str().filter(|s| {
@@ -71,14 +71,15 @@ impl Executor {
                     return Ok(rejected("busy", Value::Null));
                 }
                 let carrier = self.core.current.clone().unwrap();
-                self.core.meta.as_mut().unwrap().title_revision += 1;
+                self.core.meta.as_mut().unwrap().title.revision += 1;
                 let op = self.start_op(
                     tx,
                     fx,
                     OpSpec::Title(crate::ops::Title {
                         carrier,
-                        title: title.trim().into(),
-                        generate: false,
+                        request: crate::ops::TitleRequest::Rename {
+                            title: title.trim().into(),
+                        },
                     }),
                     Some(command.id.clone()),
                 )?;
@@ -245,14 +246,8 @@ impl Executor {
                 effort: None,
                 permission_mode: optional("permission_mode"),
                 settings: nd_backend::LiveSettings::default(),
-                title: Some(text.trim().chars().take(60).collect()),
-                title_source: Some("summary".into()),
-                title_seed: (text.trim().chars().count() >= 10
-                    && !text.trim_start().starts_with('/'))
-                .then(|| text.to_owned()),
-                title_attempted: false,
+                title: state::SessionTitle::new(text),
                 settings_revision: 0,
-                title_revision: 0,
                 note: None,
                 irreversible: vec![],
             }),
@@ -643,14 +638,7 @@ impl Executor {
             Err(why) => return Ok(rejected("invalid_attachment", json!({"reason":why}))),
         };
         self.hold_attachments(tx, command, &attachments)?;
-        if !self.core.meta().title_attempted
-            && self.core.meta().title_seed.is_none()
-            && self.core.meta().title_source.as_deref() != Some("manual")
-            && text.trim().chars().count() >= 10
-            && !text.trim_start().starts_with('/')
-        {
-            self.core.meta.as_mut().unwrap().title_seed = Some(text.to_owned());
-        }
+        self.core.meta.as_mut().unwrap().title.note_prompt(text);
         self.core.arrivals += 1;
         self.core.messages.insert(
             command.id.clone(),

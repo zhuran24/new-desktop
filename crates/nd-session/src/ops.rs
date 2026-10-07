@@ -39,7 +39,13 @@ impl OpSpec {
     }
     /// 结构操作：一个会话同时至多一个，进行中代持给对话的新输入。
     pub fn structural(&self) -> bool {
-        !matches!(self, Self::Title(Title { generate: true, .. }))
+        !matches!(
+            self,
+            Self::Title(Title {
+                request: TitleRequest::Generate { .. },
+                ..
+            })
+        )
     }
     pub fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
         match self {
@@ -301,10 +307,44 @@ impl Configure {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TitleRequest {
+    Rename { title: String },
+    Generate { description: String },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TitleRecord")]
 pub struct Title {
     pub carrier: CarrierId,
-    pub title: String,
-    pub generate: bool,
+    pub request: TitleRequest,
+}
+#[derive(Deserialize)]
+struct TitleRecord {
+    carrier: CarrierId,
+    #[serde(default)]
+    request: Option<TitleRequest>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    generate: bool,
+}
+impl From<TitleRecord> for Title {
+    fn from(record: TitleRecord) -> Self {
+        Self {
+            carrier: record.carrier,
+            request: record.request.unwrap_or_else(|| {
+                if record.generate {
+                    TitleRequest::Generate {
+                        description: record.title,
+                    }
+                } else {
+                    TitleRequest::Rename {
+                        title: record.title,
+                    }
+                }
+            }),
+        }
+    }
 }
 impl Title {
     fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
@@ -320,14 +360,15 @@ impl Title {
                 &self.carrier,
                 Act::Invoke {
                     to: self.carrier.clone(),
-                    invocation: if self.generate {
-                        nd_backend::Invocation::GenerateTitle {
-                            description: self.title.clone(),
+                    invocation: match &self.request {
+                        TitleRequest::Generate { description } => {
+                            nd_backend::Invocation::GenerateTitle {
+                                description: description.clone(),
+                            }
                         }
-                    } else {
-                        nd_backend::Invocation::Title {
-                            title: self.title.clone(),
-                        }
+                        TitleRequest::Rename { title } => nd_backend::Invocation::Title {
+                            title: title.clone(),
+                        },
                     },
                 },
             )

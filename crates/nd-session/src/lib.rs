@@ -172,13 +172,14 @@ fn list_item(core: &state::Core) -> Item {
             "cwd": meta.cwd,
             "backend": format!("{:?}", meta.kind).to_lowercase(),
             "model": meta.model,
-            "title":meta.title,
+            "title":meta.title.text,
             "note": meta.note,
             "process_alive": alive,
         }),
         fallback: Fallback {
             title: meta
                 .title
+                .text
                 .clone()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| meta.cwd.display().to_string()),

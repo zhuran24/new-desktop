@@ -37,6 +37,55 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    Summary,
+    Ai,
+    Manual,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionTitle {
+    #[serde(rename = "title")]
+    pub text: Option<String>,
+    #[serde(rename = "title_source")]
+    pub source: Option<TitleSource>,
+    #[serde(rename = "title_seed")]
+    pub seed: Option<String>,
+    #[serde(rename = "title_attempted")]
+    pub attempted: bool,
+    #[serde(rename = "title_revision")]
+    pub revision: u64,
+}
+impl SessionTitle {
+    pub fn new(text: &str) -> Self {
+        let mut title = Self {
+            text: Some(text.trim().chars().take(60).collect()),
+            source: Some(TitleSource::Summary),
+            ..Self::default()
+        };
+        title.note_prompt(text);
+        title
+    }
+    pub fn may_auto_generate(&self) -> bool {
+        !self.attempted && self.seed.is_some() && self.source != Some(TitleSource::Manual)
+    }
+    pub fn note_prompt(&mut self, text: &str) {
+        if !self.attempted
+            && self.seed.is_none()
+            && self.source != Some(TitleSource::Manual)
+            && text.trim().chars().count() >= 10
+            && !text.trim_start().starts_with(['!', '/'])
+        {
+            self.seed = Some(text.to_owned());
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Meta {
     pub id: SessionId,
@@ -52,18 +101,10 @@ pub struct Meta {
     pub permission_mode: Option<String>,
     #[serde(default, deserialize_with = "read_settings")]
     pub settings: nd_backend::LiveSettings,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub title_source: Option<String>,
-    #[serde(default)]
-    pub title_seed: Option<String>,
-    #[serde(default)]
-    pub title_attempted: bool,
+    #[serde(flatten)]
+    pub title: SessionTitle,
     #[serde(default)]
     pub settings_revision: u64,
-    #[serde(default)]
-    pub title_revision: u64,
     /// 撤掉或部分完成的原因。
     pub note: Option<String>,
     /// 部分完成时已经做过（或可能做过）的不可逆步骤。

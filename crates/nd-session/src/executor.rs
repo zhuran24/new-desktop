@@ -652,25 +652,22 @@ impl Executor {
             if self.deps.config.auto_title
                 && self.core.meta().status == Status::Active
                 && self.core.messages.is_empty()
-                && !self.core.meta().title_attempted
-                && self.core.meta().title_seed.is_some()
-                && self.core.meta().title_source.as_deref() != Some("manual")
+                && self.core.meta().title.may_auto_generate()
                 && self
                     .core
                     .current_carrier()
                     .is_some_and(|c| c.alive && !c.turn_running)
                 && !self.core.ops.values().any(|op| op.spec.structural())
             {
-                let title = self.core.meta().title_seed.clone().unwrap();
+                let title = self.core.meta().title.seed.clone().unwrap();
                 let carrier = self.core.current.clone().unwrap();
-                self.core.meta.as_mut().unwrap().title_attempted = true;
+                self.core.meta.as_mut().unwrap().title.attempted = true;
                 self.start_op(
                     tx,
                     fx,
                     OpSpec::Title(crate::ops::Title {
                         carrier,
-                        title,
-                        generate: true,
+                        request: crate::ops::TitleRequest::Generate { description: title },
                     }),
                     None,
                 )?;
