@@ -369,6 +369,11 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
     use nd_watchdog_proto::{Event, FixtureMeta};
     let scenario = Scenario::start(options("v6-workflow")).await.unwrap();
     let main = Route::new(None, "claude-haiku-4-5");
+    std::fs::write(
+        scenario.root().join("project/volume-input.txt"),
+        "VOLUME_TOOL_OBSERVED\n".repeat(128),
+    )
+    .unwrap();
     let script = "export const meta = {name:'watchdog-volume',description:'Offline sequential workflow volume probe'}; for (let i=0;i<6;i++) { await agent('offline volume sample '+i, {model:'sonnet',label:'volume-'+i}); } return {completed:6};";
     scenario.endpoint().enqueue(
         main.clone(),
@@ -379,14 +384,23 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
         ),
     );
     for _ in 0..4 {
-        scenario
-            .endpoint()
-            .enqueue(main.clone(), ModelReply::text("WORKFLOW_OBSERVED"));
+        scenario.endpoint().enqueue(
+            main.clone(),
+            ModelReply::streaming_text("WORKFLOW_OBSERVED\n".repeat(1024), 4, 2),
+        );
     }
-    for _ in 0..6 {
+    for i in 0..6 {
         scenario.endpoint().enqueue_any_agent(
             "claude-sonnet-5-5",
-            ModelReply::streaming_text("0123456789abcdef".repeat(2048), 16, 5),
+            ModelReply::tool(
+                &format!("volume_read_{i}"),
+                "Read",
+                serde_json::json!({"file_path":"/sandbox/project/volume-input.txt"}),
+            ),
+        );
+        scenario.endpoint().enqueue_any_agent(
+            "claude-sonnet-5-5",
+            ModelReply::streaming_text("0123456789abcdef".repeat(4096), 16, 5),
         );
     }
     let spec = scenario.claude_watchdog_spec("workflow").unwrap();
@@ -399,7 +413,7 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
     let mut cursor = 0;
     let mut recorded = vec![];
     let mut completed = false;
-    while began.elapsed() < Duration::from_secs(120) {
+    while began.elapsed() < Duration::from_secs(240) {
         let rows = link.read(cursor, 1000).await.unwrap();
         for row in &rows {
             if let Event::Out { line } = &row.event
@@ -431,14 +445,41 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
     );
     let stats = link.stats().await.unwrap();
     eprintln!("V6 measured elapsed={:?}; stats={stats:?}", began.elapsed());
+    let main_deltas = recorded
+        .iter()
+        .filter_map(|row| match &row.event {
+            Event::Out { line } => serde_json::from_str::<serde_json::Value>(line).ok(),
+            _ => None,
+        })
+        .filter(|v| {
+            v["type"] == "stream_event"
+                && v["parent_tool_use_id"].is_null()
+                && v["event"]["type"] == "content_block_delta"
+                && v["event"]["delta"]["type"] == "text_delta"
+        })
+        .count();
+    assert!(
+        main_deltas >= 1000,
+        "volume sample must include sustained main-conversation streaming, got {main_deltas} deltas"
+    );
+    let requests = scenario.endpoint().requests();
+    let agents = requests
+        .iter()
+        .filter_map(|r| r.route.agent.as_ref())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(agents.len(), 6);
+    let tool_results = requests
+        .iter()
+        .filter(|r| {
+            r.route.agent.is_some()
+                && r.body["messages"]
+                    .to_string()
+                    .contains("VOLUME_TOOL_OBSERVED")
+        })
+        .count();
     assert_eq!(
-        scenario
-            .endpoint()
-            .requests()
-            .iter()
-            .filter(|r| r.route.agent.is_some())
-            .count(),
-        6
+        tool_results, 6,
+        "all Workflow agents must read the actual file"
     );
     assert!(stats.stdout_lines > 0);
     assert!(stats.stream_lines > 0);
@@ -466,6 +507,23 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
         std::fs::write(
             std::path::Path::new(&dest).join("v6-stats.json"),
             serde_json::to_vec_pretty(&stats).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&dest).join("v6-measurement.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "kind": "offline_streaming_sample_not_capacity_validation",
+                "elapsed_seconds": began.elapsed().as_secs_f64(),
+                "main_text_deltas": main_deltas,
+                "workflow_agents": agents.len(),
+                "observed_tool_results": tool_results,
+                "main_chunk_chars": 4,
+                "main_pause_ms": 2,
+                "agent_chunk_chars": 16,
+                "agent_pause_ms": 5,
+                "stats": stats,
+            }))
+            .unwrap(),
         )
         .unwrap();
     }

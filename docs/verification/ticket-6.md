@@ -80,6 +80,14 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
 
 当前仓库夹具是同一脚本另一次约 75 秒运行的完整录制范围（从 initialize 到 Workflow 完成，CLI 此时仍活着），含 36 条看守记录。文件：`crates/nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl`；SHA-256 `8045853deb421e3a4685143150bbc401d1166fd75056bbb89289b148f629d09c`。首行的 count/first_seq/last_seq 可检出末尾整行缺失，连续性检查可检出中间漏行；默认纯回归验证六个子代理完成。最终场景生成的另一个原始录制和统计在日志根目录的 `v6-workflow.jsonl`、`v6-stats.json`。
 
+### 审查后的离线流式补测（2026-10-07）
+
+当前场景让主对话每 4 字符、2 ms 输出一个 SSE 分块，六个顺序 Workflow 子代理各先调用真实 Read 工具，再按每 16 字符、5 ms 输出 4096 块文本。断言依据看守收到的主对话文本增量和 CLI 后续请求中的实际文件内容；不把端点发送数量当作 stdout 数量。原场景在新增断言下只有 1 个已录主对话增量，红测成立。
+
+补测约 **150.33 秒**：看守 stdout **4642 行 / 1,202,625 B**，其中 stream_event **4619 行 / 1,114,677 B**（行数 **99.50%**、字节 **92.69%**）；主对话文本 delta **4608**，六个子代理均回读到真实工具结果；保留 **1,722,413 B**，溢出 0，LostLines=false。此样本包含工具调用和持续流式正文，仍受所列离线分块参数影响，不用于关闭代表性真负载下的容量定值。
+
+原始流水、统计与分块条件保留在 `/mnt/wd_external/nd-build/tmp/review-fixes-p22-stream-evidence/` 的 `v6-workflow.jsonl`、`v6-stats.json`、`v6-measurement.json`；红、绿日志分别为同级 `review-fixes-p22-stream-red.log`、`review-fixes-p22-stream-green.log`。仓库中上述旧夹具仍是原始录制；不重写其历史数字或哈希。
+
 ## 其余行为与证明边界
 
 | 行为 | 自动测试 |
