@@ -4,8 +4,17 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 pub const WINDOW: usize = 60;
-fn control(item: &Item) -> bool {
+fn pinned_metadata(item: &Item) -> bool {
     matches!(item.kind.as_str(), "header" | "draft" | "lineage")
+}
+fn unsettled(item: &Item) -> bool {
+    item.data["complete"] == false
+        || (item.kind == "control" && item.data["state"] == "pending")
+        || (item.kind == "prompt"
+            && matches!(
+                item.data["state"].as_str(),
+                Some("held" | "waiting" | "pending" | "written" | "withdrawing")
+            ))
 }
 #[derive(Default)]
 pub struct History {
@@ -87,7 +96,7 @@ impl History {
         let mut items: Vec<_> = self
             .items
             .values()
-            .filter(|i| control(i))
+            .filter(|i| pinned_metadata(i))
             .cloned()
             .collect();
         items.push(self.navigation());
@@ -103,16 +112,11 @@ impl History {
         });
         items.extend(page.items);
         // 进行中的条目必须在冷快照里保留完整累计内容，即使较新的条目超过一页。
-        for item in self.items.values().filter(|i| {
-            !control(i)
-                && (i.data["complete"] == false
-                    || (i.kind == "control" && i.data["state"] == "pending")
-                    || (i.kind == "prompt"
-                        && matches!(
-                            i.data["state"].as_str(),
-                            Some("held" | "waiting" | "pending" | "written" | "withdrawing")
-                        )))
-        }) {
+        for item in self
+            .items
+            .values()
+            .filter(|i| !pinned_metadata(i) && unsettled(i))
+        {
             if !items.iter().any(|i| i.id == item.id) {
                 items.push(item.clone());
             }
@@ -179,7 +183,7 @@ impl History {
                         .as_str()
                         .is_some_and(|id| excluded.contains(id));
                 }
-                !control(i) && (included || i.kind == "op" || i.kind == "asked")
+                !pinned_metadata(i) && (included || i.kind == "op" || i.kind == "asked")
             })
             .collect();
         let eligible: Vec<_> = body
