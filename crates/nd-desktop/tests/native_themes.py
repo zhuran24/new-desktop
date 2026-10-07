@@ -110,7 +110,8 @@ def inner():
         handles.append(log)
         daemon = subprocess.Popen(['/nd-daemon', '--root', '/sandbox/daemon'], stdout=log, stderr=log)
         app = start('theme')
-        original = wait(app, 'theme', lambda t: t['theme']['colors']['background'] == '#123456ff')
+        original = wait(app, 'theme', lambda t: True)
+        assert original['theme']['colors']['background'] == '#123456ff' and original['warning'] is None, original
         screenshot('custom', [(18, 52, 86), (23, 63, 95)])
         replacement = themes / 'replacement.tmp'
         replacement.write_text(ocean.replace('#123456ff', '#26384aff').replace('"body": 18', '"body": 20'))
@@ -170,7 +171,8 @@ def inner():
         (themes / 'ocean.json').unlink()
         Path('/sandbox/state/ui.json').write_text(json.dumps({'theme_selection': {'kind': 'file', 'file': 'missing.json'}}))
         app = start('missing')
-        wait(app, 'missing', lambda t: t['warning'] is not None and 'missing.json' in t['warning'])
+        missing = wait(app, 'missing', lambda t: True)
+        assert missing['warning'] is not None and 'missing.json' in missing['warning'], missing
         (themes / 'missing.json').write_text(ocean)
         wait(app, 'missing', lambda t: t['warning'] is None and t['theme']['colors']['background'] == '#123456ff')
         (themes / 'missing.json').unlink()

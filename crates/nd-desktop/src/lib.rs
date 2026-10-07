@@ -45,7 +45,7 @@ pub struct Desktop {
     escape: nd_view_model::EscapeState,
     started: std::time::Instant,
     uploading: usize,
-    images: std::collections::BTreeMap<String, Option<std::sync::Arc<Image>>>,
+    images: nd_view_model::ImageCache<std::sync::Arc<Image>>,
     device: String,
     draft_writes: std::collections::BTreeSet<String>,
     queued_send: Option<(String, String, u64, String)>,
@@ -158,11 +158,12 @@ impl Desktop {
             }
         });
         let system_theme = themes::system_mode(window);
-        let theme_catalog = nd_view_model::ThemeCatalog::default();
-        let theme = theme_catalog
-            .resolve(&state.theme_selection(), system_theme)
-            .theme;
-        let mut theme_feed = themes::ThemeFeed::start(theme_directory.clone())?;
+        let _ = std::fs::create_dir_all(&theme_directory);
+        let theme_catalog = nd_view_model::ThemeCatalog::read(&theme_directory);
+        let resolved = theme_catalog.resolve(&state.theme_selection(), system_theme);
+        let theme = resolved.theme;
+        let mut theme_feed =
+            themes::ThemeFeed::start(theme_directory.clone(), theme_catalog.clone())?;
         let theme_reload = theme_feed.reload.clone();
         let themes = cx.spawn(async move |weak, cx| {
             while let Some(catalog) = theme_feed.recv().await {
@@ -216,7 +217,7 @@ impl Desktop {
             theme,
             theme_catalog,
             system_theme,
-            theme_warning: None,
+            theme_warning: resolved.warning,
             theme_directory,
             theme_reload,
             _themes: themes,

@@ -59,24 +59,17 @@ impl Desktop {
             "image/gif" => ImageFormat::Gif,
             _ => return,
         };
-        if self.images.contains_key(&a.blob) {
+        if !self.images.request(&a.blob) {
             return;
         }
-        // 显示缓存有界；字节的持久所有者是守护进程 Blobs。
-        if self.images.len() >= 64 {
-            self.images.pop_first();
-        }
-        self.images.insert(a.blob.clone(), None);
         let client = self.client.clone();
         let blob = a.blob.clone();
         cx.spawn(async move |weak, cx| {
             let result = client.blob(blob.clone()).await;
             let _ = weak.update(cx, |this, cx| {
-                if let Ok(bytes) = result
-                    && this.images.contains_key(&blob)
-                {
+                if let Ok(bytes) = result {
                     this.images
-                        .insert(blob, Some(Arc::new(Image::from_bytes(format, bytes))));
+                        .complete(&blob, Arc::new(Image::from_bytes(format, bytes)));
                 }
                 cx.notify();
             });
@@ -86,8 +79,8 @@ impl Desktop {
     pub(crate) fn attachment_view(&self, a: &Attachment, cx: &mut Context<Self>) -> AnyElement {
         let t = &self.theme;
         let attachment = a.clone();
-        let missing_image = a.media_type.starts_with("image/")
-            && self.images.get(&a.blob).and_then(Clone::clone).is_none();
+        let missing_image =
+            a.media_type.starts_with("image/") && self.images.get(&a.blob).cloned().is_none();
         div()
             .id(SharedString::from(format!("{}/{}", a.blob, a.name)))
             .when(missing_image, |d| {
@@ -104,17 +97,14 @@ impl Desktop {
             .text_color(rgba(t.colors.muted))
             .text_size(px(t.typography.small))
             .child(format!("📎 {} · {} 字节", a.name, a.size))
-            .when_some(
-                self.images.get(&a.blob).and_then(Clone::clone),
-                |d, image| {
-                    d.child(
-                        img(image)
-                            .max_w(px(t.spacing.large * 10.))
-                            .max_h(px(t.spacing.large * 6.))
-                            .object_fit(ObjectFit::Contain),
-                    )
-                },
-            )
+            .when_some(self.images.get(&a.blob).cloned(), |d, image| {
+                d.child(
+                    img(image)
+                        .max_w(px(t.spacing.large * 10.))
+                        .max_h(px(t.spacing.large * 6.))
+                        .object_fit(ObjectFit::Contain),
+                )
+            })
             .into_any_element()
     }
     pub(crate) fn draft_attachments(&self, cx: &mut Context<Self>) -> AnyElement {

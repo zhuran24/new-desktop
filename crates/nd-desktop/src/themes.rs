@@ -11,8 +11,8 @@ pub(crate) struct ThemeFeed {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 impl ThemeFeed {
-    pub fn start(directory: PathBuf) -> std::io::Result<Self> {
-        let (send, updates) = tokio::sync::watch::channel(ThemeCatalog::default());
+    pub fn start(directory: PathBuf, initial: ThemeCatalog) -> std::io::Result<Self> {
+        let (send, updates) = tokio::sync::watch::channel(initial);
         let (reload, mut events) = tokio::sync::mpsc::channel(1);
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let notices = reload.clone();

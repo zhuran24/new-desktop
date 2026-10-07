@@ -28,3 +28,6 @@ pub use settings::*;
 
 mod model_picker;
 pub use model_picker::ModelPicker;
+
+mod image_cache;
+pub use image_cache::ImageCache;
