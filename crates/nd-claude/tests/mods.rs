@@ -65,8 +65,8 @@ async fn both_mods_pass_the_pinned_cli_static_check_with_their_multi_file_layout
             "session.end",
             "session.start"
         ]
-            .map(str::to_owned)
-            .into()
+        .map(str::to_owned)
+        .into()
     );
     assert_eq!(hooks(&listed[1]), ["session.start".to_owned()].into());
     scenario.close().unwrap();
