@@ -256,12 +256,14 @@ impl Conversation {
         if main {
             self.map_turn(frame, out);
         }
-        if main && frame["type"] == "system" && frame["subtype"] == "session_title_changed" {
-            if let Some(title) = frame["title"].as_str() {
-                out.push(Convo::TitleChanged {
-                    title: title.into(),
-                });
-            }
+        if main
+            && frame["type"] == "system"
+            && frame["subtype"] == "session_title_changed"
+            && let Some(title) = frame["title"].as_str()
+        {
+            out.push(Convo::TitleChanged {
+                title: title.into(),
+            });
         }
         match frame["type"].as_str() {
             Some("user") => {

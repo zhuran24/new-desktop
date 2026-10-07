@@ -591,3 +591,14 @@ pub enum Invocation {
     Title { title: String },
     GenerateTitle { description: String },
 }
+
+/// 承载位报告的能力经过后端端口的硬约束，再交给所有界面。
+/// 缺字段一律不开放 ultracode；Codex 无论报告内容如何都不可用。
+pub fn session_capabilities(kind: &BackendKind, reported: &Value) -> Value {
+    let mut caps = reported.as_object().cloned().unwrap_or_default();
+    caps.insert(
+        "ultracode".into(),
+        Value::Bool(*kind == BackendKind::Claude && reported["ultracode"] == true),
+    );
+    Value::Object(caps)
+}

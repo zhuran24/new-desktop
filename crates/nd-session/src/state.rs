@@ -43,6 +43,9 @@ pub struct Meta {
     pub cwd: PathBuf,
     pub kind: BackendKind,
     pub model: Option<String>,
+    /// 已确认接受的 effort 意图；模型暂不支持时仍保留，供续接和以后换模型。
+    #[serde(default)]
+    pub effort: Option<String>,
     pub permission_mode: Option<String>,
     #[serde(default)]
     pub settings: Value,
@@ -54,6 +57,10 @@ pub struct Meta {
     pub title_seed: Option<String>,
     #[serde(default)]
     pub title_attempted: bool,
+    #[serde(default)]
+    pub settings_revision: u64,
+    #[serde(default)]
+    pub title_revision: u64,
     /// 撤掉或部分完成的原因。
     pub note: Option<String>,
     /// 部分完成时已经做过（或可能做过）的不可逆步骤。

@@ -70,9 +70,11 @@ fn uuid_from_hex(hex: &str) -> String {
 fn profile(v: &View<'_>) -> Profile {
     let meta = v.meta();
     Profile {
-        effort: meta.settings["applied"]["effort"]
-            .as_str()
-            .map(str::to_owned),
+        effort: meta.effort.clone().or_else(|| {
+            meta.settings["applied"]["effort"]
+                .as_str()
+                .map(str::to_owned)
+        }),
         kind: meta.kind.clone(),
         model: meta.model.clone(),
         permission_mode: meta.permission_mode.clone(),

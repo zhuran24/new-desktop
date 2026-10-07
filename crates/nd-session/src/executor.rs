@@ -501,6 +501,14 @@ impl Executor {
                 })
             }
             "session.rename" => {
+                if let Some(expected) = command.expect.get("title_revision")
+                    && expected.as_u64() != Some(self.core.meta().title_revision)
+                {
+                    return Ok(rejected(
+                        "conflict",
+                        json!({"title_revision":self.core.meta().title_revision}),
+                    ));
+                }
                 let Some(title) = command.args["title"].as_str().filter(|s| {
                     !s.trim().is_empty()
                         && s.chars().count() <= 200
@@ -514,6 +522,7 @@ impl Executor {
                     return Ok(rejected("busy", Value::Null));
                 }
                 let carrier = self.core.current.clone().unwrap();
+                self.core.meta.as_mut().unwrap().title_revision += 1;
                 let op = self.start_op(
                     tx,
                     fx,
@@ -530,6 +539,14 @@ impl Executor {
                 })
             }
             "session.configure" => {
+                if let Some(expected) = command.expect.get("settings_revision")
+                    && expected.as_u64() != Some(self.core.meta().settings_revision)
+                {
+                    return Ok(rejected(
+                        "conflict",
+                        json!({"settings_revision":self.core.meta().settings_revision}),
+                    ));
+                }
                 if self.core.meta().status != Status::Active {
                     return Ok(rejected("not_active", Value::Null));
                 }
@@ -542,7 +559,11 @@ impl Executor {
                     return Ok(rejected("invalid_setting", Value::Null));
                 };
                 if matches!(setting, nd_wire::LiveSetting::Ultracode(_))
-                    && self.core.meta().settings["caps"]["ultracode"] != true
+                    && nd_backend::session_capabilities(
+                        &self.core.meta().kind,
+                        &self.core.meta().settings["caps"],
+                    )["ultracode"]
+                        != true
                 {
                     return Ok(rejected(
                         "unsupported",
@@ -552,6 +573,7 @@ impl Executor {
                 let Some(carrier) = self.core.current.clone() else {
                     return Ok(rejected("not_active", Value::Null));
                 };
+                self.core.meta.as_mut().unwrap().settings_revision += 1;
                 let op = self.start_op(
                     tx,
                     fx,
@@ -670,6 +692,7 @@ impl Executor {
                 cwd: PathBuf::from(cwd),
                 kind,
                 model: optional("model"),
+                effort: None,
                 permission_mode: optional("permission_mode"),
                 settings: Value::Null,
                 title: Some(text.trim().chars().take(60).collect()),
@@ -678,6 +701,8 @@ impl Executor {
                     && !text.trim_start().starts_with('/'))
                 .then(|| text.to_owned()),
                 title_attempted: false,
+                settings_revision: 0,
+                title_revision: 0,
                 note: None,
                 irreversible: vec![],
             }),
@@ -771,6 +796,14 @@ impl Executor {
             Err(why) => return Ok(rejected("invalid_attachment", json!({"reason":why}))),
         };
         self.hold_attachments(tx, command, &attachments)?;
+        if !self.core.meta().title_attempted
+            && self.core.meta().title_seed.is_none()
+            && self.core.meta().title_source.as_deref() != Some("manual")
+            && text.trim().chars().count() >= 10
+            && !text.trim_start().starts_with('/')
+        {
+            self.core.meta.as_mut().unwrap().title_seed = Some(text.to_owned());
+        }
         self.core.arrivals += 1;
         self.core.messages.insert(
             command.id.clone(),
@@ -1017,7 +1050,11 @@ impl Executor {
                     c.turn_running = false;
                 }
                 if let Some(settings) = adopt.get("settings") {
-                    self.core.meta.as_mut().unwrap().settings = settings.clone();
+                    let meta = self.core.meta.as_mut().unwrap();
+                    meta.settings = settings.clone();
+                    if let Some(mode) = settings["permission_mode"].as_str() {
+                        meta.permission_mode = Some(mode.into());
+                    }
                 }
                 self.ensure_lineage(carrier)?;
             }
@@ -1045,6 +1082,7 @@ impl Executor {
                 let meta = self.core.meta.as_mut().unwrap();
                 match setting {
                     nd_wire::LiveSetting::Model(model) => meta.model = Some(model.clone()),
+                    nd_wire::LiveSetting::Effort(effort) => meta.effort = Some(effort.clone()),
                     nd_wire::LiveSetting::PermissionMode(mode) => {
                         meta.permission_mode = Some(mode.clone())
                     }
@@ -1269,6 +1307,7 @@ impl Executor {
         for _ in 0..64 {
             if self.deps.config.auto_title
                 && self.core.meta().status == Status::Active
+                && self.core.messages.is_empty()
                 && !self.core.meta().title_attempted
                 && self.core.meta().title_seed.is_some()
                 && self.core.meta().title_source.as_deref() != Some("manual")
@@ -2082,9 +2121,12 @@ pub(crate) fn header(core: &Core) -> Value {
         "model": meta.model,
         "title":meta.title,
         "title_source":meta.title_source,
+        "title_revision":meta.title_revision,
+        "settings_revision":meta.settings_revision,
         "permission_mode": meta.permission_mode,
+        "pending_setting": core.ops.values().find(|op| matches!(op.spec,OpSpec::Configure(_))).map(|_| if carrier.is_some_and(|c| c.turn_running) {"设置将在本回合结束后生效"} else {"正在应用设置"}),
         "settings": meta.settings,
-        "caps": meta.settings["caps"],
+        "caps": nd_backend::session_capabilities(&meta.kind, &meta.settings["caps"]),
         "note": meta.note,
         "irreversible": meta.irreversible,
         "process": carrier.map(|c| json!({

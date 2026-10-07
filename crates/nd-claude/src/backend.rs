@@ -695,13 +695,13 @@ impl Inner {
                     });
                 }
             }
-            if let Act::Configure { setting, .. } = &p.act {
-                if let Some(slot) = self.carriers.lock().unwrap().get(&record.carrier) {
-                    let _ = slot.tx.send(Cmd::Configure {
-                        ticket: p.issued.ticket.clone(),
-                        setting: setting.clone(),
-                    });
-                }
+            if let Act::Configure { setting, .. } = &p.act
+                && let Some(slot) = self.carriers.lock().unwrap().get(&record.carrier)
+            {
+                let _ = slot.tx.send(Cmd::Configure {
+                    ticket: p.issued.ticket.clone(),
+                    setting: setting.clone(),
+                });
             }
             if let Act::End { how, .. } = &p.act {
                 // 结束可以重发。
@@ -1202,7 +1202,18 @@ impl Actor {
                     } => {
                         if let Some(ticket) = self.controls.remove(&request_id) {
                             if !ok {
-                                facts.push(done(&ticket, Outcome::failed(body.to_string())));
+                                let reason = body["error"]
+                                    .as_str()
+                                    .unwrap_or("CLI 拒绝此设置")
+                                    .to_owned();
+                                let outcome = if request_id.starts_with("settings:") {
+                                    Outcome::Unknown {
+                                        evidence: format!("设置已被接受，但回读失败：{reason}"),
+                                    }
+                                } else {
+                                    Outcome::failed(reason)
+                                };
+                                facts.push(done(&ticket, outcome));
                             } else if request_id.starts_with("title:") {
                                 facts.push(done(
                                     &ticket,
@@ -1274,6 +1285,14 @@ impl Actor {
             }
         }
         if let Some(code) = exited {
+            for (_, ticket) in self.controls.drain() {
+                facts.push(done(
+                    &ticket,
+                    Outcome::Unknown {
+                        evidence: "后端进程退出，设置或标题结果未确认".into(),
+                    },
+                ));
+            }
             for (_, ticket) in self.pending.drain() {
                 facts.push(done(
                     &ticket,
@@ -1536,7 +1555,8 @@ fn settings_with_caps(mut settings: Value) -> Value {
     let ultra = settings["applied"]["ultracodeAvailable"] == true
         && settings["applied"]["ultracodeRequested"].is_boolean()
         && settings["applied"]["ultracode"].is_boolean();
-    settings["caps"] = json!({"model":true,"effort":true,"permission_mode":true,"ultracode":ultra});
+    settings = json!({"applied":settings["applied"],"permission_modes":["default","acceptEdits","plan","dontAsk","auto","bypassPermissions"]});
+    settings["caps"] = json!({"model":settings["applied"]["model"].is_string(),"effort":settings["applied"].is_object(),"permission_mode":settings["applied"].is_object(),"ultracode":ultra});
     settings
 }
 
