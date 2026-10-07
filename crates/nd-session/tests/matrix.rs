@@ -344,11 +344,14 @@ async fn a_create_whose_first_message_is_unknown_is_partial_at_every_commit_poin
         uploads: vec![],
         script: vec![(ActKind::Send, Reply::Unknown("进程退出，没等到回显".into()))],
         idle_ms: 3_600_000,
-        steps: vec![Step {
-            command: create("matrix-create-partial", "你好"),
-            until: |s| status_is(s, "partial"),
-        }],
-        check: |_, s| {
+        steps: vec![
+            Step { command: create("matrix-create-partial", "你好"), until: |s| status_is(s, "partial") },
+            Step { command: command("after-partial", "session.send", json!({
+                "session":session_id_for("matrix-create-partial"), "text":"cannot be held forever"
+            })), until: |s| status_is(s, "partial") },
+        ],
+        check: |h, s| {
+            assert!(matches!(receipt(h, "after-partial"), nd_wire::Receipt::Rejected { ref code, .. } if code == "precondition"));
             assert!(header(s)["irreversible"].to_string().contains("first"));
         },
     })

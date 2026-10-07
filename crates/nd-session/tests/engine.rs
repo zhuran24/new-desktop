@@ -77,9 +77,22 @@ async fn a_create_whose_first_message_may_have_reached_the_backend_is_kept_as_pa
     let h = Harness::new(config()).await;
     h.adapter.script(
         nd_session::scripted::ActKind::Send,
-        nd_session::scripted::Reply::Unknown("写出后进程退出，没等到回显".into()),
+        nd_session::scripted::Reply::Hold,
     );
     let session = accepted_session(&h.create("create-partial", "你好").await);
+    h.wait(&session, "first message pending", |s| {
+        prompt(s, "你好").is_some()
+    })
+    .await;
+    h.send("held-before-partial", &session, "during creation")
+        .await;
+    h.wait(&session, "held", |s| {
+        prompt(s, "during creation").is_some_and(|p| p.data["state"] == "held")
+    })
+    .await;
+    assert!(h.adapter.release(nd_session::scripted::Reply::Unknown(
+        "写出后进程退出，没等到回显".into()
+    )));
     let snapshot = h
         .wait(&session, "partial", |s| {
             s.items
@@ -105,6 +118,14 @@ async fn a_create_whose_first_message_may_have_reached_the_backend_is_kept_as_pa
         .find(|i| i.id == format!("session/{session}"))
         .expect("partial session stays listed");
     assert_eq!(entry.data["status"], "partial");
+    assert_eq!(
+        prompt(&snapshot, "during creation").unwrap().data["state"],
+        "failed"
+    );
+    let reply = h.send("after-partial", &session, "no carrier").await;
+    assert!(matches!(reply, nd_wire::CommandReply::Receipt {
+        receipt: nd_wire::Receipt::Rejected { ref code, .. }
+    } if code == "precondition"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

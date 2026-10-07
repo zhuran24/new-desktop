@@ -1170,7 +1170,9 @@ impl Executor {
 
     fn send(&mut self, tx: &mut Tx<'_>, command: &Command) -> nd_store::Result<Receipt> {
         let status = self.core.meta().status;
-        if status == Status::Withdrawn {
+        if status == Status::Withdrawn
+            || (status == Status::Partial && self.core.current_carrier().is_none())
+        {
             return Ok(rejected("precondition", json!({"status": status.as_str()})));
         }
         let Some(text) = command.args["text"].as_str() else {
@@ -2464,6 +2466,9 @@ impl Executor {
                     meta.status = Status::Partial;
                     meta.note = Some(reason.clone());
                     meta.irreversible = irreversible.clone();
+                }
+                if self.core.current_carrier().is_none() {
+                    self.fail_messages(tx, fx, "会话创建部分完成，没有可接收输入的当前承载位")?;
                 }
             }
             (OpSpec::Launch(_), _) if failure.is_some() => {
