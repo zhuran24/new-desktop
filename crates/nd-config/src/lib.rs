@@ -186,10 +186,16 @@ impl Config {
         if !patch.is_object() {
             return Err(Error::Invalid("补丁必须为对象".into()));
         }
-        let mut value = state.published.value.clone();
-        merge(&mut value, patch);
-        (self.validate)(&value)?;
-        let text = toml::to_string_pretty(&value).map_err(|e| Error::Invalid(e.to_string()))?;
+        let mut user = match state.text.as_deref() {
+            Some(text) => serde_json::to_value(
+                toml::from_str::<toml::Value>(text).map_err(|e| Error::Invalid(e.to_string()))?,
+            )
+            .map_err(|e| Error::Invalid(e.to_string()))?,
+            None => serde_json::json!({}),
+        };
+        merge_patch(&mut user, patch);
+        let text = toml::to_string_pretty(&user).map_err(|e| Error::Invalid(e.to_string()))?;
+        let value = parse(Some(&text), &self.defaults, self.validate)?;
         self.source.compare_and_swap(state.text.as_deref(), &text)?;
         state.text = Some(text);
         state.published = Versioned {
@@ -217,6 +223,25 @@ fn merge(target: &mut Value, patch: Value) {
     if let (Some(a), Some(b)) = (target.as_object_mut(), patch.as_object()) {
         for (key, value) in b {
             merge(a.entry(key.clone()).or_insert(Value::Null), value.clone());
+        }
+    } else {
+        *target = patch;
+    }
+}
+
+/// User patches delete explicit overrides with null; defaults are merged only for validation/publication.
+fn merge_patch(target: &mut Value, patch: Value) {
+    if let Value::Object(patch) = patch {
+        if !target.is_object() {
+            *target = serde_json::json!({});
+        }
+        let target = target.as_object_mut().unwrap();
+        for (key, value) in patch {
+            if value.is_null() {
+                target.remove(&key);
+            } else {
+                merge_patch(target.entry(key).or_insert(Value::Null), value);
+            }
         }
     } else {
         *target = patch;
