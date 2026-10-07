@@ -338,35 +338,20 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                     markdown: i.kind == "text",
                     withdraw: (header.is_some_and(|h| h.data["interaction"]["withdraw"] == true)
                         && i.kind == "prompt"
-                        && matches!(
-                            i.data["state"].as_str(),
-                            Some("held" | "waiting" | "pending" | "written" | "queued")
-                        ))
+                        && nd_wire::PromptState::from_value(&i.data["state"]).withdrawable())
                     .then(|| i.data["message"].as_str().map(str::to_owned))
                     .flatten(),
                     detail: i.data["reason"].as_str().unwrap_or_default().into(),
-                    resend: (i.kind == "prompt" && i.data["state"] == "not_delivered")
+                    resend: (i.kind == "prompt"
+                        && nd_wire::PromptState::from_value(&i.data["state"])
+                            == nd_wire::PromptState::NotDelivered)
                         .then(|| i.data["message"].as_str().map(str::to_owned))
                         .flatten(),
                     blocks: crate::message_blocks(&i.kind, &text, &i.data["raw"]),
                     attachments: serde_json::from_value(i.data["attachments"].clone())
                         .unwrap_or_default(),
                     status: if i.kind == "prompt" {
-                        match i.data["state"].as_str() {
-                            Some("held") => "代持中",
-                            Some("waiting") => "等待可写",
-                            Some("pending") => "等待写出",
-                            Some("written") => "已写出",
-                            Some("queued") => "排队中",
-                            Some("withdrawing") => "撤回中",
-                            Some("withdrawn") => "已撤回",
-                            Some("landed") => "已送达",
-                            Some("failed") => "发送失败",
-                            Some("unknown") => "交付不明",
-                            Some("not_delivered") => "未送达",
-                            Some("resent") => "已重发",
-                            _ => "",
-                        }
+                        nd_wire::PromptState::from_value(&i.data["state"]).label()
                     } else if i.data["complete"] == false {
                         "生成中"
                     } else {

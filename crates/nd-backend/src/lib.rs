@@ -83,6 +83,13 @@ pub struct Issued {
 }
 
 /// 后端无关的动作。第 2 步先有承载位的一生（拉起、结束）和发送；其余动作随各自工单追加。
+/// Esc 钉住的实际回合；承载位换进程后也不会误用旧回合身份。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRef {
+    pub run: RunId,
+    pub key: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "act", rename_all = "snake_case")]
 pub enum Act {
@@ -112,6 +119,8 @@ pub enum Act {
     /// 只停当前回合，保留排队输入和后台任务。
     Interrupt {
         to: CarrierId,
+        #[serde(default)]
+        turn: Option<TurnRef>,
         #[serde(default)]
         queued: QueuedPolicy,
     },
@@ -406,6 +415,8 @@ pub enum Done {
     /// 控制请求的 ACK；不证明回合已结束。
     Interrupted {
         cancelled: Vec<Ticket>,
+        #[serde(default)]
+        already_ended: bool,
     },
     Withdrawn {
         ok: bool,
@@ -506,7 +517,10 @@ pub enum FactBody {
         ticket: Ticket,
         native: String,
     },
-    TurnStarted,
+    TurnStarted {
+        #[serde(default)]
+        turn: Option<String>,
+    },
     /// 已确认的实际回合与用户输入原生位置；不代替 Landed 的送达证据。
     TurnMapped {
         turn: String,

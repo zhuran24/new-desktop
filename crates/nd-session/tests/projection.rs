@@ -29,7 +29,7 @@ fn shown() -> impl Strategy<Value = Shown> {
                 id: format!("p{i}"),
                 text: "hi".into(),
                 intent: "fold".into(),
-                state: state.into(),
+                state: nd_wire::PromptState::from_value(&serde_json::json!(state)),
                 native: None,
                 reason: None,
             }),

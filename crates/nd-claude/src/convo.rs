@@ -31,7 +31,10 @@ pub enum Convo {
     Echo {
         uuid: String,
     },
-    TurnStarted,
+    TurnStarted {
+        #[serde(default)]
+        turn: Option<String>,
+    },
     /// 实际回合的提示集合；同一回合可包含多条 user，工具调用不另开轮。
     TurnMapped {
         turn: String,
@@ -142,6 +145,9 @@ fn block_text(block: &Value) -> (ItemKind, String) {
 }
 
 impl Conversation {
+    pub fn current_turn(&self) -> Option<&str> {
+        self.running.then_some(self.turn_key.as_deref()).flatten()
+    }
     pub fn can_cancel_queued(&self) -> bool {
         self.cancel_queued
     }
@@ -409,7 +415,9 @@ impl Conversation {
             Some("system") => match frame["subtype"].as_str() {
                 Some("init") if main => {
                     self.running = true;
-                    out.push(Convo::TurnStarted);
+                    out.push(Convo::TurnStarted {
+                        turn: self.turn_key.clone(),
+                    });
                 }
                 Some("task_started") => {
                     if let Some(id) = frame["task_id"].as_str() {

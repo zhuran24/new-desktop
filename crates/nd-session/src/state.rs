@@ -128,6 +128,8 @@ pub struct Carrier {
     /// 后台任务能否收尾；没报过就是 Unknown，不当成空。
     pub drain: Drain,
     pub turn_running: bool,
+    #[serde(default)]
+    pub turn: Option<nd_backend::TurnRef>,
     pub turns: u64,
     /// 端口报的能力表（拉起时、能力变了时）；旧记录没有时为空。
     #[serde(default)]

@@ -24,7 +24,7 @@ impl Executor {
                     text: m.text.clone(),
                     attachments: m.attachments.clone(),
                     intent: intent_name(m.intent).into(),
-                    state: "failed".into(),
+                    state: PromptState::Failed,
                     native: None,
                     reason: Some(reason.into()),
                 },
@@ -49,11 +49,11 @@ impl Executor {
         for entry in queued {
             let structural = self.core.ops.values().any(|op| op.spec.structural());
             let Some(carrier) = self.core.current_carrier().cloned().filter(|_| !structural) else {
-                self.show_queued(tx, fx, &entry, "held", None)?;
+                self.show_queued(tx, fx, &entry, PromptState::Held, None)?;
                 continue;
             };
             if !carrier.alive {
-                self.show_queued(tx, fx, &entry, "held", None)?;
+                self.show_queued(tx, fx, &entry, PromptState::Held, None)?;
                 self.start_op(
                     tx,
                     fx,
@@ -78,7 +78,7 @@ impl Executor {
                     continue;
                 }
                 if matches!(invoke.invocation, Invocation::Shell { .. }) && carrier.turn_running {
-                    self.show_queued(tx, fx, &entry, "waiting_turn", None)?;
+                    self.show_invoke(tx, fx, invoke, "waiting_turn", None)?;
                     continue;
                 }
             }
@@ -115,23 +115,25 @@ impl Executor {
                         queue.sent(ticket.clone());
                     }
                     fx.hand.push(ticket);
-                    self.show_queued(tx, fx, &entry, "pending", None)?;
+                    self.show_queued(tx, fx, &entry, PromptState::Pending, None)?;
                     progress = true;
                 }
-                nd_claims::Admit::Go(_) => self.show_queued(tx, fx, &entry, "held", None)?,
+                nd_claims::Admit::Go(_) => {
+                    self.show_queued(tx, fx, &entry, PromptState::Held, None)?
+                }
                 nd_claims::Admit::Wait(obstacle) => {
                     let why = format!("{obstacle:?}");
                     if let Some(queue) = self.queue_mut(&entry.issuer()) {
                         queue.waiting = Some(why.clone());
                     }
-                    self.show_queued(tx, fx, &entry, "waiting", Some(why))?;
+                    self.show_queued(tx, fx, &entry, PromptState::Waiting, Some(why))?;
                 }
                 nd_claims::Admit::No(refusal) => {
                     let why = format!("独占登记不放行：{refusal:?}");
                     match &entry {
                         Queued::Message(m) => {
                             self.core.messages.remove(&m.id);
-                            self.show_message(tx, fx, m, "failed", Some(why))?;
+                            self.show_message(tx, fx, m, PromptState::Failed, Some(why))?;
                         }
                         Queued::Invoke(i) => self.finish_invoke(
                             tx,
@@ -160,12 +162,12 @@ impl Executor {
         tx: &Tx<'_>,
         fx: &mut Effects,
         entry: &Queued,
-        state: &str,
+        state: PromptState,
         reason: Option<String>,
     ) -> nd_store::Result<()> {
         match entry {
             Queued::Message(m) => self.show_message(tx, fx, m, state, reason),
-            Queued::Invoke(i) => self.show_invoke(tx, fx, i, state, reason),
+            Queued::Invoke(i) => self.show_invoke(tx, fx, i, state.as_str(), reason),
         }
     }
 
@@ -174,7 +176,7 @@ impl Executor {
         tx: &Tx<'_>,
         fx: &mut Effects,
         m: &Message,
-        state: &str,
+        state: PromptState,
         reason: Option<String>,
     ) -> nd_store::Result<()> {
         self.show(
@@ -185,7 +187,7 @@ impl Executor {
                 text: m.text.clone(),
                 attachments: m.attachments.clone(),
                 intent: intent_name(m.intent).into(),
-                state: state.into(),
+                state,
                 native: None,
                 reason,
             },

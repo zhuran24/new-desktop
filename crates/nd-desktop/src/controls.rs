@@ -104,7 +104,17 @@ impl Desktop {
         let command = Command {
             id: uuid::Uuid::new_v4().to_string(),
             device: self.device.clone(),
-            expect: json!({}),
+            expect: if name == "session.interrupt" {
+                let turn = self
+                    .session_snapshot
+                    .as_ref()
+                    .and_then(|s| s.items.iter().find(|i| i.id == "header"))
+                    .map(|h| h.data["process"]["turn"].clone())
+                    .unwrap_or(Value::Null);
+                json!({"turn":turn})
+            } else {
+                json!({})
+            },
             name: name.into(),
             args,
         };

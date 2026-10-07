@@ -389,7 +389,10 @@ impl ScriptedAdapter {
                     vec![]
                 };
                 vec![done(Outcome::Ok {
-                    done: Done::Interrupted { cancelled },
+                    done: Done::Interrupted {
+                        cancelled,
+                        already_ended: false,
+                    },
                 })]
             }
             (Act::Configure { setting, .. }, Reply::Ok) => {

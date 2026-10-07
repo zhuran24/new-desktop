@@ -122,3 +122,5 @@ CLI 依赖逐条登记在 [CLI 契约清单](../../docs/cli-contracts.md) 的「
 
 
 #19 集成后，检查点的 writes 覆盖用户输入和控制请求的实际输入序号，controls 只保留回应配对。对旧版不含 writes 的控制检查点按旧格式兼容；无法证明未写出时保持 Unknown。接回先追平并报 Recovered，写过的控制继续等原回应；已终结 Unknown 的票只对账，不重新执行。明确回应同时提供 Clarified，供引擎更新原 Unknown 的当前结论。
+
+中断携带按 Esc 时的 `TurnRef{run,key}`；重启补发与普通写入走同一核对。目标已结束或无法确认时只回「目标回合已结束，无需中断」，不写 CLI interrupt。桌面用已呈现的 `process.turn` 填入 expect，未提供 expect 的终端调用在签票时钉住当前回合。CLI 没有原子的期望回合字段，核对与实际写入之间仍有竞态；会话头的 `process.interrupt_scope` 明示这一界限。

@@ -1164,6 +1164,14 @@ impl Inner {
     }
 }
 
+#[cfg(feature = "scenarios")]
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryFault {
+    CrashAfterWrite,
+    PauseAfterWrite,
+}
+
 struct Actor {
     inner: Arc<Inner>,
     session: SessionId,
@@ -1337,22 +1345,6 @@ impl Actor {
                 self.pending.insert(uuid.clone(), ticket.clone());
                 #[cfg(feature = "scenarios")]
                 self.stop_fault(&msg.text);
-                #[cfg(feature = "scenarios")]
-                if self.delivery_fault(&msg.text, false).is_some() {
-                    self.inner
-                        .deliver_facts(
-                            &self.session,
-                            &self.carrier,
-                            vec![done(
-                                &ticket,
-                                Outcome::Unknown {
-                                    evidence: "场景故障：输入传输回应丢失，尚未核实写入".into(),
-                                },
-                            )],
-                        )
-                        .await;
-                    return;
-                }
                 let seq = self.run.next_input();
                 if let Err(error) = self.run.write(&frame).await {
                     // 传输出错（例如别处接管了看守连接）：换连接后按看守报的已写高水位定，
@@ -1388,33 +1380,41 @@ impl Actor {
                     }
                 }
                 #[cfg(feature = "scenarios")]
-                if let Some(action) = self.delivery_fault(&msg.text, true) {
-                    if action == "crash_after_write" {
-                        std::process::abort();
-                    }
-                    if action == "pause_after_write" {
+                match self.delivery_fault(&msg.text) {
+                    Some(DeliveryFault::CrashAfterWrite) => std::process::abort(),
+                    Some(DeliveryFault::PauseAfterWrite) => {
                         let _ = rustix::process::kill_process(
                             rustix::process::Pid::from_raw(std::process::id() as i32).unwrap(),
                             rustix::process::Signal::STOP,
                         );
                     }
-                    if action == "unknown_after_write" {
-                        self.inner
-                            .deliver_facts(
-                                &self.session,
-                                &self.carrier,
-                                vec![done(
-                                    &ticket,
-                                    Outcome::Unknown {
-                                        evidence: "场景故障：写出后连接中断".into(),
-                                    },
-                                )],
-                            )
-                            .await;
-                    }
+                    None => {}
                 }
             }
             Cmd::Control { ticket, act } => {
+                if let Act::Interrupt { turn, .. } = &act
+                    && !turn.as_ref().is_some_and(|target| {
+                        target.run == self.run_id
+                            && self.convo.current_turn() == Some(target.key.as_str())
+                    })
+                {
+                    self.inner
+                        .deliver_facts(
+                            &self.session,
+                            &self.carrier,
+                            vec![done(
+                                &ticket,
+                                Outcome::Ok {
+                                    done: Done::Interrupted {
+                                        cancelled: vec![],
+                                        already_ended: true,
+                                    },
+                                },
+                            )],
+                        )
+                        .await;
+                    return;
+                }
                 let id = native_uuid(&ticket);
                 let request = match &act {
                     Act::Interrupt { queued, .. } => {
@@ -1450,31 +1450,12 @@ impl Actor {
                 #[cfg(feature = "scenarios")]
                 self.stop_fault(request["subtype"].as_str().unwrap_or_default());
                 self.controls.insert(id.clone(), (ticket.clone(), act));
-                #[cfg(feature = "scenarios")]
-                if self
-                    .delivery_fault(request["subtype"].as_str().unwrap_or_default(), false)
-                    .is_some()
-                {
-                    self.inner
-                        .deliver_facts(
-                            &self.session,
-                            &self.carrier,
-                            vec![done(
-                                &ticket,
-                                Outcome::Unknown {
-                                    evidence: "场景故障：控制请求传输未确认".into(),
-                                },
-                            )],
-                        )
-                        .await;
-                    return;
-                }
                 // 看守按实际输入序号去重；不把连接失败当作请求未送达。
                 let seq = self.run.next_input();
                 if let Err(error) = self.run.write(&frame).await {
                     let recovered = self.relink().await
                         && (self.run.written_through() >= seq
-                            || self.run.write(&frame).await.is_ok());
+                            || self.run.retry_write(seq, &frame).await.is_ok());
                     if !recovered {
                         // 保留请求配对，迟到回应仍可澄清原 Unknown；writes 才是写出证据。
                         self.inner
@@ -1733,7 +1714,7 @@ impl Actor {
     }
 
     #[cfg(feature = "scenarios")]
-    fn delivery_fault(&self, text: &str, written: bool) -> Option<String> {
+    fn delivery_fault(&self, text: &str) -> Option<DeliveryFault> {
         let path = self
             .inner
             .claude
@@ -1744,11 +1725,9 @@ impl Actor {
         if !value["contains"].as_str().is_some_and(|s| text.contains(s)) {
             return None;
         }
-        if (value["action"] == "unknown_without_write") == written {
-            return None;
-        }
+        let action = serde_json::from_value(value["action"].clone()).ok()?;
         std::fs::remove_file(path).ok()?;
-        value["action"].as_str().map(str::to_owned)
+        Some(action)
     }
 
     /// 场景构建的故障点：写某条消息之前让后端进程停住（SIGSTOP），模拟「写出了、还没被处理」。
@@ -1920,7 +1899,10 @@ impl Actor {
                                                 })
                                                 .collect();
                                             Outcome::Ok {
-                                                done: Done::Interrupted { cancelled },
+                                                done: Done::Interrupted {
+                                                    cancelled,
+                                                    already_ended: false,
+                                                },
                                             }
                                         }
                                     }
@@ -2006,7 +1988,9 @@ impl Actor {
                             last_assistant,
                         },
                     )),
-                    Convo::TurnStarted => facts.push(fact(key, FactBody::TurnStarted)),
+                    Convo::TurnStarted { turn } => {
+                        facts.push(fact(key, FactBody::TurnStarted { turn }))
+                    }
                     Convo::TurnEnded {
                         ok, subtype, error, ..
                     } => facts.push(fact(key, FactBody::TurnEnded { ok, subtype, error })),

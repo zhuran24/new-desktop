@@ -133,7 +133,7 @@ impl Executor {
                             text: msg.text.clone(),
                             attachments: msg.attachments.clone(),
                             intent: intent_name(msg.intent).into(),
-                            state: "written".into(),
+                            state: PromptState::Written,
                             native: Some(native),
                             reason: None,
                         };
@@ -147,6 +147,15 @@ impl Executor {
                     last_assistant,
                 } => {
                     self.ensure_lineage(&batch.carrier)?;
+                    if !complete
+                        && let Some(c) = self.core.carriers.get_mut(&batch.carrier)
+                        && c.turn.is_none()
+                    {
+                        c.turn = c.run.clone().map(|run| nd_backend::TurnRef {
+                            run,
+                            key: turn.clone(),
+                        });
+                    }
                     let Some(backend_session) =
                         self.core.carriers.get(&batch.carrier).map(|c| c.bs.clone())
                     else {
@@ -165,8 +174,13 @@ impl Executor {
                         })
                         .map_err(aborted)?;
                 }
-                FactBody::TurnStarted => {
+                FactBody::TurnStarted { turn } => {
                     if let Some(c) = self.core.carriers.get_mut(&batch.carrier) {
+                        c.turn = c
+                            .run
+                            .clone()
+                            .zip(turn)
+                            .map(|(run, key)| nd_backend::TurnRef { run, key });
                         c.turn_running = true;
                     }
                 }
@@ -174,6 +188,7 @@ impl Executor {
                     let n = match self.core.carriers.get_mut(&batch.carrier) {
                         Some(c) => {
                             c.turn_running = false;
+                            c.turn = None;
                             c.turns += 1;
                             c.turns
                         }
@@ -207,6 +222,7 @@ impl Executor {
                         c.run = None;
                         c.alive = false;
                         c.turn_running = false;
+                        c.turn = None;
                         c.checkpoint = None;
                     }
                 }
@@ -293,6 +309,7 @@ impl Executor {
                     c.adopt = adopt.clone();
                     c.checkpoint = None;
                     c.turn_running = false;
+                    c.turn = None;
                 }
                 let meta = self.core.meta.as_mut().unwrap();
                 meta.settings = settings.clone();
@@ -341,6 +358,7 @@ impl Executor {
                     c.run = None;
                     c.alive = false;
                     c.turn_running = false;
+                    c.turn = None;
                     c.checkpoint = None;
                 }
             }
@@ -380,13 +398,15 @@ impl Executor {
             let (state, native, reason) = match &outcome {
                 Outcome::Ok {
                     done: Done::Landed { native },
-                } => ("landed", Some(native.clone()), None),
-                Outcome::Unknown { .. } => ("unknown", None, Some(outcome.reason())),
+                } => (PromptState::Landed, Some(native.clone()), None),
+                Outcome::Unknown { .. } => (PromptState::Unknown, None, Some(outcome.reason())),
                 Outcome::Refused {
                     refusal: Refusal::Withdrawn,
-                } => ("withdrawn", None, None),
-                other if !other.possibly_applied() => ("not_delivered", None, Some(other.reason())),
-                other => ("failed", None, Some(other.reason())),
+                } => (PromptState::Withdrawn, None, None),
+                other if !other.possibly_applied() => {
+                    (PromptState::NotDelivered, None, Some(other.reason()))
+                }
+                other => (PromptState::Failed, None, Some(other.reason())),
             };
             self.show(
                 tx,
@@ -396,7 +416,7 @@ impl Executor {
                     text: msg.text.clone(),
                     attachments: msg.attachments.clone(),
                     intent: intent_name(msg.intent).into(),
-                    state: state.into(),
+                    state,
                     native,
                     reason,
                 },
@@ -444,7 +464,7 @@ impl Executor {
                     } => {
                         self.restore_withdrawn(tx, fx, &message)?;
                         self.refill_draft(tx, &id, &restore, std::slice::from_ref(&message))?;
-                        "withdrawn"
+                        ControlState::Withdrawn
                     }
                     Outcome::Ok {
                         done: Done::Withdrawn { ok: false },
@@ -454,23 +474,35 @@ impl Executor {
                                 tx,
                                 fx,
                                 &message,
-                                "written",
+                                PromptState::Written,
                                 Some("已开始处理，撤回失败".into()),
                             )?;
                         }
-                        "not_withdrawable"
+                        ControlState::NotWithdrawable
                     }
                     Outcome::Unknown { .. } => {
                         if self.core.messages.contains_key(&message.id) {
-                            self.show_message(tx, fx, &message, "unknown", Some(outcome.reason()))?;
+                            self.show_message(
+                                tx,
+                                fx,
+                                &message,
+                                PromptState::Unknown,
+                                Some(outcome.reason()),
+                            )?;
                         }
-                        "unknown"
+                        ControlState::Unknown
                     }
                     _ => {
                         if self.core.messages.contains_key(&message.id) {
-                            self.show_message(tx, fx, &message, "written", Some(outcome.reason()))?;
+                            self.show_message(
+                                tx,
+                                fx,
+                                &message,
+                                PromptState::Written,
+                                Some(outcome.reason()),
+                            )?;
                         }
-                        "failed"
+                        ControlState::Failed
                     }
                 };
                 self.show(
@@ -478,7 +510,7 @@ impl Executor {
                     fx,
                     Shown::Control {
                         id,
-                        state: state.into(),
+                        state,
                         outcome: serde_json::to_value(outcome).map_err(aborted)?,
                     },
                 )?;
@@ -489,7 +521,7 @@ impl Executor {
                 mut held,
             } => {
                 if let Outcome::Ok {
-                    done: Done::Interrupted { cancelled },
+                    done: Done::Interrupted { cancelled, .. },
                 } = &outcome
                 {
                     for send in cancelled {
@@ -535,16 +567,23 @@ impl Executor {
                     held.clear();
                 }
                 let state = match &outcome {
-                    Outcome::Ok { .. } => "acknowledged",
-                    Outcome::Unknown { .. } => "unknown",
-                    _ => "failed",
+                    Outcome::Ok {
+                        done:
+                            Done::Interrupted {
+                                already_ended: true,
+                                ..
+                            },
+                    } => ControlState::AlreadyEnded,
+                    Outcome::Ok { .. } => ControlState::Acknowledged,
+                    Outcome::Unknown { .. } => ControlState::Unknown,
+                    _ => ControlState::Failed,
                 };
                 self.show(
                     tx,
                     fx,
                     Shown::Control {
                         id,
-                        state: state.into(),
+                        state,
                         outcome: serde_json::to_value(outcome).map_err(aborted)?,
                     },
                 )?;

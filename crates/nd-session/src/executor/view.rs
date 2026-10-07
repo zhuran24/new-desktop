@@ -65,6 +65,8 @@ pub(crate) fn header(core: &Core) -> Value {
             "alive": c.alive,
             "readiness": c.readiness,
             "turn_running": c.turn_running,
+            "turn": c.turn,
+            "interrupt_scope": "中断前核对回合；CLI 没有原子期望回合参数，核对与写入之间仍有竞态",
             "drain": c.drain,
             "features": c.features,
         })),

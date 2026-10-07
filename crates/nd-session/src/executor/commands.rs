@@ -374,7 +374,7 @@ impl Executor {
             )?;
         }
         self.core.messages.remove(&message.id);
-        self.show_message(tx, fx, message, "withdrawn", None)
+        self.show_message(tx, fx, message, PromptState::Withdrawn, None)
     }
 
     pub(super) fn withdraw(
@@ -441,7 +441,7 @@ impl Executor {
                 },
             );
             fx.hand.insert(0, ticket);
-            self.show_message(tx, fx, &message, "withdrawing", None)?;
+            self.show_message(tx, fx, &message, PromptState::Withdrawing, None)?;
         } else {
             self.restore_withdrawn(tx, fx, &message)?;
             self.refill_draft(tx, &command.id, &restore, &[message])?;
@@ -457,6 +457,19 @@ impl Executor {
         command: &Command,
         fx: &mut Effects,
     ) -> nd_store::Result<Receipt> {
+        let expected_turn: Option<Option<nd_backend::TurnRef>> = match command.expect.get("turn") {
+            Some(value) => match serde_json::from_value(value.clone()) {
+                Ok(turn) => Some(turn),
+                Err(_) => {
+                    return Ok(rejected(
+                        "invalid",
+                        json!({"need":"expect.turn: {run,key} or null"}),
+                    ));
+                }
+            },
+            None => None,
+        };
+
         let queued = match command.args["queued"].as_str().unwrap_or("keep") {
             "keep" => nd_backend::QueuedPolicy::Keep,
             "cancel" => nd_backend::QueuedPolicy::Cancel,
@@ -493,7 +506,7 @@ impl Executor {
             held.sort_by_key(|m| m.queue.arrival);
             for message in &held {
                 self.core.messages.remove(&message.id);
-                self.show_message(tx, fx, message, "withdrawing", None)?;
+                self.show_message(tx, fx, message, PromptState::Withdrawing, None)?;
             }
             Some(restore)
         } else {
@@ -524,6 +537,7 @@ impl Executor {
                 },
                 act: Act::Interrupt {
                     to: carrier.id,
+                    turn: expected_turn.unwrap_or(carrier.turn),
                     queued,
                 },
                 kind: carrier.kind,
@@ -543,7 +557,7 @@ impl Executor {
             fx,
             Shown::Control {
                 id: command.id.clone(),
-                state: "pending".into(),
+                state: ControlState::Pending,
                 outcome: Value::Null,
             },
         )?;
@@ -583,7 +597,7 @@ impl Executor {
                     text: msg.text,
                     attachments: msg.attachments,
                     intent: intent_name(msg.intent).into(),
-                    state: "resent".into(),
+                    state: PromptState::Resent,
                     native: None,
                     reason: Some(format!("已由消息 {} 重发", command.id)),
                 },

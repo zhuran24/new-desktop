@@ -9,12 +9,10 @@ fn pinned_metadata(item: &Item) -> bool {
 }
 fn unsettled(item: &Item) -> bool {
     item.data["complete"] == false
-        || (item.kind == "control" && item.data["state"] == "pending")
+        || (item.kind == "control"
+            && nd_wire::ControlState::from_value(&item.data["state"]).unsettled())
         || (item.kind == "prompt"
-            && matches!(
-                item.data["state"].as_str(),
-                Some("held" | "waiting" | "pending" | "written" | "withdrawing")
-            ))
+            && nd_wire::PromptState::from_value(&item.data["state"]).unsettled())
 }
 #[derive(Default)]
 pub struct History {

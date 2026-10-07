@@ -50,6 +50,7 @@ async fn confirmed_queue_cancellation_returns_an_unknown_send_and_revokes_resend
         &control,
         Outcome::Ok {
             done: Done::Interrupted {
+                already_ended: false,
                 cancelled: vec![original.clone()],
             },
         },

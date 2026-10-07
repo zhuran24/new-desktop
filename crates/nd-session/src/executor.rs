@@ -4,6 +4,7 @@
 //! 显示缓存同一事务提交；提交之后才发事件、给端口确认、把新票交给端口。纯增量不开事务。
 mod drafts;
 use drafts::RefOwner;
+use nd_wire::{ControlState, PromptState};
 mod commands;
 mod facts;
 mod idle;
@@ -955,6 +956,7 @@ impl Executor {
                         why: "还没有后台任务表".into(),
                     },
                     turn_running: false,
+                    turn: None,
                     turns: 0,
                     features: vec![],
                 });
@@ -1017,7 +1019,7 @@ impl Executor {
                 text: msg.text.clone(),
                 attachments: msg.attachments.clone(),
                 intent: intent_name(msg.intent).into(),
-                state: "pending".into(),
+                state: PromptState::Pending,
                 native: None,
                 reason: None,
             };

@@ -293,7 +293,7 @@ fn walking_pages_matches_the_simple_projection_and_cursors_survive_append() {
             id: format!("p{n}"),
             text: format!("提示 {n}"),
             intent: "fold".into(),
-            state: "landed".into(),
+            state: nd_wire::PromptState::Landed,
             native: None,
             reason: None,
             attachments: vec![],

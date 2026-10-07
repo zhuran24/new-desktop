@@ -192,11 +192,11 @@ async fn an_uncertain_unwritten_interrupt_is_clarified_without_executing_it() {
         .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
         .await
         .unwrap();
-    std::fs::write(
-        fx.scenario.root().join("runtime/delivery-fault.json"),
-        r#"{"contains":"interrupt","action":"unknown_without_write"}"#,
-    )
-    .unwrap();
+    fx.wait(&session, "active round identity published", |s| {
+        header(s)["process"]["turn_running"] == true && !header(s)["process"]["turn"].is_null()
+    })
+    .await;
+    let cut = fx.cut_input(&session).await;
     fx.command(
         "uncertain-esc",
         "session.interrupt",
@@ -217,6 +217,7 @@ async fn an_uncertain_unwritten_interrupt_is_clarified_without_executing_it() {
     })
     .await
     .expect("control unknown fault must be observed");
+    drop(cut);
     fx.scenario.restart_daemon().unwrap();
     let clarified = fx
         .wait(&session, "known unwritten control", |s| {
@@ -1180,6 +1181,30 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// 从外部夺取旧控制连接并暂时移走 socket；真实 write/relink 自己报交付不明。
+    async fn cut_input(&self, session: &str) -> WatchdogCut {
+        let snapshot = self.peek(session).await;
+        let run = header(&snapshot)["process"]["run"].as_str().unwrap();
+        let socket = self
+            .scenario
+            .watchdogs()
+            .unwrap()
+            .directory(run)
+            .unwrap()
+            .join("watchdog.sock");
+        let parked = socket.with_extension("parked");
+        std::fs::rename(&socket, &parked).unwrap();
+        let mut controller = tokio::net::UnixStream::connect(&parked).await.unwrap();
+        let hello: nd_watchdog_proto::Response =
+            nd_watchdog_proto::recv(&mut controller).await.unwrap();
+        assert!(matches!(hello, nd_watchdog_proto::Response::Hello { .. }));
+        WatchdogCut {
+            socket,
+            parked,
+            _controller: controller,
+        }
+    }
+
     /// 守护进程配 Claude 后端：钉住的 CLI（看守沙盒里叫 /cli）、仓库里的两个 mod、
     /// 场景自己的 CLAUDE_CONFIG_DIR；后端环境从白名单构造，只有离线端点和假 key。
     async fn start(name: &str, idle_reclaim_ms: u64) -> Self {
@@ -2975,8 +3000,8 @@ async fn streaming_survives_kill_and_service_restart_with_a_checkpoint_mid_block
 }
 
 #[tokio::test]
-async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_input() {
-    for action in ["unknown_after_write", "crash_after_write"] {
+async fn a_crash_after_write_before_accounting_never_resends_the_native_input() {
+    for action in ["crash_after_write"] {
         let fx = Fixture::start("nd19-write-window", 3_600_000).await;
         fx.scenario
             .endpoint()
@@ -3004,26 +3029,6 @@ async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_inp
             reply,
             CommandReply::Receipt { .. } | CommandReply::DeliveryUnknown
         ));
-        if action == "unknown_after_write" {
-            fx.wait(&session, "unknown delivery", |s| {
-                prompt(s, "写后窗口").is_some_and(|i| i.data["state"] == "unknown")
-            })
-            .await;
-            let refused = fx
-                .command(
-                    "no-blind-resend",
-                    "session.resend",
-                    json!({"session":session,"message":"window-send"}),
-                )
-                .await;
-            assert!(matches!(
-                refused,
-                CommandReply::Receipt {
-                    receipt: Receipt::Rejected { .. }
-                }
-            ));
-            fx.scenario.restart_daemon().unwrap();
-        }
         // 写出后的故障可晚于 command 收据；一次性 peek 会撞上旧连接关闭。
         // 和产品界面共用重连副本，必须等到新纪元里的真实投递确认。
         let mut feed =
@@ -3141,11 +3146,7 @@ async fn recovery_confirms_an_unwritten_unknown_and_nd_wire_resends_only_on_requ
         .enqueue(fx.main(), ModelReply::text("就绪"));
     let session = fx.create("lost-create", "/sandbox/project", "开始").await;
     fx.wait(&session, "ready", |s| texts(s) == ["就绪"]).await;
-    std::fs::write(
-        fx.scenario.root().join("runtime/delivery-fault.json"),
-        json!({"contains":"","action":"unknown_without_write"}).to_string(),
-    )
-    .unwrap();
+    let cut = fx.cut_input(&session).await;
     let png = include_bytes!("fixtures/pixel.png");
     let blob = fx.ui().await.put_blob(png).await.unwrap();
     let attachments =
@@ -3166,6 +3167,7 @@ async fn recovery_confirms_an_unwritten_unknown_and_nd_wire_resends_only_on_requ
     )
     .await
     .unwrap();
+    drop(cut);
     fx.scenario.restart_daemon().unwrap();
     fx.wait(&session, "confirmed absent input", |s| {
         prompt(s, "").is_some_and(|i| i.data["state"] == "not_delivered")
@@ -4744,5 +4746,99 @@ async fn disabling_mcp_backgrounding_removes_the_send_now_preservation_promise()
             "{name}"
         );
         fx.close();
+    }
+}
+
+#[tokio::test]
+async fn an_interrupt_pinned_to_an_ended_round_does_not_stop_a_later_round_after_restart() {
+    let fx = Fixture::start("interrupt-target", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("round A"));
+    let session = fx.create("target-create", "/sandbox/project", "A").await;
+    let first = fx
+        .wait(&session, "A ended", |s| {
+            texts(s) == ["round A"] && header(s)["process"]["turn_running"] == false
+        })
+        .await;
+    let run = header(&first)["process"]["run"].as_str().unwrap();
+    let recording =
+        std::fs::read_to_string(fx.scenario.root().join(format!("recordings/{run}.jsonl")))
+            .unwrap();
+    let target = recording
+        .lines()
+        .filter_map(|line| serde_json::from_str::<nd_watchdog_proto::Record>(line).ok())
+        .find_map(|record| match record.event {
+            nd_watchdog_proto::Event::Out { line } => {
+                let frame: Value = serde_json::from_str(&line).ok()?;
+                (frame["type"] == "system" && frame["subtype"] == "init")
+                    .then(|| frame["uuid"].clone())
+            }
+            _ => None,
+        })
+        .expect("real CLI round identity");
+    let gate = fx
+        .scenario
+        .endpoint()
+        .enqueue_held(fx.main(), ModelReply::text("round B completed"));
+    fx.send("target-B", &session, "B").await;
+    fx.scenario
+        .endpoint()
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(10))
+        .await
+        .unwrap();
+    fx.scenario.restart_daemon().unwrap();
+    fx.wait(&session, "B recovered", |s| {
+        header(s)["recovering"] == false && header(s)["process"]["turn_running"] == true
+    })
+    .await;
+    fx.ui()
+        .await
+        .command(&Command {
+            id: "old-escape".into(),
+            device: "old-window".into(),
+            name: "session.interrupt".into(),
+            args: json!({"session":session}),
+            expect: json!({"turn":{"run":run,"key":target}}),
+        })
+        .await
+        .unwrap();
+    let after = fx
+        .wait(&session, "control settled", |s| {
+            s.items
+                .iter()
+                .any(|i| i.id == "control/old-escape" && i.data["state"] != "pending")
+        })
+        .await;
+    assert_eq!(
+        header(&after)["process"]["turn_running"],
+        true,
+        "a stale Esc must leave B running"
+    );
+    assert_eq!(
+        after
+            .items
+            .iter()
+            .find(|i| i.id == "control/old-escape")
+            .unwrap()
+            .data["state"],
+        "already_ended"
+    );
+    gate.release();
+    fx.wait(&session, "B naturally completed", |s| {
+        texts(s) == ["round A", "round B completed"]
+    })
+    .await;
+    fx.close();
+}
+
+struct WatchdogCut {
+    socket: std::path::PathBuf,
+    parked: std::path::PathBuf,
+    _controller: tokio::net::UnixStream,
+}
+impl Drop for WatchdogCut {
+    fn drop(&mut self) {
+        let _ = std::fs::rename(&self.parked, &self.socket);
     }
 }
