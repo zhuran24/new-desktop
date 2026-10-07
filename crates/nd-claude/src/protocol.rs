@@ -79,7 +79,7 @@ pub enum Fact {
         op_id: String,
         outcome: Outcome,
     },
-    /// 发出的命令随旧代次丢了结果，可以重发：同一个操作 id 按新代次重新排队。
+    /// 安全重排：尚未交付，或已交付但允许重发；操作 id 和期望会话保持不变。
     Resent {
         module: ModName,
         op_id: String,
@@ -247,23 +247,21 @@ impl ModState {
                 to_gen: hello.mod_gen.clone(),
             });
             // 旧代次的结果随模块变量一起没了：按可重发类别处理在途命令。
-            let session = self.session.clone();
             let mut unknown = vec![];
             for (op_id, (module, command, delivered)) in self.outstanding.iter_mut() {
                 if *module != hello.module || command.expected_mod_gen == hello.mod_gen {
                     continue;
                 }
                 match command.action.resend() {
-                    Resend::Resendable => {
+                    resend if resend == Resend::Resendable || !*delivered => {
                         command.expected_mod_gen = hello.mod_gen.clone();
-                        command.expected_backend_session_id = session.clone();
                         *delivered = false;
                         facts.push(Fact::Resent {
                             module: *module,
                             op_id: op_id.clone(),
                         });
                     }
-                    Resend::NotResendable => unknown.push(op_id.clone()),
+                    _ => unknown.push(op_id.clone()),
                 }
             }
             for op_id in unknown {
