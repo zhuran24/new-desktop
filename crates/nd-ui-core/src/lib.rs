@@ -332,24 +332,16 @@ impl SyncReplica {
             }
         }
     }
-    pub async fn put_blob(&self, bytes: &[u8]) -> Result<String> {
-        use sha2::{Digest, Sha256};
-        let id = format!("{:x}", Sha256::digest(bytes));
+    pub async fn put_blob(&self, bytes: &[u8]) -> Result<nd_wire::BlobId> {
+        let id = nd_wire::BlobId::of(bytes);
         self.http("PUT", &id, bytes.to_vec()).await?;
         Ok(id)
     }
-    pub async fn get_blob(&self, id: &str) -> Result<Vec<u8>> {
+    pub async fn get_blob(&self, id: &nd_wire::BlobId) -> Result<Vec<u8>> {
         self.http("GET", id, vec![]).await
     }
-    async fn http(&self, method: &str, id: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    async fn http(&self, method: &str, id: &nd_wire::BlobId, bytes: Vec<u8>) -> Result<Vec<u8>> {
         use http_body_util::{BodyExt, Full};
-        if id.len() != 64
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("invalid SHA-256".into());
-        }
         let io = hyper_util::rt::TokioIo::new(UnixStream::connect(&self.path).await?);
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await?;
         let task = tokio::spawn(async move {

@@ -954,6 +954,7 @@ async fn get_blob(
     State(state): State<Arc<Mutex<Engine>>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> std::result::Result<Vec<u8>, axum::http::StatusCode> {
+    let id: nd_wire::BlobId = id.parse().map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
     let blobs = state.lock().await.blobs.clone();
     tokio::task::spawn_blocking(move || blobs.get(&id))
         .await
@@ -965,12 +966,14 @@ async fn put_blob(
     axum::extract::Path(id): axum::extract::Path<String>,
     bytes: axum::body::Bytes,
 ) -> std::result::Result<String, axum::http::StatusCode> {
-    use sha2::{Digest, Sha256};
-    if format!("{:x}", Sha256::digest(&bytes)) != id {
+    let id: nd_wire::BlobId = id
+        .parse()
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+    if nd_wire::BlobId::of(&bytes) != id {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
     let blobs = state.lock().await.blobs.clone();
-    tokio::task::spawn_blocking(move || blobs.put(&bytes))
+    tokio::task::spawn_blocking(move || blobs.put(&bytes).map(|id| id.to_string()))
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)

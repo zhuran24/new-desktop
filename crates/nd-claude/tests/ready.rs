@@ -342,7 +342,7 @@ async fn a_resumed_backend_is_ready_when_both_mods_report_the_resumed_session() 
             .inspect()
             .unwrap()
             .iter()
-            .any(|f| f.run == "first" && f.state == "Up")
+            .any(|f| f.run == "first" && f.state == nd_runs::RunState::Up)
         {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

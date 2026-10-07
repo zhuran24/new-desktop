@@ -404,7 +404,7 @@ impl Command {
     Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct Attachment {
-    pub blob: String,
+    pub blob: nd_id::BlobId,
     pub name: String,
     pub media_type: String,
     pub size: u64,
@@ -412,14 +412,6 @@ pub struct Attachment {
 
 impl Attachment {
     pub fn validate(&self) -> Result<(), String> {
-        if self.blob.len() != 64
-            || !self
-                .blob
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("附件需要小写 SHA-256 内容散列".into());
-        }
         if self.name.is_empty() || self.name.len() > 255 || self.name.chars().any(char::is_control)
         {
             return Err("附件名称为空、过长或含控制字符".into());
@@ -474,3 +466,5 @@ pub struct TitleExpected {
 
 mod item_state;
 pub use item_state::{ControlState, PromptState};
+
+pub use nd_id::BlobId;

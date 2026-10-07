@@ -217,14 +217,14 @@ async fn attachment_roundtrip_uses_authenticated_http_and_survives_restart() {
     let replica = SyncReplica::connect(&daemon.socket()).await.unwrap();
     let id = replica.put_blob(b"abc").await.unwrap();
     assert_eq!(
-        id,
+        id.as_str(),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     assert_eq!(replica.get_blob(&id).await.unwrap(), b"abc");
     daemon.restart_daemon().unwrap();
     drop(daemon.connect().await.unwrap());
     assert_eq!(replica.get_blob(&id).await.unwrap(), b"abc");
-    assert!(replica.get_blob("../config.toml").await.is_err());
+    assert!("../config.toml".parse::<nd_wire::BlobId>().is_err());
 }
 
 #[tokio::test]

@@ -6,7 +6,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 pub struct FrozenImage {
     pub media_type: String,
     pub data: String,
-    pub sha256: String,
+    pub sha256: nd_id::BlobId,
 }
 
 impl FrozenImage {
@@ -14,7 +14,7 @@ impl FrozenImage {
         Self {
             media_type: media_type.into(),
             data: STANDARD.encode(bytes),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: nd_id::BlobId::of(bytes),
         }
     }
 }
@@ -58,7 +58,7 @@ pub(crate) fn reference(input: &FrozenInput, reference: &str) -> Result<Part, Co
     let bytes = STANDARD
         .decode(&image.data)
         .map_err(|_| ConvertError::Invalid("invalid frozen image base64".into()))?;
-    if format!("{:x}", Sha256::digest(&bytes)) != image.sha256 {
+    if nd_id::BlobId::of(&bytes) != image.sha256 {
         return Err(ConvertError::Invalid("frozen image hash mismatch".into()));
     }
     Ok(inline(&image.media_type, &image.data))

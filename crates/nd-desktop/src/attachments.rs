@@ -59,7 +59,7 @@ impl Desktop {
             "image/gif" => ImageFormat::Gif,
             _ => return,
         };
-        if !self.images.request(&a.blob) {
+        if !self.images.request(a.blob.as_str()) {
             return;
         }
         let client = self.client.clone();
@@ -69,7 +69,7 @@ impl Desktop {
             let _ = weak.update(cx, |this, cx| {
                 if let Ok(bytes) = result {
                     this.images
-                        .complete(&blob, Arc::new(Image::from_bytes(format, bytes)));
+                        .complete(blob.as_str(), Arc::new(Image::from_bytes(format, bytes)));
                 }
                 cx.notify();
             });
@@ -79,15 +79,15 @@ impl Desktop {
     pub(crate) fn attachment_view(&self, a: &Attachment, cx: &mut Context<Self>) -> AnyElement {
         let t = &self.theme;
         let attachment = a.clone();
-        let missing_image =
-            a.media_type.starts_with("image/") && self.images.get(&a.blob).cloned().is_none();
+        let missing_image = a.media_type.starts_with("image/")
+            && self.images.get(a.blob.as_str()).cloned().is_none();
         div()
             .id(SharedString::from(format!("{}/{}", a.blob, a.name)))
             .when(missing_image, |d| {
                 d.cursor_pointer()
                     .child("点击加载图片或重试")
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.images.remove(&attachment.blob);
+                        this.images.remove(attachment.blob.as_str());
                         this.load_attachment_image(&attachment, cx);
                     }))
             })
@@ -97,7 +97,7 @@ impl Desktop {
             .text_color(rgba(t.colors.muted))
             .text_size(px(t.typography.small))
             .child(format!("📎 {} · {} 字节", a.name, a.size))
-            .when_some(self.images.get(&a.blob).cloned(), |d, image| {
+            .when_some(self.images.get(a.blob.as_str()).cloned(), |d, image| {
                 d.child(
                     img(image)
                         .max_w(px(t.spacing.large * 10.))

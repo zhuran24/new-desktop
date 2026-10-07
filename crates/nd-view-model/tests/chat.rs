@@ -370,7 +370,7 @@ fn delivery_unknown_is_explained_and_only_confirmed_non_delivery_offers_resend()
 fn attachment_edits_participate_in_draft_receipt_revision() {
     let mut draft = nd_view_model::Draft::default();
     let a = nd_wire::Attachment {
-        blob: "a".repeat(64),
+        blob: "a".repeat(64).parse().unwrap(),
         name: "图.png".into(),
         media_type: "image/png".into(),
         size: 42,

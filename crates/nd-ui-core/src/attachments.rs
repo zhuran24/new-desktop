@@ -1,5 +1,4 @@
 use nd_wire::Attachment;
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 
@@ -56,7 +55,7 @@ impl AttachmentSource {
             return Err("不支持此文件：请使用 PNG、JPEG、GIF、WebP、PDF 或 UTF-8 文本".into());
         };
         let attachment = Attachment {
-            blob: format!("{:x}", Sha256::digest(&bytes)),
+            blob: nd_wire::BlobId::of(&bytes),
             name,
             media_type: media_type.into(),
             size: bytes.len() as u64,

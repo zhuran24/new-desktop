@@ -4227,6 +4227,7 @@ name = "nd-convert"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "nd-id",
  "proptest",
  "serde",
  "serde_json",
@@ -4257,7 +4258,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4281,6 +4281,17 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "nd-id"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4346,8 +4357,8 @@ dependencies = [
 name = "nd-store"
 version = "0.1.0"
 dependencies = [
+ "nd-id",
  "rusqlite",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -4384,7 +4395,6 @@ dependencies = [
  "hyper-util",
  "nd-wire",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
@@ -4428,6 +4438,7 @@ dependencies = [
 name = "nd-wire"
 version = "0.1.0"
 dependencies = [
+ "nd-id",
  "schemars",
  "serde",
  "serde_json",

@@ -1,5 +1,5 @@
 use crate::{Error, Result, Store, Tx};
-use sha2::{Digest, Sha256};
+use nd_id::BlobId;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -28,10 +28,10 @@ impl Blobs {
         })?;
         Ok(Self { directory, store })
     }
-    pub fn put(&self, bytes: &[u8]) -> Result<String> {
+    pub fn put(&self, bytes: &[u8]) -> Result<BlobId> {
         let _io = self.store.blob_io.lock().unwrap();
-        let id = format!("{:x}", Sha256::digest(bytes));
-        let path = self.path(&id)?;
+        let id = BlobId::of(bytes);
+        let path = self.path(&id);
         let mut temp = tempfile::NamedTempFile::new_in(&self.directory)?;
         temp.write_all(bytes)?;
         temp.as_file().sync_all()?;
@@ -48,42 +48,42 @@ impl Blobs {
         self.store.write(|tx| {
             tx.execute(
                 "INSERT OR IGNORE INTO nd_blobs(id,size,unused_since) VALUES (?1,?2,unixepoch())",
-                crate::params![id, bytes.len() as u64],
+                crate::params![id.as_str(), bytes.len() as u64],
             )?;
             let deleting: bool =
-                tx.query_row("SELECT deleting FROM nd_blobs WHERE id=?1", [&id], |r| {
+                tx.query_row("SELECT deleting FROM nd_blobs WHERE id=?1", [id.as_str()], |r| {
                     r.get(0)
                 })?;
             if deleting {
                 return Err(Error::Busy);
             }
-            tx.execute("UPDATE nd_blobs SET unused_since=unixepoch() WHERE id=?1 AND unused_since IS NOT NULL", [&id])?;
+            tx.execute("UPDATE nd_blobs SET unused_since=unixepoch() WHERE id=?1 AND unused_since IS NOT NULL", [id.as_str()])?;
             Ok(())
         })?;
         Ok(id)
     }
-    pub fn get(&self, id: &str) -> Result<Vec<u8>> {
-        let bytes = std::fs::read(self.path(id)?)?;
-        if format!("{:x}", Sha256::digest(&bytes)) != id {
+    pub fn get(&self, id: &BlobId) -> Result<Vec<u8>> {
+        let bytes = std::fs::read(self.path(id))?;
+        if BlobId::of(&bytes) != *id {
             return Err(Error::Corrupt);
         }
         Ok(bytes)
     }
     /// 业务事务内核对引用；不读文件，不和清理器交错。
-    pub fn size(&self, tx: &Tx<'_>, id: &str) -> Result<Option<u64>> {
+    pub fn size(&self, tx: &Tx<'_>, id: &BlobId) -> Result<Option<u64>> {
         use crate::OptionalExtension;
         Ok(tx
             .query_row(
                 "SELECT size FROM nd_blobs WHERE id=?1 AND deleting=0",
-                [id],
+                [id.as_str()],
                 |r| r.get(0),
             )
             .optional()?)
     }
-    pub fn hold(&self, tx: &mut Tx<'_>, id: &str, owner: &str) -> Result<()> {
+    pub fn hold(&self, tx: &mut Tx<'_>, id: &BlobId, owner: &str) -> Result<()> {
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM nd_blobs WHERE id=?1 AND deleting=0)",
-            [id],
+            [id.as_str()],
             |r| r.get(0),
         )?;
         if !exists {
@@ -91,17 +91,20 @@ impl Blobs {
         }
         tx.execute(
             "INSERT OR IGNORE INTO nd_blob_refs(blob,owner) VALUES (?1,?2)",
-            [id, owner],
+            [id.as_str(), owner],
         )?;
-        tx.execute("UPDATE nd_blobs SET unused_since=NULL WHERE id=?1", [id])?;
+        tx.execute(
+            "UPDATE nd_blobs SET unused_since=NULL WHERE id=?1",
+            [id.as_str()],
+        )?;
         Ok(())
     }
-    pub fn release(&self, tx: &mut Tx<'_>, id: &str, owner: &str) -> Result<()> {
+    pub fn release(&self, tx: &mut Tx<'_>, id: &BlobId, owner: &str) -> Result<()> {
         tx.execute(
             "DELETE FROM nd_blob_refs WHERE blob=?1 AND owner=?2",
-            [id, owner],
+            [id.as_str(), owner],
         )?;
-        tx.execute("UPDATE nd_blobs SET unused_since=COALESCE(unused_since,unixepoch()) WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM nd_blob_refs WHERE blob=?1)", [id])?;
+        tx.execute("UPDATE nd_blobs SET unused_since=COALESCE(unused_since,unixepoch()) WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM nd_blob_refs WHERE blob=?1)", [id.as_str()])?;
         Ok(())
     }
     /// 标记删除和引用检查在同一事务里；文件删除在事务外，可在崩溃后重试。
@@ -114,28 +117,25 @@ impl Blobs {
             let mut statement = tx.prepare("SELECT id FROM nd_blobs WHERE deleting=1")?;
             Ok(statement.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
         })?;
-        for id in &ids {
-            match std::fs::remove_file(self.path(id)?) {
+        for raw in &ids {
+            let id: BlobId = raw.parse().map_err(|_| Error::Corrupt)?;
+            match std::fs::remove_file(self.path(&id)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
             std::fs::File::open(&self.directory)?.sync_all()?;
             self.store.write(|tx| {
-                tx.execute("DELETE FROM nd_blobs WHERE id=?1 AND deleting=1", [id])?;
+                tx.execute(
+                    "DELETE FROM nd_blobs WHERE id=?1 AND deleting=1",
+                    [id.as_str()],
+                )?;
                 Ok(())
             })?;
         }
         Ok(ids.len())
     }
-    fn path(&self, id: &str) -> Result<PathBuf> {
-        if id.len() != 64
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(Error::Aborted("无效的 SHA-256".into()));
-        }
-        Ok(Path::new(&self.directory).join(id))
+    fn path(&self, id: &BlobId) -> PathBuf {
+        Path::new(&self.directory).join(id.as_str())
     }
 }

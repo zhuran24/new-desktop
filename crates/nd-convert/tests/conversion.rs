@@ -373,7 +373,8 @@ fn local_images_use_only_frozen_bytes_and_sync_rejects_changed_attachments() {
         convert(&input, BackendKind::Claude, Some(&result.sync)),
         Err(nd_convert::ConvertError::SyncInvalid)
     );
-    input.images.get_mut("/does/not/exist.png").unwrap().sha256 = "wrong".into();
+    input.images.get_mut("/does/not/exist.png").unwrap().sha256 =
+        nd_id::BlobId::of(b"different bytes");
     assert!(convert(&input, BackendKind::Claude, None).is_err());
 }
 

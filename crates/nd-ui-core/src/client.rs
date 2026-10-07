@@ -12,7 +12,7 @@ enum Work {
         AttachmentSource,
         oneshot::Sender<Result<nd_wire::Attachment, String>>,
     ),
-    Blob(String, oneshot::Sender<Result<Vec<u8>, String>>),
+    Blob(nd_wire::BlobId, oneshot::Sender<Result<Vec<u8>, String>>),
     Command(Command, oneshot::Sender<Result<CommandReply, String>>),
     Models(String, String, oneshot::Sender<Result<Vec<Model>, String>>),
     Get(
@@ -175,7 +175,7 @@ impl CommandClient {
             .map_err(|_| "上传队列已满或连接已关闭".to_owned())?;
         result.await.map_err(|_| "上传已取消".to_owned())?
     }
-    pub async fn blob(&self, blob: String) -> Result<Vec<u8>, String> {
+    pub async fn blob(&self, blob: nd_wire::BlobId) -> Result<Vec<u8>, String> {
         let (done, result) = oneshot::channel();
         self.tx
             .try_send(Work::Blob(blob, done))
