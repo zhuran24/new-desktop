@@ -24,25 +24,14 @@ impl Executor {
                     Ok(a) => a,
                     Err(why) => return Ok(rejected("invalid_attachment", json!({"reason":why}))),
                 };
-                let owner = if expected.draft_version == self.core.draft.version {
-                    let owner = format!("draft/{}", self.id);
-                    for a in &self.core.draft.attachments {
-                        self.deps.blobs.release(tx, &a.blob, &owner)?;
-                    }
-                    owner
-                } else {
-                    format!("draft-saved/{}/{}", self.id, command.id)
-                };
-                for a in &attachments {
-                    self.deps.blobs.hold(tx, &a.blob, &owner)?;
-                }
-                let result = self.core.update_draft(
+                let result = self.replace_or_save_draft(
+                    tx,
                     &command.id,
                     &command.device,
                     expected.draft_version,
                     args.text,
                     attachments,
-                );
+                )?;
                 Ok(Receipt::Done {
                     value: json!(result),
                 })
@@ -191,12 +180,15 @@ impl Executor {
         command: &Command,
         attachments: &[nd_wire::Attachment],
     ) -> nd_store::Result<()> {
-        for a in attachments {
-            self.deps
-                .blobs
-                .hold(tx, &a.blob, &format!("message/{}/{}", self.id, command.id))?;
-        }
-        Ok(())
+        self.reference_attachments(
+            tx,
+            RefOwner::Message {
+                session: &self.id,
+                command: &command.id,
+            },
+            attachments,
+            true,
+        )
     }
 
     pub(super) fn create(
@@ -315,15 +307,15 @@ impl Executor {
         restore: &state::DraftRestore,
         hold: bool,
     ) -> nd_store::Result<()> {
-        let owner = format!("return/{}/{}", self.id, id);
-        for attachment in &restore.attachments {
-            if hold {
-                self.deps.blobs.hold(tx, &attachment.blob, &owner)?;
-            } else {
-                self.deps.blobs.release(tx, &attachment.blob, &owner)?;
-            }
-        }
-        Ok(())
+        self.reference_attachments(
+            tx,
+            RefOwner::Return {
+                session: &self.id,
+                id,
+            },
+            &restore.attachments,
+            hold,
+        )
     }
 
     pub(super) fn refill_draft(
@@ -350,25 +342,14 @@ impl Executor {
             }
         }
         let returned_id = format!("return/{id}");
-        let owner = if restore.version == self.core.draft.version {
-            let owner = format!("draft/{}", self.id);
-            for a in &self.core.draft.attachments {
-                self.deps.blobs.release(tx, &a.blob, &owner)?;
-            }
-            owner
-        } else {
-            format!("draft-saved/{}/{}", self.id, returned_id)
-        };
-        for a in &attachments {
-            self.deps.blobs.hold(tx, &a.blob, &owner)?;
-        }
-        self.core.update_draft(
+        self.replace_or_save_draft(
+            tx,
             &returned_id,
             &restore.device,
             restore.version,
             text,
             attachments,
-        );
+        )?;
         Ok(())
     }
 
@@ -654,20 +635,7 @@ impl Executor {
             },
         );
         // 发送与清稿同一事务；旧界面、不同正文和重试均不能清掉后来编辑的草稿。
-        if command.expect["draft_version"].as_u64() == Some(self.core.draft.version)
-            && self.core.draft.text == text
-            && self.core.draft.attachments == attachments
-        {
-            for a in &self.core.draft.attachments {
-                self.deps
-                    .blobs
-                    .release(tx, &a.blob, &format!("draft/{}", self.id))?;
-            }
-            self.core.draft.attachments.clear();
-            self.core.draft.version += 1;
-            self.core.draft.text.clear();
-            self.core.draft.device = command.device.clone();
-        }
+        self.consume_draft_if_matches(tx, command, text, &attachments)?;
         // Done 只表示进了发送台；代持、写出、回显看这条消息的状态。
         Ok(Receipt::Done {
             value: json!({"message": command.id, "draft": self.core.draft}),

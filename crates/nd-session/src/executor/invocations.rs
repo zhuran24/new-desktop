@@ -123,13 +123,8 @@ impl Executor {
         invoke.arrival = self.core.arrivals;
         // `!` 和 /subtask 从输入框发出：输入框原文（`input`）等于当前稿且版本对得上，就同事务清稿。
         if let Some(input) = input.as_deref()
-            && command.expect["draft_version"].as_u64() == Some(self.core.draft.version)
-            && self.core.draft.text == input
-            && self.core.draft.attachments.is_empty()
+            && self.consume_draft_if_matches(tx, command, input, &[])?
         {
-            self.core.draft.version += 1;
-            self.core.draft.text.clear();
-            self.core.draft.device = command.device.clone();
             invoke.draft_base = self.core.draft.version;
         }
         let shown = invoke_shown(&invoke, "held", json!({}));
@@ -458,7 +453,6 @@ impl Executor {
         text: String,
         attachments: Vec<nd_wire::Attachment>,
     ) -> nd_store::Result<Vec<String>> {
-        let draft_owner = format!("draft/{}", self.id);
         let mut saved = vec![];
         if invoke.draft_base != self.core.draft.version {
             if text.is_empty() && attachments.is_empty() {
@@ -466,13 +460,14 @@ impl Executor {
                 return Ok(saved);
             }
             let id = format!("{}/backfill", invoke.id);
-            for a in &attachments {
-                self.deps
-                    .blobs
-                    .hold(tx, &a.blob, &format!("draft-saved/{}/{id}", self.id))?;
-            }
-            self.core
-                .update_draft(&id, &invoke.device, invoke.draft_base, text, attachments);
+            self.replace_or_save_draft(
+                tx,
+                &id,
+                &invoke.device,
+                invoke.draft_base,
+                text,
+                attachments,
+            )?;
             saved.push(id);
             return Ok(saved);
         }
@@ -481,11 +476,15 @@ impl Executor {
             && (old.text != text || old.attachments != attachments)
         {
             let id = format!("{}/displaced", invoke.id);
-            for a in &old.attachments {
-                self.deps
-                    .blobs
-                    .hold(tx, &a.blob, &format!("draft-saved/{}/{id}", self.id))?;
-            }
+            self.reference_attachments(
+                tx,
+                RefOwner::SavedDraft {
+                    session: &self.id,
+                    command: &id,
+                },
+                &old.attachments,
+                true,
+            )?;
             self.core.draft.saved.push(nd_wire::SavedDraft {
                 attachments: old.attachments.clone(),
                 id: id.clone(),
@@ -495,19 +494,14 @@ impl Executor {
             });
             saved.push(id);
         }
-        for a in &old.attachments {
-            self.deps.blobs.release(tx, &a.blob, &draft_owner)?;
-        }
-        for a in &attachments {
-            self.deps.blobs.hold(tx, &a.blob, &draft_owner)?;
-        }
-        self.core.update_draft(
+        self.replace_or_save_draft(
+            tx,
             &format!("{}/backfill", invoke.id),
             &invoke.device,
             invoke.draft_base,
             text,
             attachments,
-        );
+        )?;
         Ok(saved)
     }
 }

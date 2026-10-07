@@ -2,6 +2,8 @@
 //!
 //! 一个输入一个事务：命令收据、批次的事实与检查点、发件箱、操作账、独占登记的放行、
 //! 显示缓存同一事务提交；提交之后才发事件、给端口确认、把新票交给端口。纯增量不开事务。
+mod drafts;
+use drafts::RefOwner;
 mod commands;
 mod facts;
 mod idle;
@@ -1180,13 +1182,15 @@ impl Executor {
                 // 首条提示还没进入发送步骤时没有历史条目引用附件；撤掉种子一并释放。
                 // 已有提示的失败/交付不明仍保留附件，供用户核对和另发。
                 if !op.entries.contains_key("first") {
-                    for attachment in &create.attachments {
-                        self.deps.blobs.release(
-                            tx,
-                            &attachment.blob,
-                            &format!("message/{}/{}", self.id, self.core.meta().created_by),
-                        )?;
-                    }
+                    self.reference_attachments(
+                        tx,
+                        RefOwner::Message {
+                            session: &self.id,
+                            command: &self.core.meta().created_by,
+                        },
+                        &create.attachments,
+                        false,
+                    )?;
                 }
                 if let Some(meta) = &mut self.core.meta {
                     meta.status = Status::Withdrawn;
