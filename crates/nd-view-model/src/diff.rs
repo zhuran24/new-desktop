@@ -38,7 +38,7 @@ pub fn unified_diff(text: &str) -> Vec<DiffLine> {
                 row.kind = DiffKind::Header;
             } else if let Some((old, new, left, right)) = range.as_mut() {
                 match line.as_bytes().first() {
-                    Some(b' ') if *left > 0 && *right > 0 => {
+                    Some(b' ') | None if *left > 0 && *right > 0 => {
                         row.kind = DiffKind::Context;
                         row.old = Some(*old);
                         row.new = Some(*new);
