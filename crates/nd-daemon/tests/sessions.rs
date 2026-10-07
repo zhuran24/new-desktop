@@ -1802,6 +1802,11 @@ async fn native_chat(themes: bool) {
     )
     .await;
     let answer = "# 中文回答\n\n一段 **Markdown**。\n\n```rust\nfn main() { println!(\"你好\"); }\n```\n\n结束。";
+    let answer = if themes {
+        "# 中文回答\n\n[主题链接 LINK](https://example.invalid) 和 `INLINE_CODE`\n\n| 表头 HEAD | 第二列 |\n| --- | --- |\n| 内容 | 内容 |\n\n```rust\nfn main() { println!(\"你好\"); }\n```\n\n结束。"
+    } else {
+        answer
+    };
     fx.scenario.endpoint().enqueue(
         Route::new(None, "claude-haiku-4-5-20251001"),
         ModelReply::streaming_text(answer, 1, 100),

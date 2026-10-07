@@ -26,7 +26,7 @@ def inner():
         theme_file = theme_dir / 'ocean.json'
         theme_source = Path('/sandbox/ocean.json').read_text()
         theme_file.write_text(theme_source)
-        Path('/sandbox/state/ui.json').write_text(json.dumps({'theme_selection': {'kind': 'file', 'file': 'ocean.json'}}))
+        Path('/sandbox/state/ui.json').write_text(json.dumps({'theme_selection': {'kind': 'file', 'file': 'ocean.json'}, **({'window': {'width': 1100, 'height': 1300}} if not settings.get('history') and not settings.get('session_settings') else {})}))
     app = None
     handles = []
     apps = []
@@ -276,7 +276,7 @@ def inner():
             draft_reply = subprocess.run(['/ndctl', '--socket', socket, 'command', json.dumps(command)], capture_output=True, text=True)
             assert draft_reply.returncode == 0, draft_reply.stderr
             assert json.loads(draft_reply.stdout)['receipt']['status'] == 'done', draft_reply.stdout
-            theme_file.write_text(theme_source.replace('#123456ff', '#26384aff').replace('"body": 18', '"body": 20'))
+            theme_file.write_text(theme_source.replace('#123456ff', '#26384aff').replace('#88eeccff', '#eec188ff').replace('#173f5fff', '#3d293fff').replace('"body": 18', '"body": 20'))
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
                 events = [json.loads(line) for line in (out / 'creating.jsonl').read_text().splitlines()]
@@ -289,6 +289,15 @@ def inner():
             else:
                 raise AssertionError('live theme or draft did not update')
             screenshot('streaming-custom-theme')
+            with Image.open(out / 'streaming-custom-theme.png') as image:
+                body = image.convert('RGB').crop((440, 695, 577, 733))
+                colors = body.get_flattened_data()
+                assert sum(c == (238, 193, 136) for c in colors) > 40, 'Markdown link must use the file theme accent'
+                inline = image.convert('RGB').crop((605, 704, 710, 725))
+                assert sum(c == (38, 56, 74) for c in inline.get_flattened_data()) > 500, 'inline code must use the file theme background'
+                head = image.convert('RGB').crop((500, 754, 1125, 790))
+                assert sum(c == (38, 56, 74) for c in head.get_flattened_data()) > 15000, 'table header must use the file theme background'
+                assert sum(c == (240, 248, 255) for c in head.get_flattened_data()) > 40, 'table header text must use the file theme foreground' 
             after = json.loads(subprocess.check_output(['/ndctl', '--socket', socket, 'get', partial['stream']]))
             before_process = next(i['data']['process'] for i in before['items'] if i['id'] == 'header')
             after_process = next(i['data']['process'] for i in after['items'] if i['id'] == 'header')
@@ -381,7 +390,7 @@ def run(args, script=None):
                            'QT_QPA_PLATFORM': 'offscreen', 'LANG': 'C.UTF-8'}.items():
             command += ['--setenv', key, value]
         command += ['dbus-run-session', '--config-file', '/sandbox/dbus.conf', '--', 'kwin_wayland', '--virtual', '--socket', 'nd-test-chat',
-                    '--width', '1400', '--height', '900', '--no-lockscreen', '--no-global-shortcuts', '--no-kactivities', '--exit-with-session', '/sandbox/session.sh']
+                    '--width', '1400', '--height', '1500' if themes and not args.history and not args.settings else '900', '--no-lockscreen', '--no-global-shortcuts', '--no-kactivities', '--exit-with-session', '/sandbox/session.sh']
         with (out / 'kwin.log').open('w') as log:
             result = subprocess.run(command, stdout=log, stderr=log, timeout=100)
         assert result.returncode == 0, (out / 'kwin.log').read_text()[-6000:]

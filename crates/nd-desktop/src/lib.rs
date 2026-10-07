@@ -343,6 +343,12 @@ pub fn apply_theme(theme: &Theme, cx: &mut App) {
         kit.colors.ring = rgba(theme.colors.accent).into();
         kit.colors.muted_foreground = rgba(theme.colors.muted).into();
         kit.colors.selection = rgba(theme.colors.accent).into();
+        kit.colors.link = rgba(theme.colors.accent).into();
+        kit.colors.accent = rgba(theme.colors.background).into();
+        kit.colors.accent_foreground = rgba(theme.colors.foreground).into();
+        kit.colors.muted = rgba(theme.colors.background).into();
+        kit.colors.table_head = rgba(theme.colors.background).into();
+        kit.colors.table_head_foreground = rgba(theme.colors.foreground).into();
     });
 }
 impl Render for Desktop {
