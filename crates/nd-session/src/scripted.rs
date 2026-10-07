@@ -80,6 +80,7 @@ struct Inner {
     live: HashMap<CarrierId, RunId>,
     drain: Option<Drain>,
     acks: usize,
+    initial_settings: serde_json::Value,
 }
 
 /// 重启之间留着的后端状态。
@@ -138,6 +139,9 @@ impl ScriptedAdapter {
     /// 拉起之后报的后台任务状态。
     pub fn set_drain(&self, drain: Drain) {
         self.inner.lock().unwrap().drain = Some(drain);
+    }
+    pub fn set_initial_settings(&self, settings: serde_json::Value) {
+        self.inner.lock().unwrap().initial_settings = settings;
     }
     pub fn received(&self) -> Vec<(Ticket, Act)> {
         self.inner.lock().unwrap().received.clone()
@@ -281,6 +285,7 @@ impl ScriptedAdapter {
                 inner.applied.push(format!("open:{run}"));
                 inner.live.insert(carrier.clone(), run.clone());
                 let drain = inner.drain.clone().unwrap_or(Drain::Drained);
+                let settings = inner.initial_settings.clone();
                 drop(inner);
                 vec![
                     done(Outcome::Ok {
@@ -301,7 +306,7 @@ impl ScriptedAdapter {
                                 immediate_preserves_mcp: false,
                                 rewind_menu: true,
                             },
-                            adopt: json!({"scripted": true}),
+                            adopt: json!({"scripted": true, "settings":settings}),
                             features: vec![],
                         },
                     }),

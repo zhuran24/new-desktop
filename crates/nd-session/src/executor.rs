@@ -3272,7 +3272,7 @@ pub(crate) fn header(core: &Core) -> Value {
         "title_revision":meta.title_revision,
         "settings_revision":meta.settings_revision,
         "permission_mode": meta.permission_mode,
-        "pending_setting": core.ops.values().find(|op| matches!(op.spec,OpSpec::Configure(_))).map(|_| if carrier.is_some_and(|c| c.turn_running) {"设置将在本回合结束后生效"} else {"正在应用设置"}),
+        "pending_setting": core.ops.values().find(|op| matches!(op.spec,OpSpec::Configure(_))).map(|op| if matches!(&op.spec, OpSpec::Configure(op) if matches!(op.setting, nd_wire::LiveSetting::Model(_))) && carrier.is_some_and(|c| c.turn_running) {"模型将在本回合结束后生效"} else {"正在应用设置"}),
         "settings": meta.settings,
         "caps": nd_backend::session_capabilities(&meta.kind, &meta.settings["caps"]),
         "note": meta.note,

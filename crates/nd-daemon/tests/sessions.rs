@@ -3783,6 +3783,39 @@ async fn settings_model_changes_the_next_turn_and_survives_restart() {
         header(s)["process"]["turn_running"] == true
     })
     .await;
+    for (id, setting, key, value) in [(
+        "mid-turn-permission",
+        json!({"permission_mode":"acceptEdits"}),
+        "permission_mode",
+        "acceptEdits",
+    )] {
+        fx.command(
+            id,
+            "session.configure",
+            json!({"session":session,"setting":setting}),
+        )
+        .await;
+        let changed = tokio::time::timeout(
+            Duration::from_secs(3),
+            fx.wait(&session, "mid-turn setting", |s| {
+                header(s)["op"].is_null()
+                    && if key == "permission_mode" {
+                        header(s)["permission_mode"] == value
+                    } else {
+                        header(s)["settings"]["applied"][key] == value
+                    }
+            }),
+        )
+        .await;
+        let changed = match changed {
+            Ok(changed) => changed,
+            Err(_) => panic!(
+                "{id} did not apply mid-turn: {}",
+                header(&fx.peek(&session).await)
+            ),
+        };
+        assert_eq!(header(&changed)["process"]["turn_running"], true);
+    }
     let reply = fx
         .command(
             "model",
@@ -3840,6 +3873,7 @@ async fn settings_effort_and_ultracode_follow_cli_availability_and_preserve_effo
         header(s)["status"] == "active" && header(s)["process"]["turn_running"] == false
     })
     .await;
+    let mut busy_gate = None;
     for (id, setting, key, expected) in [
         (
             "opus",
@@ -3867,7 +3901,32 @@ async fn settings_effort_and_ultracode_follow_cli_availability_and_preserve_effo
             ),
             "{id}: {reply:?}"
         );
-        let s = fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+        let s = tokio::time::timeout(
+            Duration::from_secs(3),
+            fx.wait(&session, id, |s| header(s)["op"].is_null()),
+        )
+        .await
+        .expect("effort and ultracode must apply during the active round");
+        if id == "opus" {
+            let route = Route::new(None, "claude-opus-5-5");
+            busy_gate = Some(
+                fx.scenario
+                    .endpoint()
+                    .enqueue_held(route.clone(), ModelReply::text("finished")),
+            );
+            fx.send("busy-opus", &session, "keep running").await;
+            fx.scenario
+                .endpoint()
+                .wait_for_requests(&route, 1, Duration::from_secs(20))
+                .await
+                .unwrap();
+            fx.wait(&session, "busy opus", |s| {
+                header(s)["process"]["turn_running"] == true
+            })
+            .await;
+        } else {
+            assert_eq!(header(&s)["process"]["turn_running"], true);
+        }
         assert_eq!(
             header(&s)["settings"]["applied"][key],
             expected,
@@ -3883,6 +3942,7 @@ async fn settings_effort_and_ultracode_follow_cli_availability_and_preserve_effo
             );
         }
     }
+    busy_gate.unwrap().release();
 }
 
 #[tokio::test]

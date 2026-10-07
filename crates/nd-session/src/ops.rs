@@ -70,11 +70,7 @@ fn uuid_from_hex(hex: &str) -> String {
 fn profile(v: &View<'_>) -> Profile {
     let meta = v.meta();
     Profile {
-        effort: meta.effort.clone().or_else(|| {
-            meta.settings["applied"]["effort"]
-                .as_str()
-                .map(str::to_owned)
-        }),
+        effort: meta.effort.clone(),
         kind: meta.kind.clone(),
         model: meta.model.clone(),
         permission_mode: meta.permission_mode.clone(),
@@ -266,11 +262,13 @@ pub struct Configure {
 }
 impl Configure {
     fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
-        j.wait("between-turns", v, |v| {
-            v.carrier(&self.carrier)
-                .filter(|c| !c.turn_running)
-                .map(|_| true)
-        })?;
+        if matches!(self.setting, nd_wire::LiveSetting::Model(_)) {
+            j.wait("between-turns", v, |v| {
+                v.carrier(&self.carrier)
+                    .filter(|c| !c.turn_running)
+                    .map(|_| true)
+            })?;
+        }
         if !v.carrier(&self.carrier).is_some_and(|c| c.alive) {
             Launch {
                 carrier: self.carrier.clone(),
