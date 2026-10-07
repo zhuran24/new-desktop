@@ -20,6 +20,49 @@ fn frozen(backend: BackendKind, values: Vec<Value>) -> FrozenInput {
 }
 
 #[test]
+fn unavailable_file_images_preserve_the_conversation_and_report_loss() {
+    for (backend, target, block) in [
+        (
+            BackendKind::Codex,
+            BackendKind::Claude,
+            json!({"type":"image","fileId":"file_abc"}),
+        ),
+        (
+            BackendKind::Claude,
+            BackendKind::Codex,
+            json!({"type":"image","source":{"type":"file","file_id":"file_xyz"}}),
+        ),
+        (
+            BackendKind::Codex,
+            BackendKind::Claude,
+            json!({"type":"input_image","file_id":"future_file"}),
+        ),
+    ] {
+        let input = frozen(
+            backend,
+            vec![json!({"type":"message","role":"user","content":[
+                {"type":"text","text":"keep this text"}, block
+            ]})],
+        );
+        let result = convert(&input, target, None)
+            .expect("unavailable image is a reported loss, not a broken conversation");
+        assert!(
+            serde_json::to_string(&result.items)
+                .unwrap()
+                .contains("keep this text")
+        );
+        assert_eq!(result.loss.entries.len(), 1);
+        assert_eq!(result.loss.entries[0].reason, "image_unavailable");
+        assert!(
+            convert(&input, target, Some(&result.sync))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+}
+
+#[test]
 fn parallel_tools_keep_all_arguments_results_and_report_text_downgrade() {
     let input = frozen(
         BackendKind::Claude,

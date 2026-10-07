@@ -21,7 +21,7 @@ impl FrozenImage {
 
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
-fn unavailable(label: &str) -> Part {
+pub(crate) fn unavailable(label: &str) -> Part {
     Part::Notice {
         reason: "image_unavailable".into(),
         value: json!(label),
@@ -64,14 +64,32 @@ pub(crate) fn reference(input: &FrozenInput, reference: &str) -> Result<Part, Co
     Ok(inline(&image.media_type, &image.data))
 }
 
+/// One reference vocabulary for decoding and synchronization fingerprints.
+pub(crate) fn reference_key(block: &Value) -> Option<&str> {
+    match block["type"].as_str() {
+        Some("localImage") => block["path"].as_str(),
+        Some("input_image") => block["image_url"]
+            .as_str()
+            .or_else(|| block["file_id"].as_str()),
+        Some("image") => block["url"]
+            .as_str()
+            .or_else(|| block["source"]["url"].as_str())
+            .or_else(|| block["fileId"].as_str())
+            .or_else(|| block["source"]["file_id"].as_str()),
+        _ => None,
+    }
+}
+
+pub(crate) fn decode_reference(input: &FrozenInput, block: &Value) -> Result<Part, ConvertError> {
+    match reference_key(block) {
+        Some(key) => reference(input, key),
+        None => Ok(unavailable(&block.to_string())),
+    }
+}
+
 pub(crate) fn prefix_hash(input: &FrozenInput, count: usize) -> String {
     fn walk<'a>(v: &'a Value, refs: &mut BTreeSet<&'a str>) {
-        if let Some(s) = match v["type"].as_str() {
-            Some("localImage") => v["path"].as_str(),
-            Some("input_image") => v["image_url"].as_str(),
-            Some("image") => v["url"].as_str().or_else(|| v["source"]["url"].as_str()),
-            _ => None,
-        } {
+        if let Some(s) = reference_key(v) {
             refs.insert(s);
         }
         match v {

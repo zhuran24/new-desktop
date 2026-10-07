@@ -50,17 +50,9 @@ pub fn decode(input: &FrozenInput) -> Result<Decoded, ConvertError> {
                         &field(&b["source"], "media_type")?,
                         &field(&b["source"], "data")?,
                     )),
-                    Some("image") => images::reference(
-                        input,
-                        b["url"]
-                            .as_str()
-                            .or_else(|| b["source"]["url"].as_str())
-                            .ok_or_else(|| {
-                                ConvertError::Invalid("invalid image reference".into())
-                            })?,
-                    ),
-                    Some("localImage") => images::reference(input, &field(b, "path")?),
-                    Some("input_image") => images::reference(input, &field(b, "image_url")?),
+                    Some("image" | "localImage" | "input_image") => {
+                        images::decode_reference(input, b)
+                    }
                     Some("thinking" | "redacted_thinking") => Ok(Part::Reasoning {
                         backend: input.backend,
                         value: b.clone(),
