@@ -81,6 +81,8 @@ async fn bang_compact_and_fork_round_trips_are_recorded_and_replay_to_the_same_f
     let compact = Invocation::Compact {
         scope: CompactScope::From,
         anchor: Anchor {
+            candidates: vec![],
+            selected: 0,
             text: "NOT_IN_THE_CONVERSATION".into(),
             attachments: vec![],
             nth: 1,

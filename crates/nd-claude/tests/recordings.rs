@@ -216,6 +216,8 @@ fn recorded_invocations_replay_and_none_of_them_is_resendable() {
     let compact = Invocation::Compact {
         scope: CompactScope::From,
         anchor: Anchor {
+            candidates: vec![],
+            selected: 0,
             text: "NOT_IN_THE_CONVERSATION".into(),
             attachments: vec![],
             nth: 1,

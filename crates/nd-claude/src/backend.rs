@@ -1263,34 +1263,16 @@ impl Actor {
                     Intent::AfterTurn => "later",
                     Intent::Interrupting => "now",
                 };
-                let blobs = self.inner.blobs.clone();
-                let message = msg.clone();
-                let content = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
-                    use base64::Engine;
-                    let mut content = vec![];
-                    if !message.text.is_empty() { content.push(json!({"type":"text","text":message.text})); }
-                    for attachment in &message.attachments {
-                        let bytes = blobs.get(&attachment.blob).map_err(|e| e.to_string())?;
-                        if attachment.media_type == "text/plain" {
-                            let text = String::from_utf8(bytes).map_err(|_| format!("{} 不是 UTF-8 文本", attachment.name))?;
-                            content.push(json!({"type":"text","text":format!("附件 {}：\n{}", serde_json::to_string(&attachment.name).unwrap(), text)}));
-                        } else {
-                            let kind = if attachment.media_type == "application/pdf" { "document" } else { "image" };
-                            content.push(json!({"type":kind,"source":{"type":"base64","media_type":attachment.media_type,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}}));
-                        }
-                    }
-                    Ok(content)
-                }).await;
-                let content = match content {
-                    Ok(Ok(content)) => content,
-                    error => {
+                let content = match self.encode(&msg).await {
+                    Ok(content) => content,
+                    Err(error) => {
                         self.inner
                             .deliver_facts(
                                 &self.session,
                                 &self.carrier,
                                 vec![done(
                                     &ticket,
-                                    Outcome::failed(format!("读取附件失败：{error:?}")),
+                                    Outcome::failed(format!("读取附件失败：{error}")),
                                 )],
                             )
                             .await;
@@ -1607,7 +1589,7 @@ impl Actor {
     }
 
     /// 总结、`!`、派 fork 型子代理：经动作 mod 做，按票派生的操作 id 等结论。
-    async fn invoke(&mut self, ticket: Ticket, invocation: Invocation) {
+    async fn invoke(&mut self, ticket: Ticket, mut invocation: Invocation) {
         let feature = match &invocation {
             Invocation::Compact { .. } => Feature::Summarize,
             Invocation::Shell { .. } => Feature::BangMode,
@@ -1628,15 +1610,37 @@ impl Actor {
                 .await;
             return;
         }
-        let row = match &invocation {
+        let row = match &mut invocation {
             Invocation::Compact { anchor, .. } => {
-                let msg = Msg {
-                    attachments: anchor.attachments.clone(),
-                    text: anchor.text.clone(),
-                    intent: Intent::Fold,
-                };
-                match self.encode(&msg).await {
-                    Ok(content) => Some(invoke::row_text(&content)),
+                let prepared: Result<String, String> = async {
+                    let msg = Msg {
+                        attachments: anchor.attachments.clone(),
+                        text: anchor.text.clone(),
+                        intent: Intent::Fold,
+                    };
+                    let row = invoke::row_text(&self.encode(&msg).await?);
+                    if !anchor.candidates.is_empty() {
+                        let mut nth = 0;
+                        let mut total = 0;
+                        for (index, candidate) in anchor.candidates.iter().enumerate() {
+                            if invoke::row_text(&self.encode(candidate).await?) == row {
+                                total += 1;
+                                if index == anchor.selected {
+                                    nth = total;
+                                }
+                            }
+                        }
+                        if nth == 0 {
+                            return Err("所选提示不在可见序列中".into());
+                        }
+                        anchor.nth = nth;
+                        anchor.of = total;
+                    }
+                    Ok(row)
+                }
+                .await;
+                match prepared {
+                    Ok(row) => Some(row),
                     Err(error) => {
                         self.inner
                             .deliver_facts(
@@ -1644,7 +1648,7 @@ impl Actor {
                                 &self.carrier,
                                 vec![done(
                                     &ticket,
-                                    Outcome::failed(format!("读取所选提示的附件失败：{error}")),
+                                    Outcome::failed(format!("读取总结提示附件失败：{error}")),
                                 )],
                             )
                             .await;

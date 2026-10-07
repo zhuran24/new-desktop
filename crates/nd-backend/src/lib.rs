@@ -181,6 +181,11 @@ pub enum CompactScope {
 /// 第 `nth` 次出现，共 `of` 次。后端看到的次数对不上就不压缩。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Anchor {
+    /// 可见提示序列与所选位置；适配器按后端实际可见的内容计数。
+    #[serde(default)]
+    pub candidates: Vec<Msg>,
+    #[serde(default)]
+    pub selected: usize,
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<nd_wire::Attachment>,

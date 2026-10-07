@@ -2869,6 +2869,16 @@ impl Executor {
         };
         Ok((
             nd_backend::Anchor {
+                candidates: visible
+                    .iter()
+                    .filter_map(|id| self.prompt_content(id))
+                    .map(|(text, attachments)| nd_backend::Msg {
+                        text,
+                        attachments,
+                        intent: Intent::Fold,
+                    })
+                    .collect(),
+                selected: at,
                 text: text.clone(),
                 attachments: attachments.clone(),
                 nth,

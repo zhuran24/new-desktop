@@ -477,7 +477,13 @@ async fn summarize_from_here_compacts_only_the_selected_range_and_returns_the_pr
     fx.turn(&session, "答一").await;
     fx.round(&session, "from-2", "重复的提示", "答二").await;
     fx.round(&session, "from-3", "第三条", "答三").await;
-    let ready = fx.round(&session, "from-4", "重复的提示", "答四").await;
+    // Same row text, different attachments: the hook cannot distinguish image bytes.
+    let bytes = include_bytes!("fixtures/preview.png");
+    let blob = fx.ui().await.put_blob(bytes).await.unwrap();
+    endpoint.enqueue(fx.main(), ModelReply::text("答四"));
+    fx.command("from-4", "session.send", json!({"session":session,"text":"重复的提示",
+        "attachments":[{"blob":blob,"media_type":"image/png","name":"picture.png","size":bytes.len()}]}), json!({})).await;
+    let ready = fx.turn(&session, "答四").await;
     // 选第二次出现的「重复的提示」：同一原文按次序定位。
     let chosen = prompt_id(&ready, "重复的提示", 1);
     assert_eq!(chosen, "from-4");
