@@ -1991,6 +1991,22 @@ impl Executor {
                 json!({"status": status.as_str()}),
             )));
         }
+        let feature = match command.name.as_str() {
+            "session.shell" => "bang_mode",
+            "session.subtask" => "fork_subagent",
+            _ => "summarize",
+        };
+        if let Some(why) = self
+            .core
+            .current_carrier()
+            .and_then(|c| c.unavailable(feature))
+        {
+            // 降级的进程（mod 没装上、只能聊天）做不了：会话头已写明原因。
+            return Ok(Some(rejected(
+                "unsupported",
+                json!({"feature": feature, "why": why}),
+            )));
+        }
         let args = &command.args;
         let mut message = None;
         let mut restore = None;
@@ -2054,17 +2070,6 @@ impl Executor {
             waiting: None,
             arrival: 0,
         };
-        if let Some(why) = self
-            .core
-            .current_carrier()
-            .and_then(|c| c.unavailable(invoke.feature()))
-        {
-            // 降级的进程（mod 没装上、只能聊天）做不了：会话头已写明原因。
-            return Ok(Some(rejected(
-                "unsupported",
-                json!({"feature": invoke.feature(), "why": why}),
-            )));
-        }
         if matches!(invoke.invocation, Invocation::Compact { .. })
             && self
                 .core

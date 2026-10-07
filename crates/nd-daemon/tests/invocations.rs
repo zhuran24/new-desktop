@@ -332,3 +332,353 @@ async fn bang_runs_one_command_without_a_turn_and_the_next_request_reads_its_out
     );
     fx.close();
 }
+
+fn prompt_id(snapshot: &Snapshot, text: &str, nth: usize) -> String {
+    let mut prompts: Vec<&Item> = snapshot
+        .items
+        .iter()
+        .filter(|i| i.kind == "prompt" && i.data["text"] == text)
+        .collect();
+    prompts.sort_by_key(|i| i.data["seq"].as_u64());
+    prompts[nth].data["message"].as_str().unwrap().to_owned()
+}
+fn draft(snapshot: &Snapshot) -> &Value {
+    &item(snapshot, "draft").expect("draft").data
+}
+fn count(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+impl Fixture {
+    /// 一轮对话：排好回答、发出、等回答。
+    async fn round(&self, session: &str, id: &str, text: &str, answer: &str) -> Snapshot {
+        self.scenario
+            .endpoint()
+            .enqueue(self.main(), ModelReply::text(answer));
+        self.send(id, session, text).await;
+        self.turn(session, answer).await
+    }
+    async fn edit_draft(&self, session: &str, id: &str, version: u64, text: &str) {
+        let reply = self
+            .command(
+                id,
+                "session.draft.update",
+                json!({"session":session,"text":text}),
+                json!({"draft_version":version}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Done { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn summarize_from_here_compacts_only_the_selected_range_and_returns_the_prompt_to_the_draft()
+{
+    let fx = Fixture::start("nd22-from", true).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("答一"));
+    let session = fx.create("from-create", "第一条").await;
+    fx.turn(&session, "答一").await;
+    fx.round(&session, "from-2", "重复的提示", "答二").await;
+    fx.round(&session, "from-3", "第三条", "答三").await;
+    let ready = fx.round(&session, "from-4", "重复的提示", "答四").await;
+    // 选第二次出现的「重复的提示」：同一原文按次序定位。
+    let chosen = prompt_id(&ready, "重复的提示", 1);
+    assert_eq!(chosen, "from-4");
+    fx.edit_draft(&session, "from-draft", 0, "还没发的草稿")
+        .await;
+    let before = endpoint.requests().len();
+    endpoint.enqueue(fx.main(), ModelReply::text("范围摘要"));
+    let reply = fx
+        .deliver(
+            "from-sum",
+            "session.compact",
+            json!({"session":session,"message":chosen,"scope":"from"}),
+        )
+        .await;
+    let value = done_value(&reply).clone();
+    // 摘要器只拿到所选范围：第二次的「重复的提示」及之后，前面的原行不交给它。
+    let requests = endpoint.requests();
+    assert_eq!(requests.len(), before + 1, "exactly one summarizer request");
+    let summarizer = request_text(&requests[before].body);
+    assert_eq!(count(&summarizer, "重复的提示"), 1, "{summarizer}");
+    assert!(!summarizer.contains("第一条"), "{summarizer}");
+    assert!(!summarizer.contains("第三条"), "{summarizer}");
+    // 「从这里总结」：所选提示原文回到输入框；被替换的草稿另存、不丢。
+    assert_eq!(value["draft"]["text"], "重复的提示", "{value}");
+    let after = fx.peek(&session).await;
+    assert_eq!(draft(&after)["text"], "重复的提示");
+    let saved = draft(&after)["saved"].as_array().unwrap();
+    assert!(
+        saved.iter().any(|s| s["text"] == "还没发的草稿"),
+        "{saved:?}"
+    );
+    let shown = item(&after, "invoke/from-sum").expect("compact item");
+    assert_eq!(shown.kind, "compact");
+    assert_eq!(shown.data["state"], "done");
+    let summarized = item(&after, "lineage").unwrap().data["summarized"].clone();
+    assert_eq!(summarized, json!(["from-4"]), "{summarized}");
+
+    // 之后的请求：范围外的原行还在，所选范围换成了摘要。
+    let next = fx.round(&session, "from-5", "继续", "答五").await;
+    let text = request_text(&endpoint.requests().last().unwrap().body);
+    assert!(text.contains("第一条") && text.contains("第三条"), "{text}");
+    assert!(text.contains("范围摘要"), "{text}");
+    assert_eq!(
+        count(&text, "重复的提示"),
+        1,
+        "the summarized prompt is gone: {text}"
+    );
+    // 已被总结的提示不能再选。
+    let again = fx
+        .deliver(
+            "from-again",
+            "session.compact",
+            json!({"session":session,"message":"from-4","scope":"up_to"}),
+        )
+        .await;
+    assert!(
+        matches!(&again, CommandReply::Receipt { receipt: Receipt::Rejected { code, .. } } if code == "precondition"),
+        "{again:?}"
+    );
+    assert!(texts(&next).contains(&"答五".to_owned()));
+    fx.close();
+}
+
+#[tokio::test]
+async fn summarize_up_to_here_compacts_what_came_before_and_leaves_the_draft_empty() {
+    let fx = Fixture::start("nd22-upto", true).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("答甲"));
+    let session = fx.create("upto-create", "甲提示").await;
+    let first = fx.turn(&session, "答甲").await;
+    let head = prompt_id(&first, "甲提示", 0);
+    fx.round(&session, "upto-2", "乙提示", "答乙").await;
+    fx.round(&session, "upto-3", "丙提示", "答丙").await;
+    // 第一条之前没有可总结的。
+    let nothing = fx
+        .deliver(
+            "upto-head",
+            "session.compact",
+            json!({"session":session,"message":head,"scope":"up_to"}),
+        )
+        .await;
+    assert!(
+        matches!(&nothing, CommandReply::Receipt { receipt: Receipt::Rejected { code, .. } } if code == "precondition"),
+        "{nothing:?}"
+    );
+    fx.edit_draft(&session, "upto-draft", 0, "写了一半").await;
+    let before = endpoint.requests().len();
+    endpoint.enqueue(fx.main(), ModelReply::text("前文摘要"));
+    let reply = fx
+        .deliver(
+            "upto-sum",
+            "session.compact",
+            json!({"session":session,"message":"upto-3","scope":"up_to"}),
+        )
+        .await;
+    let value = done_value(&reply).clone();
+    let requests = endpoint.requests();
+    assert_eq!(requests.len(), before + 1, "exactly one summarizer request");
+    let summarizer = request_text(&requests[before].body);
+    assert!(
+        summarizer.contains("甲提示") && summarizer.contains("乙提示"),
+        "{summarizer}"
+    );
+    assert!(!summarizer.contains("丙提示"), "{summarizer}");
+    // 「总结到这里」：输入框留空；原来写了一半的另存。
+    assert_eq!(value["draft"]["text"], "", "{value}");
+    let after = fx.peek(&session).await;
+    assert_eq!(draft(&after)["text"], "");
+    assert!(
+        draft(&after)["saved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["text"] == "写了一半")
+    );
+    fx.round(&session, "upto-4", "接着说", "答丁").await;
+    let text = request_text(&endpoint.requests().last().unwrap().body);
+    assert!(
+        text.contains("丙提示") && text.contains("前文摘要"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("甲提示") && !text.contains("乙提示"),
+        "{text}"
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_prompt_the_cli_no_longer_holds_is_not_compacted_and_the_reason_is_shown() {
+    let fx = Fixture::start("nd22-gone", true).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("答甲"));
+    let session = fx.create("gone-create", "甲提示").await;
+    let first = fx.turn(&session, "答甲").await;
+    let head = prompt_id(&first, "甲提示", 0);
+    fx.round(&session, "gone-2", "乙提示", "答乙").await;
+    // 终端式的整段 /compact：CLI 自己把之前的对话都换成摘要，守护进程不知道这一步。
+    endpoint.enqueue(fx.main(), ModelReply::text("整段摘要"));
+    let before = endpoint.requests().len();
+    fx.send("gone-compact", &session, "/compact").await;
+    endpoint
+        .wait_for_requests(&fx.main(), before + 1, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.wait(&session, "the CLI compaction finished", |s| {
+        header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before = endpoint.requests().len();
+    let draft_before = draft(&fx.peek(&session).await).clone();
+    let reply = fx
+        .deliver(
+            "gone-sum",
+            "session.compact",
+            json!({"session":session,"message":head,"scope":"from"}),
+        )
+        .await;
+    let CommandReply::Receipt {
+        receipt: Receipt::Rejected { code, now },
+    } = &reply
+    else {
+        panic!("expected a rejection: {reply:?}");
+    };
+    assert_eq!(code, "anchor_gone", "{now}");
+    assert!(now["reason"].as_str().unwrap().contains("找不到"), "{now}");
+    // 定位不到就不压缩：没有摘要请求，草稿不动，条目写明原因。
+    assert_eq!(endpoint.requests().len(), before, "nothing was summarized");
+    let after = fx.peek(&session).await;
+    assert_eq!(draft(&after), &draft_before);
+    let shown = item(&after, "invoke/gone-sum").expect("compact item");
+    assert_eq!(shown.data["state"], "rejected");
+    assert!(shown.fallback.text.contains("找不到"), "{shown:?}");
+    fx.close();
+}
+
+#[tokio::test]
+async fn subtask_dispatches_a_fork_subagent_that_carries_the_parent_conversation() {
+    let fx = Fixture::start("nd22-subtask", true).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("父回答"));
+    let session = fx.create("sub-create", "父对话标记 PARENT_MARK").await;
+    fx.turn(&session, "父回答").await;
+    // fork 子代理的请求带着动态 agent id；它完成后 CLI 自己把结果交给主对话。
+    endpoint.enqueue_any_agent(MODEL, ModelReply::text("子任务完成"));
+    endpoint.enqueue(fx.main(), ModelReply::text("收到子任务结果"));
+    let reply = fx
+        .deliver(
+            "sub-1",
+            "session.subtask",
+            json!({"session":session,"prompt":"去查一下 FORK_TASK"}),
+        )
+        .await;
+    let value = done_value(&reply).clone();
+    let agent = value["agent"].as_str().expect("agent id").to_owned();
+    assert!(!agent.is_empty(), "{value}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let request = loop {
+        if let Some(r) = endpoint
+            .requests()
+            .into_iter()
+            .find(|r| r.route.agent.as_deref() == Some(agent.as_str()))
+        {
+            break r;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fork never asked the model"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let text = request_text(&request.body);
+    assert!(
+        text.contains("PARENT_MARK"),
+        "the fork carries the parent context: {text}"
+    );
+    assert!(text.contains("FORK_TASK"), "{text}");
+    // 子代理在后台跑完：后台任务表回到空。
+    let after = fx
+        .wait(&session, "the fork finished in the background", |s| {
+            header(s)["process"]["drain"]["drain"] == "drained"
+        })
+        .await;
+    let shown = item(&after, "invoke/sub-1").expect("subtask item");
+    assert_eq!(shown.kind, "subtask");
+    assert_eq!(shown.data["state"], "done");
+    assert_eq!(shown.data["agent"], agent);
+    fx.close();
+}
+
+#[tokio::test]
+async fn without_the_hook_mod_the_header_lists_what_cannot_be_used_and_chat_still_works() {
+    let fx = Fixture::start("nd22-chatonly", false).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("只能聊天也能答"));
+    let session = fx.create("chatonly-create", "你好").await;
+    let snapshot = fx.turn(&session, "只能聊天也能答").await;
+    let degraded = header(&snapshot)["degraded"].clone();
+    assert!(
+        degraded["why"].as_str().unwrap().contains("new-desktop"),
+        "{degraded}"
+    );
+    let unavailable: Vec<&str> = degraded["unavailable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    for feature in [
+        "退役",
+        "派 Codex 子代理",
+        "给子代理直接发消息",
+        "总结",
+        "`!` 模式",
+        "fork 型子代理",
+        "设置行",
+        "当前模型操作转接来的任务（只能看结果）",
+    ] {
+        assert!(
+            unavailable.contains(&feature),
+            "{feature} missing: {degraded}"
+        );
+    }
+    let first = prompt_id(&snapshot, "你好", 0);
+    for (id, name, args) in [
+        (
+            "co-shell",
+            "session.shell",
+            json!({"session":session,"command":"pwd"}),
+        ),
+        (
+            "co-sub",
+            "session.subtask",
+            json!({"session":session,"prompt":"x"}),
+        ),
+        (
+            "co-sum",
+            "session.compact",
+            json!({"session":session,"message":first,"scope":"from"}),
+        ),
+    ] {
+        let reply = fx.deliver(id, name, args).await;
+        assert!(
+            matches!(&reply, CommandReply::Receipt { receipt: Receipt::Rejected { code, now } } if code == "unsupported" && now["why"].as_str().is_some_and(|w| w.contains("new-desktop"))),
+            "{name}: {reply:?}"
+        );
+    }
+    // 聊天照常。
+    fx.round(&session, "chatonly-2", "再问一句", "还能答").await;
+    fx.close();
+}
