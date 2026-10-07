@@ -85,3 +85,19 @@ fn empty_context_lines_advance_both_sides_and_close_the_hunk_before_the_next_fil
     assert_eq!(rows[9].old, Some(8));
     assert_eq!(rows[10].new, Some(9));
 }
+
+#[test]
+fn informal_diff_lines_keep_added_and_removed_colors_without_invented_line_numbers() {
+    for text in [
+        "- old\n+ new",
+        "@@ fn main @@\n- old\n+ new",
+        "@@ -1 +1 @@\n-a\n+b\n- old\n+ new",
+    ] {
+        let rows = unified_diff(text);
+        for (line, kind) in [("- old", DiffKind::Removed), ("+ new", DiffKind::Added)] {
+            let row = rows.iter().find(|row| row.text == line).unwrap();
+            assert_eq!(row.kind, kind);
+            assert_eq!((row.old, row.new), (None, None));
+        }
+    }
+}

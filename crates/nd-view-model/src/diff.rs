@@ -65,6 +65,13 @@ pub fn unified_diff(text: &str) -> Vec<DiffLine> {
                     range = None;
                 }
             }
+            if row.kind == DiffKind::Notice {
+                row.kind = match line.as_bytes().first() {
+                    Some(b'+') => DiffKind::Added,
+                    Some(b'-') => DiffKind::Removed,
+                    _ => DiffKind::Notice,
+                };
+            }
             row
         })
         .collect()
