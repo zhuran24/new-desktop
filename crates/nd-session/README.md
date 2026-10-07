@@ -10,7 +10,7 @@
 |---|---|
 | `Sessions::new(store, blobs, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
 | `Sessions::recover()` | 守护进程启动时装载有活进程、进行中操作或未结票的会话，交端口 `adopt` 对账 |
-| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`、`session.resend`、`session.withdraw`、`session.interrupt`；不是会话命令时返回 None |
+| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`、`session.resend`、`session.withdraw`、`session.interrupt`、`session.configure`、`session.rename`；不是会话命令时返回 None |
 | `Sessions::subscribe(&SessionId, since)` | `session/<id>` 流：快照或同纪元续上的事件，外加 `WatchGuard`（持有期间算「有人在看」） |
 | `Sessions::listing()` | 侧栏列表与一次性的提示（`global` 流里 `sessions` 命名空间的条目） |
 | `session_id_for(command_id)` | 新建会话的 id 由建它的命令 id 派生：同一条命令重试落在同一个会话上 |
