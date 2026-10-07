@@ -78,7 +78,6 @@ enum Cmd {
     Title {
         ticket: Ticket,
         invocation: nd_backend::Invocation,
-        write: bool,
     },
     Configure {
         ticket: Ticket,
@@ -114,6 +113,28 @@ fn titles(invocation: &Invocation) -> bool {
         invocation,
         Invocation::Title { .. } | Invocation::GenerateTitle { .. }
     )
+}
+
+fn unsent_outcome(command: Cmd, code: Option<i32>) -> Option<Fact> {
+    Some(match command {
+        Cmd::Send { ticket, .. }
+        | Cmd::Configure { ticket, .. }
+        | Cmd::Title { ticket, .. }
+        | Cmd::Invoke { ticket, .. } => done(
+            &ticket,
+            Outcome::Refused {
+                refusal: Refusal::Withheld,
+            },
+        ),
+        Cmd::End { ticket, .. } => done(
+            &ticket,
+            Outcome::Ok {
+                done: Done::Ended { code },
+            },
+        ),
+        Cmd::Control { ticket, .. } => done(&ticket, Outcome::failed("控制目标进程不在了")),
+        Cmd::Ack(_) | Cmd::Concluded { .. } => return None,
+    })
 }
 
 fn features(caps: &Caps) -> Vec<nd_backend::Feature> {
@@ -284,6 +305,24 @@ impl ClaudeBackend {
 }
 
 impl Inner {
+    fn enqueue(&self, to: &CarrierId, session: &SessionId, command: Cmd) -> Admit {
+        if self
+            .carriers
+            .lock()
+            .unwrap()
+            .get(to)
+            .is_some_and(|slot| &slot.session == session && slot.tx.send(command).is_ok())
+        {
+            Admit::Accepted {
+                may_be_unknown: true,
+            }
+        } else {
+            Admit::Rejected {
+                reject: Reject::Gone,
+            }
+        }
+    }
+
     async fn deliver(&self, session: &SessionId, batch: Batch) {
         let inbox = self.inboxes.lock().unwrap().get(session).cloned();
         if let Some(inbox) = inbox {
@@ -917,31 +956,8 @@ impl Inner {
             self.carriers.lock().unwrap().remove(&record.carrier);
             queued.close();
             while let Ok(cmd) = queued.try_recv() {
-                match cmd {
-                    Cmd::Send { ticket, .. }
-                    | Cmd::Configure { ticket, .. }
-                    | Cmd::Title { ticket, .. } => facts.push(done(
-                        &ticket,
-                        Outcome::Refused {
-                            refusal: Refusal::Withheld,
-                        },
-                    )),
-                    Cmd::End { ticket, .. } => facts.push(done(
-                        &ticket,
-                        Outcome::Ok {
-                            done: Done::Ended { code: None },
-                        },
-                    )),
-                    Cmd::Control { ticket, .. } => {
-                        facts.push(done(&ticket, Outcome::failed("控制目标进程不在了")))
-                    }
-                    Cmd::Invoke { ticket, .. } => facts.push(done(
-                        &ticket,
-                        Outcome::Refused {
-                            refusal: Refusal::Withheld,
-                        },
-                    )),
-                    Cmd::Ack(_) | Cmd::Concluded { .. } => {}
+                if let Some(outcome) = unsent_outcome(cmd, None) {
+                    facts.push(outcome);
                 }
             }
             facts.push(fact(
@@ -1049,7 +1065,6 @@ impl Inner {
                     let _ = slot.tx.send(Cmd::Title {
                         ticket: p.issued.ticket.clone(),
                         invocation: invocation.clone(),
-                        write: true,
                     });
                 }
             }
@@ -1468,13 +1483,7 @@ impl Actor {
                     }
                 }
             }
-            Cmd::Title {
-                ticket,
-                invocation,
-                write,
-            } => {
-                let id = format!("title:{ticket}");
-                self.settings_controls.insert(id.clone(), ticket.clone());
+            Cmd::Title { ticket, invocation } => {
                 let request = match invocation {
                     nd_backend::Invocation::Title { title } => {
                         json!({"subtype":"rename_session","title":title,"source":"host"})
@@ -1485,52 +1494,11 @@ impl Actor {
                     // 其余 Invoke 经动作 mod（`Cmd::Invoke`），不会排进这里。
                     _ => return,
                 };
-                if write
-                    && let Err(error) = self
-                        .write_control(
-                            &json!({"type":"control_request","request_id":id,"request":request}),
-                        )
-                        .await
-                {
-                    self.settings_controls.remove(&id);
-                    self.inner
-                        .deliver_facts(
-                            &self.session,
-                            &self.carrier,
-                            vec![done(
-                                &ticket,
-                                Outcome::Unknown {
-                                    evidence: error.to_string(),
-                                },
-                            )],
-                        )
-                        .await;
-                }
+                self.send_control("title", ticket, request).await;
             }
             Cmd::Configure { ticket, setting } => {
-                let request = setting_request(&setting);
-                let id = format!("configure:{ticket}");
-                self.settings_controls.insert(id.clone(), ticket.clone());
-                if let Err(error) = self
-                    .write_control(
-                        &json!({"type":"control_request","request_id":id,"request":request}),
-                    )
-                    .await
-                {
-                    self.settings_controls.remove(&id);
-                    self.inner
-                        .deliver_facts(
-                            &self.session,
-                            &self.carrier,
-                            vec![done(
-                                &ticket,
-                                Outcome::Unknown {
-                                    evidence: error.to_string(),
-                                },
-                            )],
-                        )
-                        .await;
-                }
+                self.send_control("configure", ticket, setting_request(&setting))
+                    .await;
             }
             Cmd::End { ticket, how } => {
                 self.ending = Some(ticket);
@@ -1565,6 +1533,28 @@ impl Actor {
                     self.relink().await;
                 }
             }
+        }
+    }
+    async fn send_control(&mut self, kind: &str, ticket: Ticket, request: Value) {
+        let id = format!("{kind}:{ticket}");
+        self.settings_controls.insert(id.clone(), ticket.clone());
+        if let Err(error) = self
+            .write_control(&json!({"type":"control_request","request_id":id,"request":request}))
+            .await
+        {
+            self.settings_controls.remove(&id);
+            self.inner
+                .deliver_facts(
+                    &self.session,
+                    &self.carrier,
+                    vec![done(
+                        &ticket,
+                        Outcome::Unknown {
+                            evidence: error.to_string(),
+                        },
+                    )],
+                )
+                .await;
         }
     }
     async fn encode(&self, msg: &Msg) -> Result<Vec<Value>, String> {
@@ -2104,31 +2094,8 @@ impl Actor {
             // 进程退出时还排在队列里、没写出的票：证明没写出，引擎另发（会按需拉起）。
             self.rx.close();
             while let Some(cmd) = self.queued.pop_front().or_else(|| self.rx.try_recv().ok()) {
-                match cmd {
-                    Cmd::Send { ticket, .. }
-                    | Cmd::Configure { ticket, .. }
-                    | Cmd::Title { ticket, .. } => facts.push(done(
-                        &ticket,
-                        Outcome::Refused {
-                            refusal: Refusal::Withheld,
-                        },
-                    )),
-                    Cmd::End { ticket, .. } => facts.push(done(
-                        &ticket,
-                        Outcome::Ok {
-                            done: Done::Ended { code: Some(code) },
-                        },
-                    )),
-                    Cmd::Control { ticket, .. } => {
-                        facts.push(done(&ticket, Outcome::failed("控制目标进程不在了")))
-                    }
-                    Cmd::Invoke { ticket, .. } => facts.push(done(
-                        &ticket,
-                        Outcome::Refused {
-                            refusal: Refusal::Withheld,
-                        },
-                    )),
-                    Cmd::Ack(_) | Cmd::Concluded { .. } => {}
+                if let Some(outcome) = unsent_outcome(cmd, Some(code)) {
+                    facts.push(outcome);
                 }
             }
             self.inner
@@ -2226,51 +2193,28 @@ impl BackendAdapter for ClaudeBackend {
                     .spawn(inner.open(issued, carrier, run, spec));
                 accepted
             }
-            Act::Invoke { to, invocation } => match self.inner.carriers.lock().unwrap().get(&to) {
-                Some(slot)
-                    if slot.session == issued.session
-                        && slot
-                            .tx
-                            .send(if titles(&invocation) {
-                                Cmd::Title {
-                                    ticket: issued.ticket.clone(),
-                                    invocation,
-                                    write: true,
-                                }
-                            } else {
-                                Cmd::Invoke {
-                                    ticket: issued.ticket.clone(),
-                                    invocation,
-                                }
-                            })
-                            .is_ok() =>
-                {
-                    accepted
-                }
-                _ => Admit::Rejected {
-                    reject: Reject::Gone,
-                },
-            },
-            Act::Configure { to, setting } => {
-                let carriers = self.inner.carriers.lock().unwrap();
-                match carriers.get(&to) {
-                    Some(slot)
-                        if slot.session == issued.session
-                            && slot
-                                .tx
-                                .send(Cmd::Configure {
-                                    ticket: issued.ticket.clone(),
-                                    setting,
-                                })
-                                .is_ok() =>
-                    {
-                        accepted
+            Act::Invoke { to, invocation } => {
+                let command = if titles(&invocation) {
+                    Cmd::Title {
+                        ticket: issued.ticket,
+                        invocation,
                     }
-                    _ => Admit::Rejected {
-                        reject: Reject::Gone,
-                    },
-                }
+                } else {
+                    Cmd::Invoke {
+                        ticket: issued.ticket,
+                        invocation,
+                    }
+                };
+                self.inner.enqueue(&to, &issued.session, command)
             }
+            Act::Configure { to, setting } => self.inner.enqueue(
+                &to,
+                &issued.session,
+                Cmd::Configure {
+                    ticket: issued.ticket,
+                    setting,
+                },
+            ),
             Act::Interrupt { ref to, .. } | Act::Withdraw { ref to, .. } => {
                 let carriers = self.inner.carriers.lock().unwrap();
                 match carriers.get(to) {
