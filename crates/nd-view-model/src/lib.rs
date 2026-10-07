@@ -1,6 +1,6 @@
 //! 不依赖 GPUI 的每设备视图状态、主题变量和显示数据。
 mod state;
-pub use state::{ViewState, ViewStateFile, WindowState};
+pub use state::{Panel, TreeView, ViewState, ViewStateFile, WindowState};
 mod slots;
 pub use slots::{Contribution, Slot, SlotGuard, Slots};
 mod chat;

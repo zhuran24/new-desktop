@@ -417,9 +417,13 @@ impl Render for Desktop {
         let header = self.render_slots(Slot::Header, window, cx);
         let sidebar = self.render_slots(Slot::Sidebar, window, cx);
         let mut right = self.render_slots(Slot::RightPanel, window, cx);
-        match self.state.active_panel.as_deref() {
-            Some("settings") => right.extend(self.render_slots(Slot::Settings, window, cx)),
-            Some("commands") => right.extend(self.render_slots(Slot::CommandPalette, window, cx)),
+        match self.state.active_panel {
+            Some(nd_view_model::Panel::Settings) => {
+                right.extend(self.render_slots(Slot::Settings, window, cx))
+            }
+            Some(nd_view_model::Panel::Commands) => {
+                right.extend(self.render_slots(Slot::CommandPalette, window, cx))
+            }
             _ => {}
         }
         let chat_sidebar = self.chat_sidebar(cx);

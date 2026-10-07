@@ -151,10 +151,10 @@ impl Desktop {
                 .text_color(rgba(self.theme.colors.accent))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.state.active_panel =
-                        if this.state.active_panel.as_deref() == Some("themes") {
+                        if this.state.active_panel == Some(nd_view_model::Panel::Themes) {
                             None
                         } else {
-                            Some("themes".into())
+                            Some(nd_view_model::Panel::Themes)
                         };
                     cx.notify();
                 }))
@@ -169,7 +169,7 @@ impl Desktop {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.state.active_panel.as_deref() != Some("themes") {
+        if self.state.active_panel != Some(nd_view_model::Panel::Themes) {
             return None;
         }
         let mut choices = vec![

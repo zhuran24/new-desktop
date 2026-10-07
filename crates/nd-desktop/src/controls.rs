@@ -85,7 +85,7 @@ impl Desktop {
                 self.settings_open = false;
             }
             Escape::RewindMenu => {
-                self.state.active_panel = Some("rewind".into());
+                self.state.active_panel = Some(nd_view_model::Panel::Rewind);
             }
             Escape::Interrupt if caps["interrupt"] == true => {
                 self.control(
@@ -228,7 +228,7 @@ impl Desktop {
                 ));
             }
         }
-        if self.state.active_panel.as_deref() == Some("rewind") {
+        if self.state.active_panel == Some(nd_view_model::Panel::Rewind) {
             let rounds = self
                 .session_snapshot
                 .as_ref()

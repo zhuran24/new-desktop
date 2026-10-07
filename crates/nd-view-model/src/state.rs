@@ -21,6 +21,25 @@ impl Default for WindowState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Panel {
+    Settings,
+    Commands,
+    Themes,
+    Rewind,
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeView {
+    Chronological,
+    Topological,
+    #[serde(other)]
+    Unknown,
+}
+
 /// 仅本设备的呈现偏好。快照、纪元和游标从不持久到此处。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -30,12 +49,12 @@ pub struct ViewState {
     #[serde(default)]
     pub theme_selection: Option<crate::ThemeSelection>,
     pub components: BTreeMap<String, bool>,
-    pub active_panel: Option<String>,
+    pub active_panel: Option<Panel>,
     pub window: WindowState,
     pub sidebar_width: f32,
     pub selected_session: Option<String>,
     pub scroll_anchors: BTreeMap<String, String>,
-    pub tree_views: BTreeMap<String, String>,
+    pub tree_views: BTreeMap<String, TreeView>,
 }
 impl ViewState {
     pub fn theme_selection(&self) -> crate::ThemeSelection {

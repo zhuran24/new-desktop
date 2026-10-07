@@ -14,7 +14,7 @@ fn device_view_preferences_survive_reopen_without_persisting_daemon_facts() {
         .insert("session-a".into(), "item-17".into());
     state
         .tree_views
-        .insert("tree-a".into(), "chronological".into());
+        .insert("tree-a".into(), nd_view_model::TreeView::Chronological);
     file.save(&state).unwrap();
     assert!(ViewStateFile::open(&path).is_err(), "one writer per device");
     drop(file);
@@ -123,4 +123,15 @@ fn configuration_unloads_every_slot_of_one_component_and_preserves_other_compone
     assert_eq!(slots.values(&Slot::Header), vec!["另一个".to_owned()]);
     slots.configure("overview", &entries, true).unwrap();
     assert_eq!(slots.values(&Slot::Sidebar), vec!["会话".to_owned()]);
+}
+
+#[test]
+fn future_panel_and_tree_choices_do_not_discard_other_device_preferences() {
+    let state: ViewState = serde_json::from_value(serde_json::json!({
+        "active_panel":"future_panel","tree_views":{"a":"future_tree"},"selected_session":"keep"
+    }))
+    .unwrap();
+    assert_eq!(state.active_panel, Some(nd_view_model::Panel::Unknown));
+    assert_eq!(state.tree_views["a"], nd_view_model::TreeView::Unknown);
+    assert_eq!(state.selected_session.as_deref(), Some("keep"));
 }
