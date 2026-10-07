@@ -4,6 +4,7 @@ mod chat;
 pub mod composer;
 mod drafts;
 mod history;
+mod settings;
 mod themes;
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
@@ -32,6 +33,9 @@ pub struct Desktop {
     session_feed: Option<Task<()>>,
     scroll: ScrollHandle,
     directory: Entity<InputState>,
+    title_editor: Entity<InputState>,
+    settings_open: bool,
+    settings_sending: bool,
     models: Vec<nd_wire::Model>,
     model: Option<String>,
     model_cwd: Option<String>,
@@ -181,6 +185,9 @@ impl Desktop {
             session_feed: None,
             scroll: ScrollHandle::new(),
             directory,
+            title_editor: cx.new(|cx| InputState::new(window, cx).placeholder("会话标题")),
+            settings_open: false,
+            settings_sending: false,
             models: vec![],
             model: None,
             model_cwd: None,

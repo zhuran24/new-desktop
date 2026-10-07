@@ -16,6 +16,8 @@ pub enum OpSpec {
     Create(Create),
     Launch(Launch),
     Reclaim(Reclaim),
+    Configure(Configure),
+    Title(Title),
 }
 impl OpSpec {
     pub fn kind(&self) -> &'static str {
@@ -23,6 +25,8 @@ impl OpSpec {
             OpSpec::Create(_) => "create",
             OpSpec::Launch(_) => "launch",
             OpSpec::Reclaim(_) => "reclaim",
+            OpSpec::Configure(_) => "configure",
+            OpSpec::Title(_) => "title",
         }
     }
     pub fn version(&self) -> u32 {
@@ -30,17 +34,20 @@ impl OpSpec {
             OpSpec::Create(_) => Create::VERSION,
             OpSpec::Launch(_) => Launch::VERSION,
             OpSpec::Reclaim(_) => Reclaim::VERSION,
+            OpSpec::Configure(_) | OpSpec::Title(_) => 1,
         }
     }
     /// 结构操作：一个会话同时至多一个，进行中代持给对话的新输入。
     pub fn structural(&self) -> bool {
-        true
+        !matches!(self, Self::Title(Title { generate: true, .. }))
     }
     pub fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
         match self {
             OpSpec::Create(op) => op.run(v, j),
             OpSpec::Launch(op) => op.run(v, j),
             OpSpec::Reclaim(op) => op.run(v, j),
+            OpSpec::Configure(op) => op.run(v, j),
+            OpSpec::Title(op) => op.run(v, j),
         }
     }
 }
@@ -63,6 +70,11 @@ fn uuid_from_hex(hex: &str) -> String {
 fn profile(v: &View<'_>) -> Profile {
     let meta = v.meta();
     Profile {
+        effort: meta.effort.clone().or_else(|| {
+            meta.settings["applied"]["effort"]
+                .as_str()
+                .map(str::to_owned)
+        }),
         kind: meta.kind.clone(),
         model: meta.model.clone(),
         permission_mode: meta.permission_mode.clone(),
@@ -105,6 +117,11 @@ impl Create {
                     carrier: carrier.clone(),
                     run: run.clone(),
                     spec: OpenSpec {
+                        live_settings: v.meta().settings["applied"]["ultracodeRequested"]
+                            .as_bool()
+                            .map(nd_wire::LiveSetting::Ultracode)
+                            .into_iter()
+                            .collect(),
                         origin: Origin::Fresh { id: bs.clone() },
                         profile: profile(v),
                     },
@@ -187,6 +204,11 @@ impl Launch {
                     carrier: self.carrier.clone(),
                     run: run.clone(),
                     spec: OpenSpec {
+                        live_settings: v.meta().settings["applied"]["ultracodeRequested"]
+                            .as_bool()
+                            .map(nd_wire::LiveSetting::Ultracode)
+                            .into_iter()
+                            .collect(),
                         origin: Origin::Resume { bs: bs.clone() },
                         profile: profile(v),
                     },
@@ -233,6 +255,84 @@ impl Reclaim {
                 done: Done::Ended { code },
             } => Ok(json!({"code": code})),
             other => Err(j.fail(format!("后端进程没有收尾：{}", other.reason()))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Configure {
+    pub carrier: CarrierId,
+    pub setting: nd_wire::LiveSetting,
+}
+impl Configure {
+    fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
+        j.wait("between-turns", v, |v| {
+            v.carrier(&self.carrier)
+                .filter(|c| !c.turn_running)
+                .map(|_| true)
+        })?;
+        if !v.carrier(&self.carrier).is_some_and(|c| c.alive) {
+            Launch {
+                carrier: self.carrier.clone(),
+            }
+            .run(v, j)?;
+        }
+        let outcome = j
+            .act(
+                "configure",
+                &self.carrier,
+                Act::Configure {
+                    to: self.carrier.clone(),
+                    setting: self.setting.clone(),
+                },
+            )
+            .outcome()?;
+        match outcome {
+            Outcome::Ok {
+                done: Done::Configured { settings },
+            } => Ok(settings),
+            other => Err(j.fail(other.reason())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Title {
+    pub carrier: CarrierId,
+    pub title: String,
+    pub generate: bool,
+}
+impl Title {
+    fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
+        if !v.carrier(&self.carrier).is_some_and(|c| c.alive) {
+            Launch {
+                carrier: self.carrier.clone(),
+            }
+            .run(v, j)?;
+        }
+        let outcome = j
+            .act(
+                "title",
+                &self.carrier,
+                Act::Invoke {
+                    to: self.carrier.clone(),
+                    invocation: if self.generate {
+                        nd_backend::Invocation::GenerateTitle {
+                            description: self.title.clone(),
+                        }
+                    } else {
+                        nd_backend::Invocation::Title {
+                            title: self.title.clone(),
+                        }
+                    },
+                },
+            )
+            .outcome()?;
+        match outcome {
+            Outcome::Ok {
+                done: Done::Titled { title },
+            } => Ok(json!({"title":title})),
+            other => Err(j.fail(other.reason())),
         }
     }
 }
