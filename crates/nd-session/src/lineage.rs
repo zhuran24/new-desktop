@@ -648,17 +648,8 @@ impl Lineage {
                 if landed.is_empty() && known.is_none() {
                     return Ok(());
                 }
-                let id = known.unwrap_or_else(|| {
-                    use sha2::{Digest, Sha256};
-                    let digest = Sha256::digest(identity.as_bytes());
-                    format!(
-                        "round-{}",
-                        digest[..16]
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
-                    )
-                });
+                let id = known
+                    .unwrap_or_else(|| format!("round-{}", crate::ids::derive_id("", &identity)));
                 let turn = self.rounds.entry(id.clone()).or_insert_with(|| Round {
                     id: id.clone(),
                     messages: vec![],

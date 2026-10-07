@@ -193,9 +193,7 @@ impl<'a> Journal<'a> {
     /// 创建意图编号（承载位、后端进程编号、预定的后端会话 id）：由操作 id 和键确定性派生，
     /// 重跑、重启后不变。
     pub fn id(&self, key: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(format!("nd-id:{}:{key}", self.op.id).as_bytes());
-        digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+        crate::ids::derive_id("nd-id:", &format!("{}:{key}", self.op.id))
     }
     /// 有副作用的事只经它；第一次求值时进操作账和发件箱，之后返回同一句柄。
     pub fn act(&mut self, key: &str, carrier: &CarrierId, act: Act) -> Handle<'_, 'a> {

@@ -11,6 +11,7 @@
 mod executor;
 mod feed;
 pub mod history;
+mod ids;
 pub mod journal;
 pub mod lineage;
 pub mod ops;
@@ -227,15 +228,7 @@ pub fn delivery(name: &str) -> bool {
 
 /// 由建会话的命令 id 派生会话 id：同一条命令重试落在同一个会话上。
 pub fn session_id_for(command_id: &str) -> SessionId {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("nd-session:{command_id}").as_bytes());
-    SessionId(format!(
-        "s-{}",
-        digest[..16]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    ))
+    SessionId(format!("s-{}", ids::derive_id("nd-session:", command_id)))
 }
 
 impl Sessions {
