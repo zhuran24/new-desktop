@@ -20,11 +20,11 @@ impl AttachmentSource {
                 if !metadata.is_file() {
                     return Err("附件必须是普通文件".into());
                 }
-                if metadata.len() > 5 * 1024 * 1024 {
+                if metadata.len() > nd_wire::MAX_ATTACHMENT_BYTES {
                     return Err("单个附件不能超过 5 MiB".into());
                 }
                 let mut bytes = vec![];
-                file.take(5 * 1024 * 1024 + 1)
+                file.take(nd_wire::MAX_ATTACHMENT_BYTES + 1)
                     .read_to_end(&mut bytes)
                     .await
                     .map_err(|e| e.to_string())?;

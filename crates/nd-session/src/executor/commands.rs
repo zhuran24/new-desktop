@@ -158,7 +158,7 @@ impl Executor {
                 .unwrap_or(json!([])),
         )
         .map_err(|e| format!("附件引用格式错误：{e}"))?;
-        if attachments.len() > 8 {
+        if attachments.len() > nd_wire::MAX_ATTACHMENTS_PER_MESSAGE {
             return Err("每条消息最多 8 个附件".into());
         }
         let mut total = 0;
@@ -178,7 +178,7 @@ impl Executor {
             }
             total += a.size;
         }
-        if total > 16 * 1024 * 1024 {
+        if total > nd_wire::MAX_MESSAGE_ATTACHMENT_BYTES {
             return Err("每条消息的附件总大小不能超过 16 MiB".into());
         }
         Ok(attachments)

@@ -8,6 +8,9 @@ mod settings;
 pub use settings::{EffectiveSettings, LiveSettings, SettingCaps};
 
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+pub const MAX_ATTACHMENTS_PER_MESSAGE: usize = 8;
+pub const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 会话持久草稿；光标、选区和输入法组词不在此协议中。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -432,7 +435,7 @@ impl Attachment {
         ) {
             return Err("不支持此附件类型".into());
         }
-        if self.size == 0 || self.size > 5 * 1024 * 1024 {
+        if self.size == 0 || self.size > MAX_ATTACHMENT_BYTES {
             return Err("单个附件须为 1 字节至 5 MiB".into());
         }
         Ok(())

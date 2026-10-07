@@ -18,7 +18,7 @@ impl Desktop {
             .or_default()
             .attachments()
             .len();
-        if sources.len() + existing + self.uploading > 8 {
+        if sources.len() + existing + self.uploading > nd_wire::MAX_ATTACHMENTS_PER_MESSAGE {
             self.warning = Some("每条消息最多 8 个附件".into());
             cx.notify();
             return;
