@@ -750,7 +750,7 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
     // 会话流各有一个转发任务；队列满或落后太多就断开，界面重连后恢复。
     let (overflow, mut overflowed) = tokio::sync::mpsc::channel::<()>(1);
     let mut forwards: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
-    loop {
+    'connection: loop {
         tokio::select! {
             _ = &mut writer => {
                 for forward in forwards.values() { forward.abort(); }
@@ -894,7 +894,7 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                     }
                 };
                 for event in replay {
-                    if !enqueue(&outgoing, WireResponse::Event { event }) { let _ = close.send(()); let _ = writer.await; return; }
+                    if !enqueue(&outgoing, WireResponse::Event { event }) { break 'connection; }
                 }
                 if !enqueue(&outgoing, response) { break; }
             },
