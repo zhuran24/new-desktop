@@ -304,12 +304,16 @@ def inner():
             assert before_process['run'] == after_process['run']
             assert before_process['backend_session'] == after_process['backend_session']
             assert next(i['data']['text'] for i in after['items'] if i['id'] == 'draft') == '主题切换保留的草稿'
+            assert block(after)['data']['complete'] is False
+            (out / 'release-stream').touch()
             finished = wait('creating', lambda s: block(s) is not None and block(s)['data']['complete'] is True)
             (out / 'result.json').write_text(json.dumps({'pass': True,
                 'session': finished['stream'].removeprefix('session/'),
                 'checks': ['streaming theme reload preserves process and draft',
                            'Markdown link, inline code and table header use file colors']}, ensure_ascii=False))
             return
+        at_kill = json.loads(subprocess.check_output(['/ndctl', '--socket', socket, 'get', partial['stream']]))
+        assert block(at_kill)['data']['complete'] is False, 'kill must happen before the end frame'
         app.kill()
         assert app.wait(timeout=5) == -9
         app = start('reopened')
@@ -317,6 +321,8 @@ def inner():
         assert cold['stream'] == partial['stream']
         assert block(cold)['id'] == block(partial)['id']
         assert block(cold)['data']['text'].startswith(block(partial)['data']['text'])
+        assert block(cold)['data']['complete'] is False, 'cold reopen must still see a partial block'
+        (out / 'release-stream').touch()
         finished = wait('reopened', lambda s: block(s) is not None and block(s)['data']['complete'] is True)
         assert len([i for i in finished['items'] if i['id'] == block(partial)['id']]) == 1
         screenshot('dark')

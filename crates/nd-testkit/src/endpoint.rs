@@ -40,6 +40,7 @@ pub struct ModelReply {
     content: Vec<Value>,
     stop_reason: &'static str,
     gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    finish_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     chunk_chars: usize,
     pause_ms: u64,
 }
@@ -49,6 +50,7 @@ impl ModelReply {
             content: vec![json!({"type":"text","text":text.into()})],
             stop_reason: "end_turn",
             gate: None,
+            finish_gate: None,
             chunk_chars: usize::MAX,
             pause_ms: 0,
         }
@@ -65,6 +67,7 @@ impl ModelReply {
             content: vec![json!({"type":"tool_use","id":id,"name":name,"input":input})],
             stop_reason: "tool_use",
             gate: None,
+            finish_gate: None,
             chunk_chars: usize::MAX,
             pause_ms: 0,
         }
@@ -158,6 +161,13 @@ impl ClaudeEndpoint {
     pub fn enqueue_held(&self, route: Route, mut reply: ModelReply) -> ResponseGate {
         let (tx, rx) = tokio::sync::oneshot::channel();
         reply.gate = Some(rx);
+        self.enqueue(route, reply);
+        ResponseGate(tx)
+    }
+    /// 扣住第一块内容的结束帧；UI 可在确定仍为增量时崩溃并冷启动。
+    pub fn enqueue_finish_held(&self, route: Route, mut reply: ModelReply) -> ResponseGate {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reply.finish_gate = Some(rx);
         self.enqueue(route, reply);
         ResponseGate(tx)
     }
@@ -296,15 +306,26 @@ async fn messages(
     events.push(json!({"type":"message_delta","delta":{"stop_reason":reply.stop_reason,"stop_sequence":null},"usage":{"output_tokens":10}}));
     events.push(json!({"type":"message_stop"}));
     let pause_ms = reply.pause_ms;
-    axum::response::Sse::new(futures::stream::iter(events).then(move |event| async move {
-        if pause_ms > 0 && event["type"] == "content_block_delta" {
-            tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+    let mut finish_gate = reply.finish_gate;
+    axum::response::Sse::new(futures::stream::iter(events).then(move |event| {
+        let gate = if event["type"] == "content_block_stop" {
+            finish_gate.take()
+        } else {
+            None
+        };
+        async move {
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            if pause_ms > 0 && event["type"] == "content_block_delta" {
+                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            }
+            Ok::<_, std::convert::Infallible>(
+                axum::response::sse::Event::default()
+                    .event(event["type"].as_str().unwrap())
+                    .data(event.to_string()),
+            )
         }
-        Ok::<_, std::convert::Infallible>(
-            axum::response::sse::Event::default()
-                .event(event["type"].as_str().unwrap())
-                .data(event.to_string()),
-        )
     }))
     .into_response()
 }

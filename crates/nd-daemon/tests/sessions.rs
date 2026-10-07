@@ -1907,9 +1907,9 @@ async fn native_chat(themes: bool) {
     } else {
         answer
     };
-    fx.scenario.endpoint().enqueue(
+    let finish = fx.scenario.endpoint().enqueue_finish_held(
         Route::new(None, "claude-haiku-4-5-20251001"),
-        ModelReply::streaming_text(answer, 1, 100),
+        ModelReply::streaming_text(answer, 1, 10),
     );
     let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
     let output = std::env::var_os(if themes {
@@ -1919,7 +1919,7 @@ async fn native_chat(themes: bool) {
     })
     .map(std::path::PathBuf::from)
     .unwrap_or_else(|| fx.scenario.root().join("native-chat"));
-    let result = tokio::process::Command::new("python")
+    let child = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
         .arg("--desktop")
         .arg(desktop)
@@ -1928,9 +1928,20 @@ async fn native_chat(themes: bool) {
         .arg("--output")
         .arg(&output)
         .args(if themes { vec!["--themes"] } else { vec![] })
-        .output()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(45), async {
+        while !output.join("release-stream").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("native scenario must observe an unfinished cold block before release");
+    finish.release();
+    let result = child.wait_with_output().await.unwrap();
     assert!(
         result.status.success(),
         "{}\n{}",
