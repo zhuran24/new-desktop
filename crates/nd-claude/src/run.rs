@@ -113,11 +113,7 @@ impl Caps {
         Feature::ALL
             .iter()
             .map(|f| {
-                let why = match self.features.get(f) {
-                    Some(Availability::Available) => None,
-                    Some(Availability::Unsupported { why }) => Some(why.clone()),
-                    None => Some("这个进程没有声明这项能力".into()),
-                };
+                let why = self.unsupported(*f);
                 nd_backend::Feature {
                     id: f.id().into(),
                     label: f.label().into(),
@@ -461,38 +457,13 @@ impl ClaudeRun {
     }
     /// 按当前绑定把命令放进 mod 的队列，返回操作 id；这个 mod 没绑定在当前后端会话上就不发。
     pub fn send(&self, module: ModName, action: Action) -> Option<String> {
-        let binding = self.binding();
-        let mod_gen = binding.mods.get(&module)?.mod_gen.clone();
         let op_id = uuid::Uuid::new_v4().to_string();
-        self.channel.send(
-            &self.ready.run,
-            module,
-            Command {
-                op_id: op_id.clone(),
-                expected_backend_session_id: binding.backend_session_id,
-                expected_mod_gen: mod_gen,
-                action,
-            },
-        );
-        Some(op_id)
+        self.send_as(module, &op_id, action).then_some(op_id)
     }
-    /// 用指定的操作 id 按当前绑定发命令（不可重发的动作用票派生的 id，重启后能按它查）。
-    /// 这个 mod 没绑定在当前后端会话上就不发，返回 false。
+    /// 用指定的操作 id 按当前绑定发命令；未绑定的 mod 不发送。
     pub fn send_as(&self, module: ModName, op_id: &str, action: Action) -> bool {
-        let binding = self.binding();
-        let Some(hello) = binding.mods.get(&module) else {
-            return false;
-        };
-        self.channel.send(
-            &self.ready.run,
-            module,
-            Command {
-                op_id: op_id.into(),
-                expected_backend_session_id: binding.backend_session_id,
-                expected_mod_gen: hello.mod_gen.clone(),
-                action,
-            },
-        )
+        self.channel
+            .send_current(&self.ready.run, module, op_id, action)
     }
     /// 等某条命令的结论；None 表示到时限仍无结论。
     pub async fn result(&self, op_id: &str, timeout: Duration) -> Option<CommandResult> {

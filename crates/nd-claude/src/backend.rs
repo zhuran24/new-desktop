@@ -137,10 +137,6 @@ fn unsent_outcome(command: Cmd, code: Option<i32>) -> Option<Fact> {
     })
 }
 
-fn features(caps: &Caps) -> Vec<nd_backend::Feature> {
-    caps.table()
-}
-
 fn readiness_of(caps: &Caps) -> Readiness {
     match &caps.readiness {
         ClaudeReadiness::Full => Readiness::Full,
@@ -176,24 +172,17 @@ fn encode(blobs: &nd_store::Blobs, message: &Msg) -> Result<Vec<Value>, String> 
 /// 守护进程重启后按操作 id 问动作 mod：做完了取结论，还在跑就过一会儿再问，查不到就是不明。
 async fn recheck(channel: ModChannel, run: String, op_id: String, me: mpsc::UnboundedSender<Cmd>) {
     loop {
-        let query = channel.binding(&run).and_then(|binding| {
-            let hello = binding.mods.get(&ModName::Actions)?;
-            let id = uuid::Uuid::new_v4().to_string();
-            channel
-                .send(
-                    &run,
-                    ModName::Actions,
-                    nd_mod_proto::Command {
-                        op_id: id.clone(),
-                        expected_backend_session_id: binding.backend_session_id.clone(),
-                        expected_mod_gen: hello.mod_gen.clone(),
-                        action: Action::Query {
-                            op_ids: vec![op_id.clone()],
-                        },
-                    },
-                )
-                .then_some(id)
-        });
+        let id = uuid::Uuid::new_v4().to_string();
+        let query = channel
+            .send_current(
+                &run,
+                ModName::Actions,
+                &id,
+                Action::Query {
+                    op_ids: vec![op_id.clone()],
+                },
+            )
+            .then_some(id);
         let answer = match query {
             Some(id) => channel.result(&run, &id, Duration::from_secs(15)).await,
             None => None,
@@ -635,10 +624,7 @@ impl Inner {
                 .await;
                 // 自己的进程写进 CLI 注册表的那一条按身份认作自有，不当外部写入者。
                 self.refresh().await;
-                let readiness = match &ready.caps.readiness {
-                    ClaudeReadiness::Full => Readiness::Full,
-                    ClaudeReadiness::ChatOnly { why } => Readiness::ChatOnly { why: why.clone() },
-                };
+                let readiness = readiness_of(&ready.caps);
                 let adopt = serde_json::to_value(&ready.caps).unwrap_or(Value::Null);
                 self.start_actor(
                     issued.session.clone(),
@@ -692,7 +678,7 @@ impl Inner {
                                         rewind_menu: true,
                                     },
                                     adopt,
-                                    features: features(&ready.caps),
+                                    features: ready.caps.table(),
                                 },
                             },
                         ),
@@ -996,7 +982,7 @@ impl Inner {
                 format!("caps:{run}:{recover_through}"),
                 FactBody::CapsChanged {
                     readiness: readiness_of(&claude_run.ready().caps),
-                    features: features(&claude_run.ready().caps),
+                    features: claude_run.ready().caps.table(),
                 },
             ));
         }
