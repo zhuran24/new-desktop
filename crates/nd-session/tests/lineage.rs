@@ -126,6 +126,11 @@ fn rewind_keeps_the_old_path_and_nested_branches_share_only_the_explicit_prefix(
             backend_session: BackendSessionId::claude("bs2"),
         })
         .unwrap();
+    assert_eq!(branched.inactive_messages(), ["b"]);
+    assert_eq!(
+        land(branched.clone(), "unmapped", "unmapped#1", "unmapped-u").inactive_messages(),
+        ["b"]
+    );
     assert_eq!(branched.current(), Some("s2"));
     assert_eq!(branched.turns("s1").unwrap().len(), 2);
     assert_eq!(branched.turns("s2").unwrap().len(), 1);
@@ -143,6 +148,18 @@ fn rewind_keeps_the_old_path_and_nested_branches_share_only_the_explicit_prefix(
             backend_session: BackendSessionId::claude("bs3"),
         })
         .unwrap();
+    let mut inactive = empty.inactive_messages();
+    inactive.sort();
+    assert_eq!(inactive, ["a", "b"]);
+    assert!(
+        empty
+            .fold(&Event::Activate {
+                segment: "s1".into()
+            })
+            .unwrap()
+            .inactive_messages()
+            .is_empty()
+    );
     assert!(empty.common_prefix("s1", "s3").unwrap().is_empty());
     let topology = empty.topology();
     assert_eq!(

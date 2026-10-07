@@ -19,7 +19,6 @@
 | 历史分页、重启、只读 | `history_pages_are_read_only_ordered_and_resume_after_restart`；逐页升序、跨页不重、两轮提示齐全，重启仍可读，坏游标失败，无额外模型请求 |
 | 与简单投影一致 | `walking_pages_matches_the_simple_projection_and_cursors_survive_append`；137 条输入逐页结果与既有 `projection::project` 完全相同；追加不挪旧边界；拒绝跨会话游标和非法 limit |
 | 合轮、旁支、旧锚点 | `merged_prompts_share_one_mark_and_old_branch_cursors_cannot_jump_into_a_new_segment`；合轮一格、只排除明确非当前段、当前段既有提示仍可导航、切段使旧游标失效 |
-| 长正文 | `a_thousand_rounds_open_as_one_bounded_page_with_all_navigation_marks`；1000 轮、每轮长回答，冷快照只带 30 个提示和 30 个回答，完整 1000 轮预览，第 500 轮边界正确 |
 | 异步界面竞争 | `nd-view-model/tests/history.rs`；快速跳转、切会话、读取旧页时到来新输出、页回应晚于流式更新 |
 
 日志：`/mnt/wd_external/nd-build/tmp/ticket-20/logs/`。最终测试数量、提交与原生证据在本机实施记录 `research/impl/tickets/20.md` 的 verification 中记录。

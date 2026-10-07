@@ -1,4 +1,4 @@
-//! 纯投影接缝：规模、游标和导航均由公开显示历史接口观察。
+//! 纯投影接缝：小输入验证游标边界与谱系过滤；千轮规模由主接缝验证。
 use nd_session::history::History;
 use nd_wire::{Fallback, Item, PageReq};
 use serde_json::json;
@@ -63,10 +63,10 @@ fn item(id: &str, kind: &str, seq: u64, data: serde_json::Value) -> Item {
         },
     }
 }
-fn thousand() -> History {
+fn four_rounds() -> History {
     let mut history = History::new("session/long".into());
     let mut rounds = vec![];
-    for n in 1..=1000 {
+    for n in 1..=4 {
         history.insert(item(
             &format!("prompt/p{n}"),
             "prompt",
@@ -77,7 +77,7 @@ fn thousand() -> History {
             &format!("block/a{n}"),
             "text",
             n * 2 + 1,
-            json!({"text":"长回答".repeat(1000),"complete":true}),
+            json!({"text":"回答","complete":true}),
         ));
         rounds
             .push(json!({"id":format!("r{n}"),"n":n,"messages":[format!("p{n}")],"complete":true}));
@@ -91,37 +91,40 @@ fn thousand() -> History {
     history
 }
 #[test]
-fn a_thousand_rounds_open_as_one_bounded_page_with_all_navigation_marks() {
-    let history = thousand();
-    let snapshot = history.snapshot();
-    assert_eq!(snapshot.iter().filter(|i| i.kind == "text").count(), 30);
-    assert_eq!(snapshot.iter().filter(|i| i.kind == "prompt").count(), 30);
-    let nav = snapshot.iter().find(|i| i.kind == "navigation").unwrap();
-    assert_eq!(nav.data["rounds"].as_array().unwrap().len(), 1000);
-    assert_eq!(nav.data["rounds"][0]["preview"], "第 1 轮提示");
-    assert_eq!(nav.data["rounds"][999]["n"], 1000);
+fn around_and_after_pages_preserve_boundaries_at_the_first_and_last_round() {
+    let history = four_rounds();
     let page = history
         .page(&PageReq {
-            around: Some("r500".into()),
+            around: Some("r2".into()),
             limit: 2,
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(page.anchor.as_deref(), Some("prompt/p500"));
-    assert_eq!(
-        page.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
-        ["prompt/p500", "block/a500"]
-    );
-    assert!(page.next.is_some());
-    assert!(page.newer.is_some());
-    let next = history
+    assert_eq!(page.anchor.as_deref(), Some("prompt/p2"));
+    let after = history
         .page(&PageReq {
             after: page.newer,
             limit: 2,
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(next.items[0].id, "prompt/p501");
+    assert_eq!(after.items[0].id, "prompt/p3");
+    let first = history
+        .page(&PageReq {
+            around: Some("r1".into()),
+            limit: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(first.next.is_none());
+    let last = history
+        .page(&PageReq {
+            around: Some("r4".into()),
+            limit: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(last.newer.is_none());
 }
 
 #[test]
@@ -146,15 +149,82 @@ fn merged_prompts_share_one_mark_and_old_branch_cursors_cannot_jump_into_a_new_s
             json!({"text":text,"complete":true}),
         ));
     }
-    let rounds = json!([
-        {"id":"merged","n":1,"messages":["a","b"],"complete":true},
-        {"id":"last","n":2,"messages":["c"],"complete":true}
-    ]);
+    use nd_backend::BackendSessionId;
+    use nd_session::lineage::{BranchKind, Event, Lineage, NativePosition};
+    let mut lineage = Lineage::default()
+        .fold(&Event::Root {
+            segment: "old".into(),
+            carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs1"),
+        })
+        .unwrap();
+    for (id, key) in [("a", "merged"), ("b", "merged"), ("discarded", "discarded")] {
+        lineage = lineage
+            .fold(&Event::Landed {
+                message: id.into(),
+                ticket: id.into(),
+                position: NativePosition {
+                    carrier: "c1".into(),
+                    backend_session: BackendSessionId::claude("bs1"),
+                    native: id.into(),
+                },
+            })
+            .unwrap();
+        if id != "a" {
+            lineage = lineage
+                .fold(&Event::TurnObserved {
+                    carrier: "c1".into(),
+                    backend_session: BackendSessionId::claude("bs1"),
+                    key: key.into(),
+                    natives: if id == "b" {
+                        vec!["a".into(), "b".into()]
+                    } else {
+                        vec![id.into()]
+                    },
+                    complete: true,
+                    last_assistant: None,
+                })
+                .unwrap();
+        }
+    }
+    let merged = lineage.turns("old").unwrap()[0].id.clone();
+    lineage = lineage
+        .fold(&Event::Branch {
+            segment: "new".into(),
+            from: "old".into(),
+            through: Some(merged.clone()),
+            kind: BranchKind::Rewind,
+            carrier: "c2".into(),
+            backend_session: BackendSessionId::claude("bs2"),
+        })
+        .unwrap();
+    lineage = lineage
+        .fold(&Event::Landed {
+            message: "c".into(),
+            ticket: "c".into(),
+            position: NativePosition {
+                carrier: "c2".into(),
+                backend_session: BackendSessionId::claude("bs2"),
+                native: "c".into(),
+            },
+        })
+        .unwrap();
+    lineage = lineage
+        .fold(&Event::TurnObserved {
+            carrier: "c2".into(),
+            backend_session: BackendSessionId::claude("bs2"),
+            key: "last".into(),
+            natives: vec!["c".into()],
+            complete: true,
+            last_assistant: None,
+        })
+        .unwrap();
+    let rounds = serde_json::to_value(lineage.turns("new").unwrap()).unwrap();
     history.insert(item(
         "lineage",
         "lineage",
         1,
-        json!({"current":"new","rounds":rounds,"inactive_messages":["discarded"]}),
+        json!({"current":"new","rounds":rounds,"inactive_messages":lineage.inactive_messages()}),
     ));
     assert_eq!(
         history.navigation().data["rounds"]
@@ -165,7 +235,7 @@ fn merged_prompts_share_one_mark_and_old_branch_cursors_cannot_jump_into_a_new_s
     );
     let page = history
         .page(&PageReq {
-            around: Some("merged".into()),
+            around: Some(merged),
             limit: 4,
             ..Default::default()
         })
