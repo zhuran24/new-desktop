@@ -11,6 +11,63 @@ use std::{path::Path, time::Duration};
 const MODEL: &str = "claude-haiku-4-5";
 
 #[tokio::test]
+async fn backend_exit_ends_the_running_round_before_the_next_prompt_resumes() {
+    let fx = Fixture::start("round-backend-exit", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("round-exit", "/sandbox/project", "first").await;
+    fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
+    fx.scenario.endpoint().enqueue(
+        fx.main(),
+        ModelReply::streaming_text(&"unfinished".repeat(100), 1, 30),
+    );
+    fx.send("interrupted-round", &session, "second").await;
+    fx.scenario
+        .endpoint()
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(20))
+        .await
+        .unwrap();
+    let running = fx
+        .wait(&session, "running round", |s| {
+            lineage(s)["rounds"]
+                .as_array()
+                .is_some_and(|r| r.len() == 2)
+        })
+        .await;
+    let pid = cli_pid(&fx, &running).await;
+    signal(pid, rustix::process::Signal::KILL);
+    let exited = fx
+        .wait(&session, "backend exit observed", |s| {
+            header(s)["process"]["alive"] == false
+        })
+        .await;
+    assert_eq!(
+        lineage(&exited)["rounds"][1]["complete"],
+        true,
+        "a dead process cannot keep its round running"
+    );
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("resumed"));
+    fx.send("next-round", &session, "third").await;
+    let resumed = fx
+        .wait(&session, "resumed", |s| {
+            texts(s).contains(&"resumed".into()) && header(s)["process"]["turn_running"] == false
+        })
+        .await;
+    assert_eq!(lineage(&resumed)["rounds"].as_array().unwrap().len(), 3);
+    assert!(
+        lineage(&resumed)["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["complete"] == true)
+    );
+    fx.close();
+}
+
+#[tokio::test]
 async fn temporarily_unreachable_watchdog_during_recovery_keeps_the_backend_alive() {
     let fx = Fixture::start("recover-watchdog-link", 3_600_000).await;
     fx.scenario

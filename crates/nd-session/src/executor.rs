@@ -1431,6 +1431,14 @@ impl Executor {
                     if let Some(c) = self.core.carriers.get_mut(&batch.carrier)
                         && c.run.as_ref() == Some(&run)
                     {
+                        self.core.lineage = self
+                            .core
+                            .lineage
+                            .fold(&LineageEvent::CarrierExited {
+                                carrier: batch.carrier.clone(),
+                                backend_session: c.bs.clone(),
+                            })
+                            .map_err(aborted)?;
                         c.run = None;
                         c.alive = false;
                         c.turn_running = false;

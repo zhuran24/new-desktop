@@ -146,6 +146,11 @@ pub enum Event {
         ticket: Ticket,
         position: NativePosition,
     },
+    /// 进程已退出：该绑定上的进行中轮已结束，不代表成功产出。
+    CarrierExited {
+        carrier: CarrierId,
+        backend_session: BackendSessionId,
+    },
     /// 适配器确认的实际落点；key 是这一原生回合的稳定身份，不是消息或票。
     TurnObserved {
         carrier: CarrierId,
@@ -550,6 +555,20 @@ impl Lineage {
                     }
                 } else {
                     self.landings.push(landing);
+                }
+            }
+            Event::CarrierExited {
+                carrier,
+                backend_session,
+            } => {
+                for turn in self.turns.values_mut().filter(|turn| !turn.complete) {
+                    if turn
+                        .positions
+                        .iter()
+                        .any(|p| &p.carrier == carrier && &p.backend_session == backend_session)
+                    {
+                        turn.complete = true;
+                    }
                 }
             }
             Event::TurnObserved {
