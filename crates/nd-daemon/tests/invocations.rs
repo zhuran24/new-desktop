@@ -633,7 +633,27 @@ async fn a_prompt_the_cli_no_longer_holds_is_not_compacted_and_the_reason_is_sho
         header(s)["process"]["turn_running"] == false
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let run = header(&first)["process"]["run"].as_str().unwrap();
+    let recording = fx.root().join(format!("recordings/{run}.jsonl"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let complete = std::fs::read_to_string(&recording)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<nd_watchdog_proto::Record>(line).ok())
+                .any(|record| match record.event {
+                    nd_watchdog_proto::Event::Out { line } => serde_json::from_str::<Value>(&line)
+                        .is_ok_and(|v| v["type"] == "system" && v["subtype"] == "compact_boundary"),
+                    _ => false,
+                });
+            if complete {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real compact boundary must be observed before selecting an old anchor");
     let before = endpoint.requests().len();
     let draft_before = draft(&fx.peek(&session).await).clone();
     let reply = fx

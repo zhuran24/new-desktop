@@ -181,8 +181,7 @@ impl Harness {
         let survivor = adapter.reattach_detached();
         drop(adapter);
         drop(claims);
-        // 等旧实例真正放手（扫描线程、会话执行器线程退出）。
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Sessions 的执行器句柄和 Exclusivity 的析构都会 join 工作线程。
         let claims = open_claims(&dir, &store);
         for run in live.values() {
             claims

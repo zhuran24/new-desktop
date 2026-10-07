@@ -52,8 +52,6 @@ def inner():
         raise AssertionError('theme never rendered: ' + (out / f'{name}.jsonl').read_text()[-3000:])
 
     def click(app, name, control):
-        # 日志在 Render 开始时发出，命中坐标要等该帧完成绘制。
-        time.sleep(.1)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             for line in reversed((out / f'{name}.jsonl').read_text().splitlines()):
@@ -62,9 +60,21 @@ def inner():
                 except json.JSONDecodeError:
                     continue
                 if data and data['id'] == control:
-                    Path('/sandbox/controls.json').write_text(json.dumps({'nonce': time.monotonic_ns(), 'click': data['center']}))
-                    time.sleep(.15)
-                    return
+                    nonce = time.monotonic_ns()
+                    Path('/sandbox/controls.json').write_text(json.dumps({'nonce': nonce, 'click': data['center']}))
+                    while time.monotonic() < deadline:
+                        events = []
+                        for event_line in (out / f'{name}.jsonl').read_text().splitlines():
+                            try:
+                                events.append(json.loads(event_line))
+                            except json.JSONDecodeError:
+                                pass
+                        consumed = next((i for i, e in enumerate(events) if e.get('theme_input_consumed') == nonce), None)
+                        if consumed is not None and any('theme_control' in e for e in events[consumed + 1:]):
+                            return
+                        assert app.poll() is None
+                        time.sleep(.02)
+                    raise AssertionError(f'{control}: input nonce was not consumed and painted')
             time.sleep(.03)
         raise AssertionError('missing theme control: ' + control)
 

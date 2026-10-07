@@ -8,6 +8,41 @@ fn options(name: &str) -> ScenarioOptions {
     options
 }
 
+async fn records_until(
+    link: &mut nd_runs::WatchLink,
+    after: u64,
+    until: impl Fn(&[nd_watchdog_proto::Record]) -> bool,
+) -> Vec<nd_watchdog_proto::Record> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = link.read(after, 1000).await.unwrap();
+            if until(&rows) {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watchdog output condition must become observable")
+}
+async fn input_recorded(runs: &nd_runs::Watchdogs, run: &str) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runs
+                .records(run, 0, 100)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r.event, nd_watchdog_proto::Event::In { in_seq: 1, .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("input must reach the real pipe writer");
+}
+
 #[tokio::test]
 async fn daemon_restart_preserves_backend_identity_and_numbered_io() {
     let scenario = Scenario::start(options("watchdog")).await.unwrap();
@@ -18,8 +53,11 @@ async fn daemon_restart_preserves_backend_identity_and_numbered_io() {
     let mut link = runs.link("echo").await.unwrap();
     link.write(1, "hello").await.unwrap();
     link.write(1, "hello").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let before = link.read(0, 100).await.unwrap();
+    let before = records_until(&mut link, 0, |rows| {
+        rows.iter()
+            .any(|r| matches!(&r.event, nd_watchdog_proto::Event::Out { line } if line == "hello"))
+    })
+    .await;
     assert_eq!(
         before
             .iter()
@@ -38,16 +76,12 @@ async fn daemon_restart_preserves_backend_identity_and_numbered_io() {
     let mut link = runs.link("echo").await.unwrap();
     assert_eq!(link.read(0, 100).await.unwrap(), before);
     link.write(2, "still here").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        link.read(before.last().unwrap().end_seq, 100)
-            .await
-            .unwrap()
-            .iter()
-            .any(
-                |r| matches!(&r.event, nd_watchdog_proto::Event::Out{line} if line == "still here")
-            )
-    );
+    records_until(&mut link, before.last().unwrap().end_seq, |rows| {
+        rows.iter().any(
+            |r| matches!(&r.event, nd_watchdog_proto::Event::Out { line } if line == "still here"),
+        )
+    })
+    .await;
     scenario.close().unwrap();
 }
 
@@ -75,8 +109,11 @@ async fn soft_limit_marks_only_deltas_and_hard_limit_preserves_facts_in_overflow
         .await
         .unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let rows = link.read(0, 100).await.unwrap();
+    let rows = records_until(&mut link, 0, |rows| {
+        rows.iter()
+            .any(|r| matches!(&r.event, Event::Out { line } if line.contains("complete")))
+    })
+    .await;
     assert!(rows.iter().any(|r| matches!(
         r.event,
         Event::Gap {
@@ -123,8 +160,17 @@ async fn storage_failure_reports_lost_lines_and_never_claims_a_clean_tail() {
     let runs = scenario.watchdogs().unwrap();
     runs.launch("lost", spec).await.unwrap();
     let mut link = runs.link("lost").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let rows = link.read(0, 100).await.unwrap();
+    let rows = records_until(&mut link, 0, |rows| {
+        rows.iter().any(|r| {
+            matches!(
+                r.event,
+                Event::Gap {
+                    reason: GapReason::LostLines
+                }
+            )
+        })
+    })
+    .await;
     assert!(rows.iter().any(|r| matches!(
         r.event,
         Event::Gap {
@@ -151,8 +197,11 @@ async fn backend_exit_cleans_descendants_even_without_daemon_and_watchdog_never_
     let runs = scenario.watchdogs().unwrap();
     let launch = runs.launch("exit", spec.clone()).await.unwrap();
     let mut link = runs.link("exit").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let rows = link.read(0, 100).await.unwrap();
+    let rows = records_until(&mut link, 0, |rows| {
+        rows.iter()
+            .any(|r| matches!(r.event, nd_watchdog_proto::Event::Out { .. }))
+    })
+    .await;
     let descendant = rows
         .iter()
         .find_map(|r| match &r.event {
@@ -465,7 +514,7 @@ async fn new_controller_can_end_a_backend_while_old_input_pipe_is_blocked() {
         .unwrap();
     let mut old = runs.link("blocked").await.unwrap();
     let writing = tokio::spawn(async move { old.write(1, &"x".repeat(1024 * 1024)).await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    input_recorded(&runs, "blocked").await;
     let mut current = runs.link("blocked").await.unwrap();
     tokio::time::timeout(
         Duration::from_millis(500),
@@ -552,25 +601,28 @@ async fn watchdog_death_cleans_backend_and_cannot_replay_the_launch() {
 async fn cancelled_input_transfer_finishes_once_and_reconnect_deduplicates_its_sequence() {
     let scenario = Scenario::start(options("input-once")).await.unwrap();
     let runs = scenario.watchdogs().unwrap();
-    let spec=scenario.watchdog_spec("once","/usr/bin/python3",&["-u","-c","import time,sys; time.sleep(0.3)\nfor line in sys.stdin: print(len(line.strip()),flush=True)"]).unwrap();
+    let spec=scenario.watchdog_spec("once","/usr/bin/python3",&["-u","-c","import time,sys,pathlib\nwhile not pathlib.Path('/sandbox/read-once').exists(): time.sleep(.01)\nfor line in sys.stdin: print(len(line.strip()),flush=True)"]).unwrap();
     runs.launch("once", spec).await.unwrap();
     let mut old = runs.link("once").await.unwrap();
     let writing = tokio::spawn(async move { old.write(1, &"x".repeat(256 * 1024)).await });
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    input_recorded(&runs, "once").await;
     let mut current = runs.link("once").await.unwrap();
+    std::fs::write(scenario.root().join("read-once"), "").unwrap();
     current.write(1, &"x".repeat(256 * 1024)).await.unwrap();
     current.write(2, "marker").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let output = current
-        .read(0, 100)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|r| match r.event {
-            nd_watchdog_proto::Event::Out { line } => Some(line),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let output = records_until(&mut current, 0, |rows| {
+        rows.iter()
+            .filter(|r| matches!(r.event, nd_watchdog_proto::Event::Out { .. }))
+            .count()
+            >= 2
+    })
+    .await
+    .into_iter()
+    .filter_map(|r| match r.event {
+        nd_watchdog_proto::Event::Out { line } => Some(line),
+        _ => None,
+    })
+    .collect::<Vec<_>>();
     assert_eq!(output, vec!["262144", "6"]);
     let _ = writing.await;
     scenario.close().unwrap();
@@ -600,8 +652,17 @@ async fn failed_backend_spawn_reports_never_launched_with_no_live_identity() {
         .watchdog_spec("missing", "/no-such-backend", &[])
         .unwrap();
     assert!(runs.launch("missing", spec).await.is_err());
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let found = runs.recover().await.unwrap();
+    let found = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let found = runs.recover().await.unwrap();
+            if found[0].state.is_gone() {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(found[0].state.is_gone());
     assert_eq!(
         found[0].state,

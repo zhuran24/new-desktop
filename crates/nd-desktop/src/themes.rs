@@ -368,6 +368,7 @@ impl Desktop {
                                 px(position[0].as_f64().unwrap() as f32),
                                 px(position[1].as_f64().unwrap() as f32),
                             );
+                            let nonce = next["nonce"].clone();
                             window.defer(cx, move |window, cx| {
                                 window.dispatch_event(
                                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -395,6 +396,7 @@ impl Desktop {
                                     }),
                                     cx,
                                 );
+                                println!("{}", serde_json::json!({"theme_input_consumed":nonce}));
                             });
                         }
                     })

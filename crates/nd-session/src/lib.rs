@@ -195,6 +195,18 @@ fn list_item(core: &state::Core) -> Item {
 struct Handle {
     inputs: mpsc::Sender<Input>,
     shared: Arc<Shared>,
+    stop: Option<oneshot::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// 订阅一个会话流：开头（快照或续上的事件），之后的事件；丢掉它就不再算「有人在看」。
@@ -346,18 +358,37 @@ impl Sessions {
         let deps = self.deps.clone();
         let session = id.clone();
         let thread_shared = shared.clone();
-        std::thread::Builder::new()
+        let (stop, stopped) = oneshot::channel();
+        let worker = std::thread::Builder::new()
             .name(format!("nd-session-{}", &id.0[..id.0.len().min(10)]))
-            .spawn(move || run_executor(session, deps, thread_shared, batches, rx, batch_rx, ready))
+            .spawn(move || {
+                run_executor(
+                    session,
+                    deps,
+                    thread_shared,
+                    batches,
+                    rx,
+                    batch_rx,
+                    ready,
+                    stopped,
+                )
+            })
             .map_err(nd_store::Error::Io)?;
         let born = born
             .recv()
             .map_err(|_| nd_store::Error::Aborted("session executor did not start".into()))??;
         if !born && !allow_unborn {
             drop(inputs);
+            drop(stop);
+            let _ = worker.join();
             return Ok(None);
         }
-        let handle = Arc::new(Handle { inputs, shared });
+        let handle = Arc::new(Handle {
+            inputs,
+            shared,
+            stop: Some(stop),
+            worker: Some(worker),
+        });
         executors.insert(id.clone(), handle.clone());
         Ok(Some(handle))
     }
@@ -534,6 +565,7 @@ fn run_executor(
     mut inputs: mpsc::Receiver<Input>,
     mut batch_rx: mpsc::Receiver<nd_backend::Batch>,
     ready: std::sync::mpsc::SyncSender<nd_store::Result<bool>>,
+    mut stopped: oneshot::Receiver<()>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -563,6 +595,7 @@ fn run_executor(
                 }
             }
             let input = tokio::select! {
+                _ = &mut stopped => return,
                 input = inputs.recv() => match input {
                     Some(input) => input,
                     None => return,
