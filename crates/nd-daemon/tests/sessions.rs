@@ -1497,21 +1497,40 @@ async fn draft_native_windows_save_reopen_follow_and_recover() {
     let output = std::env::var_os("ND_NATIVE_DRAFT_OUTPUT")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| fx.scenario.root().join("native-drafts"));
-    let result = tokio::process::Command::new("python")
+    let child = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
         .args([
             "--desktop",
             &std::env::var("ND_TEST_DESKTOP").expect("build scenarios desktop"),
         ])
+        .arg("--daemon-outage")
         .arg("--socket")
         .arg(fx.socket())
         .arg("--session")
         .arg(&session)
         .arg("--output")
         .arg(&output)
-        .output()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .unwrap();
+    for (marker, stop) in [("stop-daemon", true), ("start-daemon", false)] {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !output.join(marker).exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native window must reach the daemon outage gate");
+        if stop {
+            fx.scenario.stop_daemon().unwrap();
+            std::fs::write(output.join("edit-during-outage"), "").unwrap();
+        } else {
+            fx.scenario.start_daemon().unwrap();
+        }
+    }
+    let result = child.wait_with_output().await.unwrap();
     assert!(
         result.status.success(),
         "{}\n{}",

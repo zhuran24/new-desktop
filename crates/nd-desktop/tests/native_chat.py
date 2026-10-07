@@ -242,7 +242,17 @@ def inner():
             wait('draft-reopened', lambda s: s['text'] == '可找回的落败稿' and s['saved'])
             app.terminate()
             app.wait(timeout=5)
-            app = start('draft-send', draft={'text': '原生发送清稿', 'send': True}, device='b')
+            if settings.get('daemon_outage'):
+                app = start('draft-send', draft={'text': '原生发送清稿',
+                            'edit_gate': '/sandbox/out/edit-during-outage', 'send_when_saved': True}, device='b')
+                wait('draft-send', lambda s: s['text'] == '可找回的落败稿' and s['saved'])
+                (out / 'stop-daemon').touch()
+                settings['watch'] = 'rendered_notice'
+                wait('draft-send', lambda s: '草稿保存未确认' in (s.get('warning') or ''))
+                settings.pop('watch')
+                (out / 'start-daemon').touch()
+            else:
+                app = start('draft-send', draft={'text': '原生发送清稿', 'send': True}, device='b')
             # 输入、保存和受理可能在一次绘制前完成；不要求中间正文单独占一帧。
             # 首帧未加载时 saved=false，已加载的原稿非空，因此这个空稿只能来自受理清稿。
             wait('draft-send', lambda s: s['text'] == '' and s['saved'], timeout=10)
@@ -346,7 +356,7 @@ def run(args, script=None):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings and not invoke, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'themes': themes, 'invoke': invoke, 'expect': expect}, ensure_ascii=False))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings and not invoke, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'themes': themes, 'invoke': invoke, 'expect': expect, 'daemon_outage': getattr(args, 'daemon_outage', False)}, ensure_ascii=False))
         if themes:
             shutil.copy(Path(__file__).parents[2] / 'nd-view-model/tests/fixtures/ocean.json', work / 'ocean.json')
         if args.attachments:
@@ -391,6 +401,7 @@ if __name__ == '__main__':
         inner()
     else:
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument('--daemon-outage', action='store_true', help='coordinate daemon outage through files in the output directory')
         parser.add_argument('--desktop', required=True)
         parser.add_argument('--socket', required=True)
         parser.add_argument('--output', required=True)

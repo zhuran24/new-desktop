@@ -152,6 +152,7 @@ pub struct Scenario {
     disk: Option<tempfile::TempDir>,
     slice: String,
     services: Vec<String>,
+    daemon_args: Vec<String>,
     timeout: Duration,
     endpoint: Option<ClaudeEndpoint>,
     watchdog_config: Option<nd_runs::Config>,
@@ -239,6 +240,7 @@ impl Scenario {
             },
             slice,
             services: vec![unit],
+            daemon_args: Vec::new(),
             timeout: options.timeout,
             endpoint: None,
             watchdog_config: None,
@@ -357,6 +359,7 @@ impl Scenario {
             "systemd-run",
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )?;
+        this.daemon_args = args;
         this.connect().await?;
         Ok(this)
     }
@@ -660,6 +663,21 @@ impl Scenario {
             .cloned()
             .chain([self.slice.clone()])
             .collect()
+    }
+    pub fn stop_daemon(&self) -> Result<()> {
+        checked("systemctl", &["--user", "stop", &self.services[0]])?;
+        Ok(())
+    }
+    pub fn start_daemon(&self) -> Result<()> {
+        checked(
+            "systemd-run",
+            &self
+                .daemon_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(())
     }
     pub fn restart_daemon(&self) -> Result<()> {
         checked("systemctl", &["--user", "restart", &self.services[0]])?;

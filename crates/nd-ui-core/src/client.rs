@@ -193,9 +193,9 @@ impl CommandClient {
         self.tx
             .try_send(Work::Command(command, done))
             .map_err(|_| "命令队列已满或连接已关闭；未发送".to_owned())?;
-        result
-            .await
-            .map_err(|_| "命令连接已关闭；交付不明".to_owned())?
+        // After enqueueing, loss of the worker is uncertain. Err is reserved
+        // for failures proven to happen before any command was sent.
+        result.await.unwrap_or(Ok(CommandReply::DeliveryUnknown))
     }
     /// 收据等动作有结果的命令（`!`、总结、`/subtask`）：最多等 [`DELIVERY_WAIT`]，
     /// 等的时候别的命令照常走。到时限没回应只查收据，不重发正文。

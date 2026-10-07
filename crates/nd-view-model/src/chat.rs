@@ -453,10 +453,20 @@ impl Draft {
         self.send_unconfirmed = true;
     }
     pub fn retry_save(&mut self) {
+        if self.save_unconfirmed {
+            self.save_rejected();
+        }
         if self.send_unconfirmed {
             self.send_unconfirmed = false;
             self.dirty = true;
         }
+    }
+    /// A final rejection or missing receipt ends this attempt, not the local edit.
+    /// Retain the original version so a late old save causes a conflict copy.
+    pub fn save_rejected(&mut self) {
+        self.pending = None;
+        self.save_unconfirmed = false;
+        self.dirty = true;
     }
     /// 只读副本更新不能盖掉本地未持久化的编辑或组词。
     pub fn observe(&mut self, remote: nd_wire::Draft, composing: bool) {
