@@ -2725,6 +2725,10 @@ async fn streaming_survives_kill_and_service_restart_with_a_checkpoint_mid_block
         })
         .await
         .unwrap();
+        assert!(
+            fx.scenario.root().join("runtime/runs").is_dir(),
+            "daemon restart must preserve watchdog runtime files"
+        );
         let text = resumed
             .items
             .iter()

@@ -54,6 +54,8 @@ tick_ms = 1000                    # 闲置检查间隔
 
 `claude`、`watchdogs` 两节在启动时读，改了要重启守护进程才生效。启动次序：独占登记进入恢复中 → 看守托管报每个还在的后端进程的身份 → 名册装载有活进程或未完操作的会话、适配器接回（续读流水、对账未结的票）→ 独占登记身份已知、第一次扫描完成 → 放行；放行之前起操作的命令照常受理，操作等着。
 
+服务单元用 `RuntimeDirectoryPreserve=yes` 保留运行目录：停止、重启和崩溃重启都不删除看守的 socket、身份与流水。更新已安装的服务文件后须执行 `systemctl --user daemon-reload`；只有全部看守和后端进程都退出后才能手动清理该目录。
+
 ```bash
 ndctl new --cwd ~/proj --model claude-haiku-4-5 --follow "你好"
 ndctl send <会话 id> --follow "接着说"

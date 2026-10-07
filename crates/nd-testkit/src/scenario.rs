@@ -202,7 +202,12 @@ impl Scenario {
             );
         }
         let daemon = options.daemon.canonicalize()?;
-        let dir = tempfile::Builder::new().prefix("nd-test-").tempdir()?;
+        // systemd must own the same runtime directory as the packaged service.
+        // A unique parent keeps each scenario away from the owner's instance.
+        let runtime = PathBuf::from(format!("/run/user/{}", rustix::process::geteuid().as_raw()));
+        let dir = tempfile::Builder::new()
+            .prefix("nd-test-")
+            .tempdir_in(runtime)?;
         for name in [
             "home", "claude", "config", "data", "state", "cache", "runtime", "project", "out",
             "fifos", "programs",
@@ -380,6 +385,21 @@ impl Scenario {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         if restart {
+            for property in include_str!("../../../packaging/systemd/nd-daemon.service").lines() {
+                if let Some((key, value)) = property.split_once('=') {
+                    if key == "RuntimeDirectory" {
+                        args.extend([
+                            "-p".into(),
+                            format!(
+                                "RuntimeDirectory={}/runtime",
+                                self.root().file_name().unwrap().to_string_lossy()
+                            ),
+                        ]);
+                    } else if matches!(key, "RuntimeDirectoryMode" | "RuntimeDirectoryPreserve") {
+                        args.extend(["-p".into(), format!("{key}={value}")]);
+                    }
+                }
+            }
             args.extend(
                 [
                     "-p",
