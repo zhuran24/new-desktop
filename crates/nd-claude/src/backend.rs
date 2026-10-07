@@ -837,19 +837,35 @@ impl Inner {
                 _ => None,
             })
             .collect();
-        let found = self.inspect(&run).await;
         let caps: Option<Caps> = serde_json::from_value(record.adopt.clone()).ok();
         let bs = record.bs.as_ref().map(|b| b.id.clone()).unwrap_or_default();
-        let adopted = match (&found, caps.clone()) {
-            (Some(f), Some(caps)) if f.state == "Up" => {
-                self.claude.adopt(&run.0, &bs, caps).await.ok()
+        let mut delay = Duration::from_millis(50);
+        let adopted = loop {
+            match self.inspect(&run).await {
+                Some(found) if found.state == "Gone" => {
+                    self.observe_found(found).await;
+                    break None;
+                }
+                Some(found) if found.state == "Up" => {
+                    if let Some(caps) = caps.clone()
+                        && let Ok(adopted) = self.claude.adopt(&run.0, &bs, caps).await
+                    {
+                        self.observe_found(found).await;
+                        break Some(adopted);
+                    }
+                }
+                _ => {}
             }
-            _ => None,
+            // A missing or temporarily unreachable control socket is not death
+            // evidence. Keep the carrier and its obligations while refusing writes.
+            self.observe(Observed::IdentityMismatch { run: run.0.clone() })
+                .await;
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
         };
         let mut facts = vec![];
         let Some(mut claude_run) = adopted else {
             // 看守已消失时不能从“不在剩余流水里”推导没写出。
-            self.settle_gone(&run, true).await;
             for ticket in sends.values() {
                 facts.push(done(
                     ticket,

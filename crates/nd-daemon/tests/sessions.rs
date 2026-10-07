@@ -11,6 +11,70 @@ use std::{path::Path, time::Duration};
 const MODEL: &str = "claude-haiku-4-5";
 
 #[tokio::test]
+async fn temporarily_unreachable_watchdog_during_recovery_keeps_the_backend_alive() {
+    let fx = Fixture::start("recover-watchdog-link", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("link-recover", "/sandbox/project", "first").await;
+    let before = fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
+    let pid = cli_pid(&fx, &before).await;
+    let run = header(&before)["process"]["run"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let path = fx
+        .scenario
+        .watchdogs()
+        .unwrap()
+        .directory(&run)
+        .unwrap()
+        .join("watchdog.sock");
+    let parked = path.with_extension("parked");
+    std::fs::rename(&path, &parked).unwrap();
+    fx.scenario.restart_daemon().unwrap();
+    let during = fx.peek(&session).await;
+    assert_ne!(before.epoch, during.epoch);
+    std::fs::rename(parked, path).unwrap();
+    let recovered = fx
+        .wait(&session, "original backend recovered", |s| {
+            header(s)["recovering"] == false && header(s)["process"]["alive"] == true
+        })
+        .await;
+    assert_eq!(cli_pid(&fx, &recovered).await, pid);
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("still here"));
+    fx.send("after-relink", &session, "continue").await;
+    let after = fx
+        .wait(&session, "continued", |s| {
+            texts(s) == ["ready", "still here"]
+        })
+        .await;
+    assert_eq!(cli_pid(&fx, &after).await, pid);
+    let config_path = fx.scenario.root().join("config.toml");
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["watchdogs"]["memory_max"] = toml::Value::Integer(3 * 1024 * 1024 * 1024);
+    std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    let mut ui = fx.ui().await;
+    let mut global = ui.subscribe("global").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !global.items.iter().any(|i| {
+            i.data["config_error"]
+                .as_str()
+                .is_some_and(|s| s.contains("须重启"))
+        }) {
+            global = ui.next().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(cli_pid(&fx, &fx.peek(&session).await).await, pid);
+    fx.close();
+}
+
+#[tokio::test]
 async fn an_uncertain_unwritten_interrupt_is_clarified_without_executing_it() {
     let fx = Fixture::start("nd18-unknown-control", 3_600_000).await;
     let endpoint = fx.scenario.endpoint();

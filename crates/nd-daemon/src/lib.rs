@@ -165,7 +165,7 @@ fn validate_config(value: &Value) -> nd_config::Result<()> {
 }
 struct Engine {
     sessions: Arc<nd_session::Sessions>,
-    runs: Option<nd_runs::Watchdogs>,
+    runs: Option<Arc<nd_runs::Watchdogs>>,
     runs_config: Option<nd_runs::Config>,
     blobs: Arc<nd_store::Blobs>,
     store: Arc<nd_store::Store>,
@@ -187,6 +187,7 @@ impl Engine {
         blobs: Arc<nd_store::Blobs>,
         store: Arc<nd_store::Store>,
         sessions: Arc<nd_session::Sessions>,
+        runs: Option<Arc<nd_runs::Watchdogs>>,
         _root: &Path,
     ) -> Result<Self> {
         store.write(|tx| {
@@ -235,8 +236,8 @@ impl Engine {
         let (events, _) = broadcast::channel(128);
         let mut this = Self {
             sessions,
-            runs: None,
-            runs_config: None,
+            runs,
+            runs_config: serde_json::from_value(config.snapshot().value["watchdogs"].clone())?,
             blobs,
             store,
             config: config.clone(),
@@ -264,12 +265,7 @@ impl Engine {
         let next: Option<nd_runs::Config> =
             serde_json::from_value(config.snapshot().value["watchdogs"].clone())?;
         if next != self.runs_config {
-            let runs = next.clone().map(nd_runs::Watchdogs::new).transpose()?;
-            if let Some(runs) = &runs {
-                runs.recover().await?;
-            }
-            self.runs = runs;
-            self.runs_config = next;
+            return Err("看守配置已变化，须重启守护进程才能生效".into());
         }
         let section = config.section::<DiagnosticsConfig>()?.get()?;
         self.kernel
@@ -462,12 +458,16 @@ impl Paths {
 }
 /// 组装会话组件，次序照恢复的依赖：独占登记（恢复中）→ 看守托管报身份 → 适配器与名册装载会话、
 /// 对账 → 独占登记身份已知、第一次扫描完成 → 放行。会话的命令在放行之前起操作会等着。
+struct SessionAssembly {
+    sessions: Arc<nd_session::Sessions>,
+    runs: Option<Arc<nd_runs::Watchdogs>>,
+}
 async fn assemble_sessions(
     config: &Config,
     store: &Arc<nd_store::Store>,
     blobs: &Arc<nd_store::Blobs>,
     paths: &Paths,
-) -> Result<Arc<nd_session::Sessions>> {
+) -> Result<SessionAssembly> {
     let value = config.snapshot().value;
     let watchdogs_config: Option<nd_runs::Config> =
         serde_json::from_value(value["watchdogs"].clone())?;
@@ -494,8 +494,11 @@ async fn assemble_sessions(
         .unwrap_or_default()
         .as_millis() as u64;
     let mut backends = nd_backend::Backends::new();
-    if let Some(watchdogs_config) = watchdogs_config {
-        let watchdogs = Arc::new(nd_runs::Watchdogs::new(watchdogs_config)?);
+    let runs = watchdogs_config
+        .map(nd_runs::Watchdogs::new)
+        .transpose()?
+        .map(Arc::new);
+    if let Some(watchdogs) = &runs {
         // 看守托管先报每个还在的后端进程的身份。
         for found in watchdogs.recover().await? {
             let claims = claims.clone();
@@ -526,7 +529,7 @@ async fn assemble_sessions(
             let record = claude.record;
             let adapter = nd_claude::ClaudeBackend::new(
                 nd_claude::Claude::new(cfg, watchdogs.clone())?,
-                watchdogs,
+                watchdogs.clone(),
                 claims.clone(),
                 generation,
                 blobs.clone(),
@@ -569,7 +572,7 @@ async fn assemble_sessions(
         })
         .await;
     });
-    Ok(sessions)
+    Ok(SessionAssembly { sessions, runs })
 }
 
 pub async fn run(root: &Path) -> Result<()> {
@@ -598,13 +601,15 @@ pub async fn run_at(paths: Paths) -> Result<()> {
         paths.data.join("blobs"),
         store.clone(),
     )?);
-    let sessions = assemble_sessions(&config, &store, &blobs, &paths).await?;
+    let SessionAssembly { sessions, runs } =
+        assemble_sessions(&config, &store, &blobs, &paths).await?;
     let state = Arc::new(Mutex::new(
         Engine::open(
             config.clone(),
             blobs.clone(),
             store.clone(),
             sessions.clone(),
+            runs,
             &paths.data,
         )
         .await?,
