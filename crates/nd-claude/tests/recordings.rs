@@ -158,3 +158,85 @@ fn a_resendable_command_lost_with_a_reloaded_mod_is_resent_under_the_same_op_id(
         }]
     );
 }
+
+/// 真 CLI 录下的 `!`、总结（定位不到）、fork 型子代理的往返：重放事实一致；三种命令都不可重发；
+/// mod 的结论按适配器的规则解释出各自的结果。
+#[test]
+fn recorded_invocations_replay_and_none_of_them_is_resendable() {
+    use nd_backend::{
+        Anchor, CompactScope, Done, Invocation, Invoked, Outcome as PortOutcome, Refusal,
+    };
+    let (meta, session, records) = fixture::read_fixture(&recorded("invocations.jsonl")).unwrap();
+    assert_eq!(meta.scenario, "invocations");
+    let replayed = fixture::replay(&session, &records);
+    for (record, facts) in records.iter().zip(&replayed) {
+        assert_eq!(&record.facts, facts, "record {}", record.seq);
+    }
+    let facts: Vec<&Fact> = replayed.iter().flatten().collect();
+    for op in ["op-shell", "op-compact", "op-fork"] {
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                Fact::Sent { op_id, resend: nd_mod_proto::Resend::NotResendable, .. } if op_id == op
+            )),
+            "{op} must be sent as not resendable"
+        );
+    }
+    let finished = |op: &str| {
+        facts
+            .iter()
+            .find_map(|f| match f {
+                Fact::Finished { op_id, outcome, .. } if op_id == op => {
+                    Some(nd_claude::CommandResult::Outcome(outcome.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{op} finished"))
+    };
+    let shell = Invocation::Shell {
+        command: "echo RECORDED_BANG; export X=1".into(),
+    };
+    let PortOutcome::Ok {
+        done:
+            Done::Invoked {
+                result:
+                    Invoked::Shell {
+                        exit,
+                        stdout,
+                        appended,
+                        ..
+                    },
+            },
+    } = nd_claude::invoke::outcome(&shell, Some(&finished("op-shell")))
+    else {
+        panic!("shell outcome");
+    };
+    assert_eq!((exit, appended), (Some(0), true));
+    assert!(stdout.contains("RECORDED_BANG"));
+    let compact = Invocation::Compact {
+        scope: CompactScope::From,
+        anchor: Anchor {
+            text: "NOT_IN_THE_CONVERSATION".into(),
+            attachments: vec![],
+            nth: 1,
+            of: 1,
+        },
+    };
+    assert!(matches!(
+        nd_claude::invoke::outcome(&compact, Some(&finished("op-compact"))),
+        PortOutcome::Refused {
+            refusal: Refusal::AnchorGone { .. }
+        }
+    ));
+    let fork = Invocation::ForkAgent {
+        prompt: "RECORDED_FORK".into(),
+    };
+    assert!(matches!(
+        nd_claude::invoke::outcome(&fork, Some(&finished("op-fork"))),
+        PortOutcome::Ok {
+            done: Done::Invoked {
+                result: Invoked::Forked { .. }
+            }
+        }
+    ));
+}
