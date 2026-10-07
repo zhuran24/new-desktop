@@ -1,5 +1,5 @@
 use nd_view_model::{HistoryView, conversation};
-use nd_wire::{Fallback, Item, Page, PageReq, Snapshot};
+use nd_wire::{Fallback, Item, Page, Snapshot};
 use serde_json::json;
 fn snapshot(stream: &str, segment: &str) -> Snapshot {
     Snapshot {
@@ -88,7 +88,6 @@ fn navigation_loads_a_missing_round_and_ignores_late_pages_after_switching_sessi
         "最新"
     );
     assert_eq!(view.older(), Some("cursor".into()));
-    let _ = PageReq::default();
 }
 
 #[test]

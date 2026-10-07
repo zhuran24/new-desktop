@@ -104,13 +104,6 @@ impl Blobs {
         tx.execute("UPDATE nd_blobs SET unused_since=COALESCE(unused_since,unixepoch()) WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM nd_blob_refs WHERE blob=?1)", [id])?;
         Ok(())
     }
-    pub fn references(&self, id: &str) -> Result<u64> {
-        Ok(self.store.read()?.query_row(
-            "SELECT count(*) FROM nd_blob_refs WHERE blob=?1",
-            [id],
-            |r| r.get(0),
-        )?)
-    }
     /// 标记删除和引用检查在同一事务里；文件删除在事务外，可在崩溃后重试。
     pub fn collect(&self, grace: std::time::Duration) -> Result<usize> {
         let _io = self.store.blob_io.lock().unwrap();

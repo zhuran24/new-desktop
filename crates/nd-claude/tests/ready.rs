@@ -94,7 +94,10 @@ fn skills_mod(root: &std::path::Path, name: &str) {
 async fn backend_gets_the_spec_template_without_preload_and_with_the_four_old_mods_disabled() {
     let fx = Fixture::start("claude-template").await;
     let root = fx.scenario.root().to_owned();
-    for name in nd_claude::OLD_MODS.iter().chain(&["keep-me", "owner-off"]) {
+    for name in ["codex-direct", "sendnow", "cc-quota", "ultracode-toggle"]
+        .iter()
+        .chain(&["keep-me", "owner-off"])
+    {
         skills_mod(&root, name);
     }
     // owner 自己在用户设置里关掉的 mod 仍然关着：flag 层的 enabledPlugins 按键合并，不整体覆盖。
@@ -200,7 +203,10 @@ async fn backend_gets_the_spec_template_without_preload_and_with_the_four_old_mo
     })
     .await
     .expect("an unrelated skills-dir mod still loads");
-    for name in nd_claude::OLD_MODS.iter().chain(&["owner-off"]) {
+    for name in ["codex-direct", "sendnow", "cc-quota", "ultracode-toggle"]
+        .iter()
+        .chain(&["owner-off"])
+    {
         assert!(!loaded(name), "{name} loaded");
     }
     drop(run);
