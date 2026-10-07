@@ -3959,6 +3959,13 @@ async fn settings_are_read_on_open_and_permissions_and_effort_survive_reclaim() 
         .await;
     assert_eq!(header(&first)["caps"]["model"], true);
     assert_eq!(header(&first)["caps"]["ultracode"], false);
+    assert!(
+        !header(&first)["settings"]["permission_modes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("bypassPermissions")),
+        "a process without launch authorization must not offer bypassPermissions"
+    );
     let denied = fx
         .command(
             "ultra-denied",

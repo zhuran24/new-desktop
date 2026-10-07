@@ -2391,7 +2391,6 @@ fn settings_with_caps(settings: Value) -> nd_wire::LiveSettings {
         ("plan", "计划"),
         ("dontAsk", "不询问"),
         ("auto", "自动"),
-        ("bypassPermissions", "跳过审批"),
     ];
     nd_wire::LiveSettings {
         applied: nd_wire::EffectiveSettings {
