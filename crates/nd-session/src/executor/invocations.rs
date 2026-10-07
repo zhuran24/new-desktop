@@ -102,10 +102,12 @@ impl Executor {
             restore,
             draft_base: self.core.draft.version,
             covers,
-            ticket: None,
-            attempt: 0,
-            waiting: None,
-            arrival: 0,
+            queue: state::QueueState {
+                ticket: None,
+                attempt: 0,
+                waiting: None,
+                arrival: 0,
+            },
         };
         if matches!(invoke.invocation, Invocation::Compact { .. })
             && self
@@ -120,7 +122,7 @@ impl Executor {
             )));
         }
         self.core.arrivals += 1;
-        invoke.arrival = self.core.arrivals;
+        invoke.queue.arrival = self.core.arrivals;
         // `!` 和 /subtask 从输入框发出：输入框原文（`input`）等于当前稿且版本对得上，就同事务清稿。
         if let Some(input) = input.as_deref()
             && self.consume_draft_if_matches(tx, command, input, &[])?
@@ -223,126 +225,6 @@ impl Executor {
             attachments,
             covers,
         ))
-    }
-
-    /// 发送台的另一半：按到达次序签发等着的总结、`!` 命令和 fork 型子代理。
-    /// 结构操作中、没有当前承载位时代持；当前承载位没有活进程就起按需拉起；`!` 等当前回合结束再跑。
-    pub(super) fn pump_invokes(
-        &mut self,
-        tx: &mut Tx<'_>,
-        fx: &mut Effects,
-    ) -> nd_store::Result<bool> {
-        let mut queued: Vec<Invoke> = self
-            .core
-            .invokes
-            .values()
-            .filter(|i| i.ticket.is_none())
-            .cloned()
-            .collect();
-        if queued.is_empty() {
-            return Ok(false);
-        }
-        queued.sort_by_key(|i| i.arrival);
-        let mut progress = false;
-        for invoke in queued {
-            let structural = !self.core.ops.is_empty();
-            let current = self.core.current_carrier().cloned();
-            let Some(carrier) = current.filter(|_| !structural) else {
-                self.show_invoke(tx, fx, &invoke, "held", None)?;
-                continue;
-            };
-            if !carrier.alive {
-                self.show_invoke(tx, fx, &invoke, "held", None)?;
-                self.start_op(
-                    tx,
-                    fx,
-                    OpSpec::Launch(Launch {
-                        carrier: carrier.id.clone(),
-                    }),
-                    None,
-                )?;
-                return Ok(true);
-            }
-            if let Some(why) = carrier.unavailable(invoke.feature()) {
-                self.finish_invoke(
-                    tx,
-                    fx,
-                    &invoke.id,
-                    Outcome::Rejected {
-                        reject: nd_backend::Reject::Unsupported { why },
-                    },
-                )?;
-                progress = true;
-                continue;
-            }
-            if matches!(invoke.invocation, Invocation::Shell { .. }) && carrier.turn_running {
-                // 和终端一样：回合进行中输入的 `!` 等这一回合结束再跑。
-                self.show_invoke(tx, fx, &invoke, "waiting_turn", None)?;
-                continue;
-            }
-            let ticket = Ticket(format!("i:{}#{}", invoke.id, invoke.attempt));
-            match self.deps.claims.admit(
-                tx,
-                &ticket.0,
-                &nd_claims::Act::Write {
-                    session: self.id.0.clone(),
-                    bs: carrier.bs.clone(),
-                },
-            )? {
-                nd_claims::Admit::Go(nd_claims::Pass {
-                    route: nd_claims::Route::Live(run),
-                }) if carrier.run.as_ref().is_some_and(|r| r.0 == run) => {
-                    let row = OutRow {
-                        issued: Issued {
-                            ticket: ticket.clone(),
-                            session: self.id.clone(),
-                            write_gen: self.write_gen,
-                        },
-                        act: Act::Invoke {
-                            to: carrier.id.clone(),
-                            invocation: invoke.invocation.clone(),
-                        },
-                        kind: carrier.kind.clone(),
-                        issuer: Issuer::Invoke {
-                            id: invoke.id.clone(),
-                        },
-                        display: None,
-                        outcome: None,
-                        handed: false,
-                    };
-                    self.core.outbox.insert(ticket.clone(), row);
-                    if let Some(i) = self.core.invokes.get_mut(&invoke.id) {
-                        i.ticket = Some(ticket.clone());
-                        i.waiting = None;
-                    }
-                    fx.hand.push(ticket);
-                    self.show_invoke(tx, fx, &invoke, "pending", None)?;
-                    progress = true;
-                }
-                nd_claims::Admit::Go(_) => self.show_invoke(tx, fx, &invoke, "held", None)?,
-                nd_claims::Admit::Wait(obstacle) => {
-                    let why = format!("{obstacle:?}");
-                    if let Some(i) = self.core.invokes.get_mut(&invoke.id) {
-                        i.waiting = Some(why.clone());
-                    }
-                    self.show_invoke(tx, fx, &invoke, "waiting", Some(why))?;
-                }
-                nd_claims::Admit::No(refusal) => {
-                    self.finish_invoke(
-                        tx,
-                        fx,
-                        &invoke.id,
-                        Outcome::Refused {
-                            refusal: Refusal::Other {
-                                why: format!("独占登记不放行：{refusal:?}"),
-                            },
-                        },
-                    )?;
-                    progress = true;
-                }
-            }
-        }
-        Ok(progress)
     }
 
     pub(super) fn show_invoke(

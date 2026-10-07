@@ -302,8 +302,12 @@ impl Executor {
         if let Input::Kick = input
             && self.recovering.is_empty()
             && self.core.ops.is_empty()
-            && self.core.messages.values().all(|m| m.ticket.is_some())
-            && self.core.invokes.values().all(|i| i.ticket.is_some())
+            && self
+                .core
+                .messages
+                .values()
+                .all(|m| m.queue.ticket.is_some())
+            && self.core.invokes.values().all(|i| i.queue.ticket.is_some())
             && self
                 .projection
                 .items()
@@ -441,18 +445,14 @@ impl Executor {
             self.core
                 .outbox
                 .get(ticket)
-                .map(|row| {
-                    if matches!(row.act, Act::Send { .. }) {
-                        let arrival = match &row.issuer {
-                            Issuer::Message { id, .. } => {
-                                self.core.messages.get(id).map_or(0, |m| m.arrival)
-                            }
-                            _ => 0,
-                        };
-                        (1, arrival)
-                    } else {
-                        (0, 0)
+                .map(|row| match &row.issuer {
+                    Issuer::Message { id, .. } => {
+                        (1, self.core.messages.get(id).map_or(0, |m| m.queue.arrival))
                     }
+                    Issuer::Invoke { id } => {
+                        (1, self.core.invokes.get(id).map_or(0, |i| i.queue.arrival))
+                    }
+                    _ => (0, 0),
                 })
                 .unwrap_or((0, 0))
         });
@@ -683,7 +683,6 @@ impl Executor {
                 progress |= self.advance(tx, fx, &id)?;
             }
             progress |= self.pump(tx, fx)?;
-            progress |= self.pump_invokes(tx, fx)?;
             if !progress {
                 return Ok(());
             }

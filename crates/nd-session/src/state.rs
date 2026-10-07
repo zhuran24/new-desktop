@@ -203,6 +203,25 @@ pub struct DraftRestore {
     pub device: String,
 }
 
+/// 发送台共同的签票状态；平铺序列化，兼容既有持久核心。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueState {
+    pub ticket: Option<Ticket>,
+    pub attempt: u32,
+    pub waiting: Option<String>,
+    pub arrival: u64,
+}
+impl QueueState {
+    pub fn retry(&mut self) {
+        self.ticket = None;
+        self.attempt += 1;
+    }
+    pub fn sent(&mut self, ticket: Ticket) {
+        self.ticket = Some(ticket);
+        self.waiting = None;
+    }
+}
+
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -212,10 +231,8 @@ pub struct Message {
     pub text: String,
     pub intent: Intent,
     /// 当前尝试的票；None 表示还在发送台里（代持或等独占）。
-    pub ticket: Option<Ticket>,
-    pub attempt: u32,
-    pub waiting: Option<String>,
-    pub arrival: u64,
+    #[serde(flatten)]
+    pub queue: QueueState,
 }
 
 /// 收据等动作有结果的一件事（规格「收据时点」）：命令受理时记下意图，结果到了才落收据。
@@ -238,10 +255,8 @@ pub struct Invoke {
     /// 总结成功后不再是 CLI 对话行的提示（受理时算出）。
     #[serde(default)]
     pub covers: Vec<String>,
-    pub ticket: Option<Ticket>,
-    pub attempt: u32,
-    pub waiting: Option<String>,
-    pub arrival: u64,
+    #[serde(flatten)]
+    pub queue: QueueState,
 }
 impl Invoke {
     pub fn kind(&self) -> &'static str {

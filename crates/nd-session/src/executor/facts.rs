@@ -105,7 +105,7 @@ impl Executor {
                         continue;
                     };
                     if let Some(invoke) = self.core.invokes.get(&id).cloned()
-                        && invoke.ticket.as_ref() == Some(&ticket)
+                        && invoke.queue.ticket.as_ref() == Some(&ticket)
                     {
                         self.show_invoke(tx, fx, &invoke, "running", None)?;
                     }
@@ -419,6 +419,16 @@ impl Executor {
             self.core.uncertain.insert(ticket.clone(), uncertain);
         }
         self.core.outbox.remove(ticket);
+        if matches!(
+            outcome,
+            Outcome::Refused {
+                refusal: Refusal::Withheld
+            }
+        ) && let Some(queue) = self.queue_mut(&row.issuer)
+        {
+            queue.retry();
+            return Ok(());
+        }
         match row.issuer {
             Issuer::Withdrawal {
                 id,
@@ -487,7 +497,7 @@ impl Executor {
                             .core
                             .messages
                             .values()
-                            .find(|m| m.ticket.as_ref() == Some(send))
+                            .find(|m| m.queue.ticket.as_ref() == Some(send))
                         {
                             held.push(message.clone());
                         } else if let Some(row) = self.core.uncertain.get(send)
@@ -499,15 +509,17 @@ impl Executor {
                                 text: msg.text.clone(),
                                 attachments: msg.attachments.clone(),
                                 intent: msg.intent,
-                                ticket: Some(send.clone()),
-                                attempt: 0,
-                                waiting: None,
-                                arrival: *arrival,
+                                queue: state::QueueState {
+                                    ticket: Some(send.clone()),
+                                    attempt: 0,
+                                    waiting: None,
+                                    arrival: *arrival,
+                                },
                             });
                         }
                     }
                 }
-                held.sort_by_key(|m| m.arrival);
+                held.sort_by_key(|m| m.queue.arrival);
                 for message in &held {
                     self.restore_withdrawn(tx, fx, message)?;
                 }
@@ -578,37 +590,9 @@ impl Executor {
                 }
                 self.core.ops.insert(op, record);
             }
-            Issuer::Invoke { id } => {
-                if matches!(
-                    outcome,
-                    Outcome::Refused {
-                        refusal: Refusal::Withheld
-                    }
-                ) {
-                    // 证明没写出：回到等待，按当下事实重新放行、另发尝试。
-                    if let Some(i) = self.core.invokes.get_mut(&id) {
-                        i.ticket = None;
-                        i.attempt += 1;
-                    }
-                } else {
-                    self.finish_invoke(tx, fx, &id, outcome)?;
-                }
-            }
+            Issuer::Invoke { id } => self.finish_invoke(tx, fx, &id, outcome)?,
             Issuer::Message { id, .. } => {
-                if matches!(
-                    outcome,
-                    Outcome::Refused {
-                        refusal: Refusal::Withheld
-                    }
-                ) {
-                    // 证明没写出：消息回发送台，另发尝试，界面上仍是这一条。
-                    if let Some(m) = self.core.messages.get_mut(&id) {
-                        m.ticket = None;
-                        m.attempt += 1;
-                    }
-                } else {
-                    self.core.messages.remove(&id);
-                }
+                self.core.messages.remove(&id);
             }
         }
         Ok(())

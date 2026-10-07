@@ -359,7 +359,7 @@ impl Executor {
         fx: &mut Effects,
         message: &Message,
     ) -> nd_store::Result<()> {
-        if let Some(send) = &message.ticket {
+        if let Some(send) = &message.queue.ticket {
             if let Some(mut row) = self.core.uncertain.remove(send) {
                 row.outcome = None;
                 self.core.outbox.insert(send.clone(), row);
@@ -401,7 +401,7 @@ impl Executor {
             Ok(r) => r,
             Err(receipt) => return Ok(receipt),
         };
-        let original = if let Some(send) = &message.ticket {
+        let original = if let Some(send) = &message.queue.ticket {
             let Some(original) = self.core.outbox.get(send).cloned() else {
                 return Ok(rejected("not_withdrawable", json!({"message":id})));
             };
@@ -410,7 +410,11 @@ impl Executor {
             None
         };
         if let Some(original) = original.filter(|row| row.handed) {
-            let send = message.ticket.as_ref().expect("handed send has a ticket");
+            let send = message
+                .queue
+                .ticket
+                .as_ref()
+                .expect("handed send has a ticket");
             self.pin_return(tx, &command.id, &restore, true)?;
             let ticket = Ticket(format!("control:{}", command.id));
             self.core.outbox.insert(
@@ -483,10 +487,10 @@ impl Executor {
                 .core
                 .messages
                 .values()
-                .filter(|m| m.ticket.is_none())
+                .filter(|m| m.queue.ticket.is_none())
                 .cloned()
                 .collect();
-            held.sort_by_key(|m| m.arrival);
+            held.sort_by_key(|m| m.queue.arrival);
             for message in &held {
                 self.core.messages.remove(&message.id);
                 self.show_message(tx, fx, message, "withdrawing", None)?;
@@ -628,10 +632,12 @@ impl Executor {
                 id: command.id.clone(),
                 text: text.to_owned(),
                 intent,
-                ticket: None,
-                attempt: 0,
-                waiting: None,
-                arrival: self.core.arrivals,
+                queue: state::QueueState {
+                    ticket: None,
+                    attempt: 0,
+                    waiting: None,
+                    arrival: self.core.arrivals,
+                },
             },
         );
         // 发送与清稿同一事务；旧界面、不同正文和重试均不能清掉后来编辑的草稿。
