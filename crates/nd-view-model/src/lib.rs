@@ -25,3 +25,6 @@ pub use diff::*;
 
 mod settings;
 pub use settings::*;
+
+mod model_picker;
+pub use model_picker::ModelPicker;

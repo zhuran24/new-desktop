@@ -135,3 +135,22 @@ fn future_panel_and_tree_choices_do_not_discard_other_device_preferences() {
     assert_eq!(state.tree_views["a"], nd_view_model::TreeView::Unknown);
     assert_eq!(state.selected_session.as_deref(), Some("keep"));
 }
+
+#[test]
+fn changing_the_directory_invalidates_choices_and_ignores_the_previous_model_reply() {
+    let mut picker = nd_view_model::ModelPicker::default();
+    let old = picker.begin("old".into());
+    let current = picker.begin("new".into());
+    let models = vec![nd_wire::Model {
+        value: "model".into(),
+        label: "Model".into(),
+        ..Default::default()
+    }];
+    assert!(picker.finish(old, Ok(models.clone())).is_none());
+    assert!(!picker.can_create("new"));
+    assert_eq!(picker.finish(current, Ok(models)), Some(Ok(())));
+    assert!(picker.can_create("new"));
+    assert!(!picker.can_create("old"));
+    picker.invalidate();
+    assert!(!picker.can_create("new"));
+}

@@ -38,16 +38,16 @@ impl Desktop {
                     .await;
                 let done = weak
                     .update_in(cx, |this, window, cx| {
-                        if this.model_loading || this.snapshot.is_none() {
+                        if this.model_picker.is_loading() || this.snapshot.is_none() {
                             return false;
                         }
                         let value = plan["model"].as_str().unwrap();
                         assert!(
-                            this.models.iter().any(|m| m.value == value && !m.disabled),
+                            this.model_picker.choices().iter().any(|m| m.value == value && !m.disabled),
                             "model missing: {:?}",
                             this.warning
                         );
-                        this.model = Some(value.into());
+                        this.model_picker.select(value);
                         if plan["attachments"] == true {
                             println!("{}", json!({"attachment_stage":attach_stage,"uploading":this.uploading,"attached":this.drafts.get(&None).map(|d| d.attachments().len()),"warning":this.warning}));
                         }
@@ -143,11 +143,7 @@ impl Desktop {
         self.subscriptions
             .push(cx.subscribe(&self.directory, |this, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.model_generation += 1;
-                    this.models.clear();
-                    this.model = None;
-                    this.model_cwd = None;
-                    this.model_loading = false;
+                    this.model_picker.invalidate();
                     this.refresh_send(cx);
                     cx.notify();
                 }
@@ -198,11 +194,8 @@ impl Desktop {
                 .is_some_and(|d| d.needs_send_review())
             && self.snapshot.is_some()
             && if self.creating {
-                self.model_cwd.as_deref() == Some(self.directory.read(cx).value().as_ref())
-                    && self
-                        .models
-                        .iter()
-                        .any(|m| Some(&m.value) == self.model.as_ref() && !m.disabled)
+                self.model_picker
+                    .can_create(self.directory.read(cx).value().as_ref())
             } else {
                 self.session_snapshot
                     .as_ref()
@@ -325,32 +318,18 @@ impl Desktop {
     }
     pub fn load_models(&mut self, cx: &mut Context<Self>) {
         let cwd = self.directory.read(cx).value().to_string();
-        self.models.clear();
-        self.model = None;
-        self.model_cwd = None;
-        self.model_generation += 1;
-        let generation = self.model_generation;
-        self.model_loading = true;
+        let generation = self.model_picker.begin(cwd.clone());
         self.warning = None;
         self.refresh_send(cx);
         let client = self.client.clone();
         cx.spawn(async move |weak, cx| {
             let result = client.models("claude".into(), cwd.clone()).await;
             let _ = weak.update(cx, |this, cx| {
-                if generation != this.model_generation {
+                let Some(result) = this.model_picker.finish(generation, result) else {
                     return;
-                }
-                this.model_loading = false;
-                match result {
-                    Ok(models) => {
-                        this.model = models.iter().find(|m| !m.disabled).map(|m| m.value.clone());
-                        this.models = models;
-                        this.model_cwd = Some(cwd);
-                        if this.model.is_none() {
-                            this.warning = Some("后端没有可用模型".into());
-                        }
-                    }
-                    Err(e) => this.warning = Some(format!("获取模型失败：{e}")),
+                };
+                if let Err(error) = result {
+                    this.warning = Some(error);
                 }
                 this.refresh_send(cx);
                 cx.notify();
@@ -423,7 +402,7 @@ impl Desktop {
             }
             .into(),
             args: if self.creating {
-                json!({"cwd":self.directory.read(cx).value().to_string(), "model":self.model, "text":text,"attachments":attachments})
+                json!({"cwd":self.directory.read(cx).value().to_string(), "model":self.model_picker.selected(), "text":text,"attachments":attachments})
             } else {
                 json!({"session":key,"text":text,"intent":intent,"attachments":attachments})
             },
@@ -783,21 +762,21 @@ impl Desktop {
                         .id("load-models")
                         .cursor_pointer()
                         .text_color(rgba(t.colors.accent))
-                        .child(if self.model_loading {
+                        .child(if self.model_picker.is_loading() {
                             "正在获取模型…"
                         } else {
                             "获取后端模型列表"
                         })
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.model_loading {
+                            if !this.model_picker.is_loading() {
                                 this.load_models(cx);
                             }
                         })),
                 )
-                .children(self.models.iter().map(|model| {
+                .children(self.model_picker.choices().iter().map(|model| {
                     let value = model.value.clone();
                     let disabled = model.disabled;
-                    let chosen = self.model.as_ref() == Some(&model.value);
+                    let chosen = self.model_picker.selected() == Some(model.value.as_str());
                     div()
                         .id(SharedString::from(format!("model/{}", model.value)))
                         .p(px(t.spacing.small))
@@ -824,7 +803,7 @@ impl Desktop {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if !disabled {
-                                this.model = Some(value.clone());
+                                this.model_picker.select(&value);
                                 this.refresh_send(cx);
                                 cx.notify();
                             }
