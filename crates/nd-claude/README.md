@@ -74,6 +74,22 @@ argv 逐项传入，不拼 shell：`--output-format stream-json --input-format s
 
 对话的录制：主接缝场景 `a_recorded_conversation_replays_through_the_adapter_state_machine` 录下真 CLI 的一段对话（流式文字、工具调用与结果、两个回合），以看守夹具格式存为 [`tests/fixtures/conversation/claude/2.1.289/stream-tool-two-turns.jsonl`](tests/fixtures/conversation/claude/2.1.289/stream-tool-two-turns.jsonl)，事实存为同名 `.facts.json`（设 `ND_RECORD_FIXTURE=<目录>` 运行该场景时重写）。默认套件 `tests/conversation.rs` 回放比对事实，并用改造的输入证明只有原 uuid 的回显算落地、对话投影的最简版与增量版在每个前缀上一致。
 
+## 总结、`!` 模式、fork 型子代理（#22）
+
+`Act::Invoke` 交到承载位的任务里，按 `invoke.rs` 的纯计算编码成给动作 mod 的命令，操作 id 是 `native_uuid(票)`（重启后能按它查）：
+
+| `Invocation` | 动作 mod 做什么 | 结果 |
+|---|---|---|
+| `Compact{scope, anchor}` | `$.command.run({command:"compact", args:"ND_SUM "+SummarizeSpec})`；钩子 mod 的 `session.compact` 按参数里的文字散列和次序定位，只把所选范围交给摘要器 | 成功 `Done::Invoked(Compacted)`；定位不到 `Refused(AnchorGone{why})`；摘要失败 `Failed` |
+| `Shell{command}` | `$.tool.call({tool:"Bash", command})`，再 `$.session.append` 照终端 `!` 模式的格式追加 `<bash-input>` 与输出 | `Done::Invoked(Shell{exit,stdout,stderr,appended})`；被拒 `Refused`；跑完之后出错或结果丢了 `Unknown` |
+| `ForkAgent{prompt}` | `$.agent.spawn({subagentType:"fork", prompt})` | `Done::Invoked(Forked{agent})`；没派出 `Failed`/`Refused` |
+
+- **能力**：拉起时把 `Caps` 换成端口的中立能力表（`Done::Opened.features`）；守护进程重启后接回时 mod 没回来、降为只能聊天的，报 `FactBody::CapsChanged`。能力表说做不了的 `Invoke` 回 `Rejected(Unsupported{why})`。
+- **`!` 的自动批准**：派发 `Shell` 时记下命令原文；读流水见到 `can_use_tool`、Bash、`input.command` 与原文逐字一致、没有 `agent_id`、`tool_use_id` 以 `toolu_plugin_` 开头的请求，写一次 allow（不加持久规则）、清掉这条批准，不报 `Asked`。其余审批照常报给会话。规则是 `invoke::auto_approves`，审批台（#24）共用。
+- **写后记账**：命令交给通道后报 `Written{ticket, native:操作 id}`，检查点里记着在途命令（含没用掉的批准）。结论由等结果的任务交回承载位任务，报终结结果。进程退出时在途的是 `Unknown`、排队没交出的是 `Withheld`。
+- **重启接回**：引擎交来的未结 `Invoke` 票按操作 id 问动作 mod（`query`）：还在跑就过 0.5 s 再问，做完了取它留下的结论，问不到（mod 重载丢了）就是 `Unknown`，不重发。
+- 录制回归：`tests/invoke_recording.rs` 录真 CLI 的三种往返，默认套件 `recorded_invocations_replay_and_none_of_them_is_resendable` 回放 `invocations.jsonl`。
+
 ## 测试
 
 默认套件（`cargo test --workspace`）跑协议生成物一致性、录制回放与夹具完整性，不启动 CLI。场景测试用真守护进程场景（独立 slice、bwrap 断网、临时 HOME/`CLAUDE_CONFIG_DIR`/XDG）、真看守进程、钉住的 CLI 2.1.289 和仓库里的两个 mod，只有模型端点换成离线伪端点：

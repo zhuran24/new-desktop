@@ -1,6 +1,6 @@
 # 会话组件：名册与持久操作引擎
 
-日期：2026-10-06。状态：已实现第 2 步的最小引擎、名册新建、发送台、持久草稿与附件、对话投影、谱系、按需拉起、闲置回收、恢复闸门与用户重发。审批台、任务账本与转接、子代理、结构操作入口、收场的未决处置由后续工单在同一引擎上补。
+日期：2026-10-06。状态：已实现第 2 步的最小引擎、名册新建、发送台、持久草稿与附件、对话投影、谱系、按需拉起、闲置回收、恢复闸门与用户重发，以及总结、`!` 命令、fork 型子代理这三种收据等动作有结果的命令和只能聊天的降级提示。审批台、任务账本与转接、子代理、结构操作入口、收场的未决处置由后续工单在同一引擎上补。
 
 后端经 [`nd-backend`](../nd-backend/src/lib.rs) 的 `Backends`（真接缝是 `BackendAdapter`），跨会话的独占经 [`nd-claims`](../nd-claims/README.md) 的 `Exclusivity`，命令收据经 `nd-ledger`。守护进程负责组装（见[守护进程说明](../nd-daemon/README.md#会话与-claude-后端)）。
 
@@ -10,13 +10,13 @@
 |---|---|
 | `Sessions::new(store, blobs, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
 | `Sessions::recover()` | 守护进程启动时装载有活进程、进行中操作或未结票的会话，交端口 `adopt` 对账 |
-| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`、`session.resend`；不是会话命令时返回 None |
+| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`、`session.resend`、`session.shell`、`session.subtask`、`session.compact`；不是会话命令时返回 None。后三者的回应等动作有结果（`nd_session::delivery(name)` 判断） |
 | `Sessions::subscribe(&SessionId, since)` | `session/<id>` 流：快照或同纪元续上的事件，外加 `WatchGuard`（持有期间算「有人在看」） |
 | `Sessions::listing()` | 侧栏列表与一次性的提示（`global` 流里 `sessions` 命名空间的条目） |
 | `session_id_for(command_id)` | 新建会话的 id 由建它的命令 id 派生：同一条命令重试落在同一个会话上 |
 | `lineage::{Lineage, Event}` | 谱系的纯值 fold；段、承载区间、轮的原生位置、显式边、同步点、拓扑与共同前缀 |
 | `projection::{project, Projection, Shown}` | 对话投影的最简版与增量版，见下文差分基准 |
-| `scripted::ScriptedAdapter` | 窄接缝一的脚本化适配器（测试用，#32 扩展） |
+| `scripted::ScriptedAdapter` | 窄接缝一的脚本化适配器（测试用，#32 扩展）；送达时报一条实际回合（一条消息一轮），`Act::Invoke` 的原生步骤记成 `invoke:<种类>:…` |
 
 ### 命令
 
@@ -26,6 +26,9 @@
 | `session.send` | `session`、`text`、可选 `attachments` 和 `intent`（`fold` 默认、`after_turn`、`interrupting`） | `done{message:<命令 id>}` 只表示进了发送台；之后的代持、写出、落地看这条消息的条目。撤掉的会话回 `precondition` |
 | `session.draft.update` | `args:{session,text,attachments?}`；必须带 `expect:{draft_version}` | `done{draft,saved}`；版本相符替换当前稿，否则另存原文，`saved` 为另存稿 id。参数不合法回 `invalid` |
 | `session.resend` | `session`、`message`（确认未送达的原消息 id） | `done{message:<命令 id>,draft}`；资格不满足回 `precondition`，不消费当前草稿 |
+| `session.shell` | `nd_wire::ShellArgs{session,command,input?}`；可带 `expect.draft_version` | 收据等动作有结果：`done` 的 value 是 `nd_wire::Invoked{invoke,draft,exit,stdout,stderr,appended}`；见下文 |
+| `session.subtask` | `nd_wire::SubtaskArgs{session,prompt,input?}`；可带 `expect.draft_version` | 同上，`Invoked{invoke,draft,agent}` |
+| `session.compact` | `nd_wire::CompactArgs{session,message,scope:"from"\|"up_to"}` | 同上，`Invoked{invoke,draft,saved}`；定位不到回 `rejected{anchor_gone, now.reason}` |
 
 ### 持久草稿
 
@@ -47,16 +50,27 @@
 
 | id | kind | 内容 |
 |---|---|---|
-| `header` | `header` | `status`（`preparing` 准备中、`active`、`partial` 部分完成、`withdrawn` 已撤掉）、`note`、`irreversible`、`process{carrier,backend_session,run,alive,readiness,turn_running,drain}`、进行中的 `op`、`recovering` |
+| `header` | `header` | `status`（`preparing` 准备中、`active`、`partial` 部分完成、`withdrawn` 已撤掉）、`note`、`irreversible`、`process{carrier,backend_session,run,alive,readiness,turn_running,drain,features}`、`degraded`、进行中的 `op`、`recovering`。`features` 是端口的能力表（`{id,label,available,why}`），界面按它显示或隐藏总结、`!`、`/subtask`；进程只能聊天时 `degraded{why,unavailable}` 写明原因和用不了的功能名 |
 | `draft` | `draft` | 当前草稿 `version,text,attachments,device` 和 `saved[]`；编辑控件使用此项，不作为已发对话显示 |
 | `prompt/<消息 id>` | `prompt` | `text`、`attachments`、`intent`、`state`：`held` 代持、`waiting` 等独占、`pending` 已签票、`written` 已写出、`landed` 回显了原编号、`failed`、`unknown` 交付不明、`not_delivered` 未送达、`resent` 已重发；`native` 是写出用的原生编号 |
 | `block/<API 消息 id>:<块序号>`、`block/result:<工具调用 id>` | `text`、`thinking`、`tool_use`、`tool_result`、`other` | `text`、`complete`；流式增量期间 `complete:false`、文字累积，完整块到了整体替换 |
 | `turn/<承载位>/<n>` | `turn` | 后端回合结束的诊断条目：`ok`、`subtype`、`error`；其中 `n` 是后端 result 的计数，导航使用下面的谱系轮索引 |
-| `lineage` | `lineage` | `current` 当前段、`rounds` 当前段从 1 起的轮索引、`topology`、`segments`、`carriers`、`edges`、`switches`、`origin`。轮含 `id`、`n`、`messages`、`positions`、`complete`、`last_assistant` |
+| `lineage` | `lineage` | `current` 当前段、`rounds` 当前段从 1 起的轮索引、`topology`、`segments`、`carriers`、`edges`、`switches`、`origin`、`summarized`（已被总结、不再是 CLI 对话行的提示消息 id）。轮含 `id`、`n`、`messages`、`positions`、`complete`、`last_assistant` |
 | `op/<操作 id>` | `op` | `kind`、`phase`、`reason`、`irreversible` |
-| `asked/<请求 id>` | `asked` | 后端在等回答的请求；第 2 步只显示，审批台在第 3 步 |
+| `asked/<请求 id>` | `asked` | 后端在等回答的请求；第 2 步只显示，审批台在第 3 步。`!` 命令自己引出的那一条 Bash 审批由 Claude 适配按规则放行，不出现在这里 |
+| `invoke/<命令 id>` | `shell`、`compact`、`subtask` | 收据等动作有结果的命令：`state`（`held` 代持、`waiting` 等独占、`waiting_turn` 等当前回合结束、`pending` 已签票、`running` 已交给动作 mod、`done`、`rejected`、`failed`、`unknown`）、`reason`，及各自的内容与结果：`command`/`exit`/`stdout`/`stderr`/`appended`；`scope`/`message`/`saved`；`prompt`/`agent` |
 
 侧栏条目 `session/<id>`（命名空间 `sessions`，kind `session`）带 `status`、`created_by`、`cwd`、`model`、`process_alive`；撤掉的会话从列表消失，换成一条 `notice/<id>`（只提示一次，不落库）。
+
+## 总结、`!` 命令与 fork 型子代理（#22）
+
+三种命令的效果是一个至多一次、不可重发的后端动作（`Act::Invoke`），收据时点是 Delivery（规格「收据时点」）：
+
+- **受理**：命令的事务里只记意图（核心的 `invokes`，含命令内容散列），不落收据；协议入口把这类命令放到单独的任务里等，同一连接照常处理别的请求。同 id 同内容的重试挂到同一个结果上，不同内容回 `conflict`。等的连接断了，界面按命令 id 查收据，查不到不重发正文。
+- **签票**（发送台的另一半，`pump_invokes`）：结构操作中或没有当前承载位时代持；当前承载位没有活进程就起按需拉起；`!` 在回合进行中等这一回合结束（和终端一样）；能力表说做不了（只能聊天）就直接拒绝；其余经独占登记 `Write` 放行后签 `i:<命令 id>#<尝试号>` 的票。`Refused(Withheld)` 回到等待、另发尝试。
+- **结果入账**：票的终结结果到了，在同一事务里落收据、更新 `invoke/<命令 id>` 条目、回给还在等的连接。`Unknown` 落 `Unknown{now:{invoke,stream}}` 收据，之后的澄清只改条目，收据不改。
+- **总结的定位与回填**：只能选当前段里还是 CLI 对话行的人类提示（在轮索引里、没被总结过）。受理时按「原文与附件完全相同」数出它是第几次出现、共几次（`Anchor{text,attachments,nth,of}`），记下这次覆盖的提示（`from`：它和之后的；`up_to`：它之前的）与受理时的草稿版本。成功后这些提示记进 `summarized`，草稿按 #16 的回填约定在同一事务里改：`from` 放回所选提示的原文与附件，`up_to` 留空；以受理时的版本为基准，之后改过就把回填的原文另存（`up_to` 则不动），被替换掉的非空旧稿另存为 `<命令 id>/displaced`，不丢。一次只允许一个总结在途。
+- **`!` 与 `/subtask` 的清稿**：带 `input`（输入框原文）且 `expect.draft_version` 对得上、当前稿正文等于 `input`、没有附件时，受理事务里清稿；结果收据里的 `draft` 是落定那一刻的当前稿。
 
 ## 谱系与轮导航
 
@@ -107,6 +121,9 @@
 | 新建＋发送 | 两次都带附件 | `attachment_create_and_send_recover_at_every_commit_point` | 原附件交给端口，消息各生效一次 |
 | 新建 | 拉起失败且没有发送附件 | `attachment_creation_compensation_releases_unused_uploads_at_every_commit_point` | 未使用上传可被回收 |
 | 发送＋附件草稿 | 附件冲突另存、匹配发送、后来编辑 | `attached_draft_conflict_and_send_consumption_recover_at_every_commit_point` | 附件与正文共同遵守版本、引用和消费规则 |
+| 总结（从这里） | 拉起、发两条、改草稿、总结第二条 | `summarize_from_here_backfills_the_draft_once_at_every_commit_point` | 压缩恰好生效一次；草稿回填一次（版本只加一），旧稿恰好另存一份；收据 Done |
+| `!` 命令 | 动作 mod 的结论丢了（交付不明） | `a_bang_whose_result_is_lost_is_unknown_and_never_rerun_at_every_commit_point` | 命令至多跑一次、不另发；收据 Unknown |
+| `/subtask` | 派 fork 型子代理成功 | `a_subtask_dispatches_one_fork_subagent_at_every_commit_point` | 恰好派出一个；收据 Done 带子代理 id |
 
 #32 在这套矩阵上加三层记录的可重发类别、代持去处与租约结束等断言；后续结构操作按「新增操作就加（操作，场景）行」接入。
 

@@ -69,3 +69,12 @@ bash scripts/test-scenarios.sh
 正文中的 diff/patch 围栏与 Edit 替换片段显示增删、行号和无末尾换行标记。Edit 行号是片段内的位置。diff 颜色由 `Theme.colors.diff_added/diff_removed` 提供。详情、协议字段和证明边界见 [#17 验证](../../docs/verification/ticket-17.md)。
 
 `CommandClient::upload(AttachmentSource)` 与 `blob` 使用同一个 nd-wire UDS 的 HTTP 通道；没有桌面私有文件发送路径。输入框只发一次 `ComposerEvent::Attach`，宿主仍只有原来的一个 Submit 接收者。已有会话的草稿与冲突另存稿都持久保存附件；发送只清匹配文字、附件和版本的那份草稿。创建会话前的临时草稿尚未持久化。
+
+## 总结、`!` 模式、/subtask 与降级提示
+
+- **`!` 命令**：已创建会话的输入框里以 `!` 开头的一段文字是一条 shell 命令（`! pwd` 与 `!pwd` 相同），提交时发 `session.shell`（`nd_wire::ShellArgs`，`input` 带输入框原文与草稿版本）。守护进程受理时清掉匹配的草稿，输入框跟着快照变空；命令跑完在对话里显示一条「! 命令」，带命令、输出和退出码，模型下一次请求读得到。它本身不起回合；当前回合进行中提交的，等这一回合结束再跑。
+- **`/subtask <要做的事>`**：派 fork 型子代理（`session.subtask`），带着当前对话在后台跑；对话里显示子代理 id，子代理面板归 #28/#34。
+- **总结**：还在当前对话里的人类提示下方有「从这里总结」「总结到这里」（`session.compact`，`nd_wire::CompactArgs`）。成功后前者把该提示原文放回输入框，后者让输入框留空；被替换的旧稿另存，可在另存稿里取回。提示定位不到或已被总结时不压缩，界面提示原因。
+- **降级提示**：后端进程只能聊天（mod 没装上等）时，会话头下方列出原因和这时用不了的功能（名单来自端口能力表），总结按钮隐藏，`!` 与 `/subtask` 不发出、正文留在输入框并提示原因。
+- 三个命令的收据等动作有结果：经 `CommandClient::deliver` 另开连接等（最长 15 分钟），等的时候草稿保存等别的命令照常走；到时限没有回应只查收据、不重发正文。`!`/`/subtask` 带附件时提示先移除附件。
+- 视图计算在 `nd_view_model::{composer_input, conversation}`（`ConversationView.degraded/abilities`、`MessageView.summarize`），纯函数测试在 `crates/nd-view-model/tests/invocations.rs`。真窗口场景 `bang_runs_one_command_…` 与 `without_the_hook_mod_…`（`crates/nd-daemon/tests/invocations.rs`，驱动 `tests/native_chat.py --invoke`）核对产品输入框里的 `!` 跑完并清空、降级进程的会话头提示与拒绝。
