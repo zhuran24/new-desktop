@@ -59,7 +59,12 @@ async fn both_mods_pass_the_pinned_cli_static_check_with_their_multi_file_layout
     };
     assert_eq!(
         hooks(&listed[0]),
-        ["classic.SessionStart", "session.end", "session.start"]
+        [
+            "classic.SessionStart",
+            "session.compact",
+            "session.end",
+            "session.start"
+        ]
             .map(str::to_owned)
             .into()
     );

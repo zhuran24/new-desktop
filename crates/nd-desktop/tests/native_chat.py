@@ -335,6 +335,8 @@ def inner():
 
 def run(args, script=None):
     themes = getattr(args, "themes", False)
+    invoke = getattr(args, "invoke", None)
+    expect = getattr(args, "expect", None)
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='nd-test-chat-'))
@@ -344,7 +346,7 @@ def run(args, script=None):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings and not args.invoke, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'themes': themes, 'invoke': args.invoke, 'expect': args.expect}, ensure_ascii=False))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings and not invoke, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'themes': themes, 'invoke': invoke, 'expect': expect}, ensure_ascii=False))
         if themes:
             shutil.copy(Path(__file__).parents[2] / 'nd-view-model/tests/fixtures/ocean.json', work / 'ocean.json')
         if args.attachments:

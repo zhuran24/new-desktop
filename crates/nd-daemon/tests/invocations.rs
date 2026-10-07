@@ -652,6 +652,26 @@ async fn a_prompt_the_cli_no_longer_holds_is_not_compacted_and_the_reason_is_sho
     let shown = item(&after, "invoke/gone-sum").expect("compact item");
     assert_eq!(shown.data["state"], "rejected");
     assert!(shown.fallback.text.contains("找不到"), "{shown:?}");
+
+    // 同一原文再发一次：守护进程以为有两条「甲提示」，CLI 里只剩新的一条，次数对不上也不压缩。
+    fx.round(&session, "gone-again", "甲提示", "答甲二").await;
+    let before = endpoint.requests().len();
+    let reply = fx
+        .deliver(
+            "gone-dup",
+            "session.compact",
+            json!({"session":session,"message":"gone-again","scope":"from"}),
+        )
+        .await;
+    let CommandReply::Receipt {
+        receipt: Receipt::Rejected { code, now },
+    } = &reply
+    else {
+        panic!("expected a rejection: {reply:?}");
+    };
+    assert_eq!(code, "anchor_gone", "{now}");
+    assert!(now["reason"].as_str().unwrap().contains("对不上"), "{now}");
+    assert_eq!(endpoint.requests().len(), before, "nothing was summarized");
     fx.close();
 }
 
