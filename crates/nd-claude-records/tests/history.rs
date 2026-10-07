@@ -18,6 +18,48 @@ fn message(id: &str, parent: Option<&str>, role: &str, text: &str) -> Value {
 }
 
 #[test]
+fn an_ordinary_pin_below_a_parallel_result_follows_the_remaining_batch() {
+    let mut a1 = message("a1", Some("u"), "assistant", "");
+    a1["message"]["id"] = json!("batch");
+    a1["message"]["content"] = json!([{"type":"tool_use","id":"t1","name":"Read","input":{}}]);
+    let mut a2 = message("a2", Some("a1"), "assistant", "");
+    a2["message"]["id"] = json!("batch");
+    a2["message"]["content"] = json!([{"type":"tool_use","id":"t2","name":"Read","input":{}}]);
+    let mut r1 = message("r1", Some("a1"), "user", "");
+    r1["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"t1","content":"one"}]);
+    let mut r2 = message("r2", Some("a2"), "user", "");
+    r2["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"t2","content":"two"}]);
+    for (kind, parent, tool) in [
+        ("attachment", "r1", None),
+        ("system", "r1", None),
+        ("user", "r1", None),
+        ("attachment", "a1", Some("t1")),
+    ] {
+        let mut extra = message("extra", Some(parent), kind, "metadata");
+        extra["isMeta"] = json!(true);
+        if let Some(tool) = tool {
+            extra["attachment"] = json!({"type":"tool_result", "toolUseID":tool});
+        }
+        let data = transcript(&[
+            message("u", None, "user", "read both"),
+            a1.clone(),
+            a2.clone(),
+            r1.clone(),
+            extra,
+            json!({"type":"last-prompt","leafUuid":"extra"}),
+            r2.clone(),
+            message("next", Some("r2"), "assistant", "done"),
+        ]);
+        let index = RecordIndex::parse(&data).unwrap();
+        assert_eq!(
+            index.current().unwrap().leaf(),
+            Some("next"),
+            "pin on {kind}"
+        );
+    }
+}
+
+#[test]
 fn history_follows_the_current_leaf_and_excludes_a_rewound_branch() {
     let data = transcript(&[
         message("alpha", None, "user", "你好"),

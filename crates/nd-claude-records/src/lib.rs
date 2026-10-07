@@ -29,6 +29,8 @@ struct Node {
     message_id: Option<String>,
     agent_id: Option<String>,
     tool_result: bool,
+    transparent: bool,
+    attachment_tool: Option<String>,
     tool_uses: Vec<String>,
     tool_results: Vec<String>,
     active: bool,
@@ -155,6 +157,12 @@ impl<'a> RecordIndex<'a> {
                     timestamp: row["timestamp"].as_str().map(str::to_owned),
                     message_id: row["message"]["id"].as_str().map(str::to_owned),
                     agent_id: row["agentId"].as_str().map(str::to_owned),
+                    transparent: row["type"] == "attachment"
+                        || (row["type"] == "system" && row["subtype"] != "compact_boundary")
+                        || (row["type"] == "user"
+                            && row["isMeta"] == true
+                            && block_ids(&row, "tool_result", "tool_use_id").is_empty()),
+                    attachment_tool: row["attachment"]["toolUseID"].as_str().map(str::to_owned),
                     tool_uses: block_ids(&row, "tool_use", "id"),
                     tool_results: block_ids(&row, "tool_result", "tool_use_id"),
                     tool_result: row["type"] == "user"
@@ -310,44 +318,113 @@ impl<'a> RecordIndex<'a> {
         false
     }
 
+    fn in_batch(node: &Node, message: &str) -> bool {
+        node.transparent
+            || node.tool_result
+            || (node.kind == "assistant" && node.message_id.as_deref() == Some(message))
+    }
+
+    fn preceding_batch<'s>(&'s self, node: &'s Node, message: &str) -> Vec<&'s Node> {
+        let mut batch = Vec::new();
+        let mut seen = HashSet::from([&node.id]);
+        let mut cursor = self.parent(node).ok().flatten();
+        while let Some(node) = cursor {
+            if !Self::in_batch(node, message) || !seen.insert(&node.id) {
+                break;
+            }
+            batch.push(node);
+            cursor = self.parent(node).ok().flatten();
+        }
+        batch
+    }
+
     fn follows_batch(&self, last: usize, pin: usize) -> bool {
-        let pinned = &self.nodes[pin];
-        let assistant = if pinned.kind == "assistant" {
-            Some(pinned)
-        } else if pinned.tool_result {
-            self.parent(pinned).ok().flatten()
+        // CLI throughBatch crosses metadata before identifying the pinned tool.
+        let mut cursor = Some(&self.nodes[pin]);
+        let mut skipped = None;
+        let mut seen = HashSet::new();
+        while let Some(node) = cursor.filter(|n| n.transparent) {
+            if !seen.insert(&node.id) {
+                return false;
+            }
+            skipped = Some(node);
+            cursor = self.parent(node).ok().flatten();
+        }
+        let mut source = Vec::new();
+        let mut attachment = false;
+        let assistant = if let Some(result) = cursor.filter(|n| n.tool_result) {
+            source.clone_from(&result.tool_results);
+            self.parent(result).ok().flatten()
+        } else if let Some(skipped) = skipped {
+            match (cursor, skipped.attachment_tool.as_ref()) {
+                (Some(node), Some(tool)) if node.kind == "assistant" => {
+                    source.push(tool.clone());
+                    attachment = true;
+                    node.message_id.as_deref().and_then(|id| {
+                        std::iter::once(node)
+                            .chain(self.preceding_batch(node, id))
+                            .find(|n| n.tool_uses.contains(tool))
+                    })
+                }
+                _ => None,
+            }
         } else {
-            None
+            cursor
         };
         let Some(assistant) =
             assistant.filter(|n| n.kind == "assistant" && !n.tool_uses.is_empty())
         else {
             return false;
         };
+        let Some(message) = assistant.message_id.as_deref() else {
+            return false;
+        };
+        let preceding: HashSet<_> = self
+            .preceding_batch(assistant, message)
+            .into_iter()
+            .map(|n| &n.id)
+            .collect();
         let mut cursor = Some(&self.nodes[last]);
         let mut seen = HashSet::new();
+        let mut child: Option<&Node> = None;
+        let mut continuous = false;
         while let Some(node) = cursor {
             if !seen.insert(&node.id) {
                 break;
             }
+            if continuous && node.id == assistant.id {
+                return true;
+            }
             if node.id != assistant.id
                 && node.kind == "assistant"
                 && !node.tool_uses.is_empty()
-                && assistant.message_id.is_some()
-                && node.message_id == assistant.message_id
+                && node.message_id.as_deref() == Some(message)
                 && node.sidechain == assistant.sidechain
                 && node.agent_id == assistant.agent_id
             {
-                return true;
+                if preceding.contains(&node.id) {
+                    return true;
+                }
+                continuous = true;
+            } else if !Self::in_batch(node, message) {
+                continuous = false;
             }
-            if node.parent.as_deref() == Some(&assistant.id)
-                && node
-                    .tool_results
-                    .iter()
-                    .any(|id| assistant.tool_uses.contains(id) && !pinned.tool_results.contains(id))
+            if node.id == assistant.id
+                && source.iter().any(|id| assistant.tool_uses.contains(id))
+                && child.is_some_and(|n| {
+                    n.tool_results.iter().any(|id| {
+                        assistant.tool_uses.contains(id)
+                            && if attachment {
+                                assistant.tool_uses.len() > 1
+                            } else {
+                                !source.contains(id)
+                            }
+                    })
+                })
             {
                 return true;
             }
+            child = Some(node);
             cursor = self.parent(node).ok().flatten();
         }
         false
