@@ -222,6 +222,11 @@ impl Shown {
             ),
             Shown::Invoke { kind, data, .. } => {
                 let state = data["state"].as_str().unwrap_or("?");
+                let state = if kind == "shell" && data["appended"] == false {
+                    format!("{state}，输出没有进对话")
+                } else {
+                    state.to_owned()
+                };
                 let (title, text) = match kind.as_str() {
                     "shell" => (
                         "! 命令".to_owned(),

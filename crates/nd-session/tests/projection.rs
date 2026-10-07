@@ -56,3 +56,13 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn shell_fallback_reports_that_output_did_not_enter_the_conversation() {
+    let items = project(&[Shown::Invoke {
+        id: "shell".into(),
+        kind: "shell".into(),
+        data: json!({"state":"done","command":"pwd","exit":0,"stdout":"/p","appended":false}),
+    }]);
+    assert!(items[0].fallback.text.contains("输出没有进对话"));
+}

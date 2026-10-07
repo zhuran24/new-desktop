@@ -172,6 +172,11 @@ fn invocation_view(i: &nd_wire::Item) -> Option<(String, String, String, String)
                 Some(code) => format!("退出码 {code}"),
                 None => "已结束".to_owned(),
             };
+            let done = if i.data["appended"] == false {
+                format!("{done} · 输出没有进对话")
+            } else {
+                done
+            };
             ("! 命令", text, done)
         }
         "compact" => (
