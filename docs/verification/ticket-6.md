@@ -110,3 +110,5 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
 ## V6 待验
 
 重新定值需记录长 Workflow 的真实看守 stdout 行数/字节、stream_event 占比、保留与溢出峰值，并包含后台工具调用。端点 SSE 数不能替代看守实际流水；现有离线样本不关闭 V6。真实服务测量由 owner 在隔离实例中另行授权，不进默认套件，也不制造 OOM。
+
+#6 在 V6 的测量证据与阈值依据齐全前不能关单。N7、溢出策略与离线 Workflow 回归通过只关闭各自的验证项；owner 清单的工单汇总与 V6 节均按这一条件验收。
