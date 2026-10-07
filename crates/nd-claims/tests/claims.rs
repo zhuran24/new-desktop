@@ -524,7 +524,8 @@ fn scripted_cli_lists_are_unverified_without_registry_identity_and_interest_drop
 }
 
 #[test]
-fn real_cli_background_session_without_a_pid_blocks_even_when_no_one_is_listing_external_sessions() {
+fn real_cli_background_session_without_a_pid_blocks_even_when_no_one_is_listing_external_sessions()
+{
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
     let claims = support::ready(store, dir.path());

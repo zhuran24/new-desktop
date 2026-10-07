@@ -117,8 +117,10 @@ async fn backend_gets_the_spec_template_without_preload_and_with_the_four_old_mo
         .insert("CLAUDE_CODE_PLUGIN_DIR_WATCH".into(), "1".into());
     let claude = fx.claude(config);
     let session = session_id();
+    let mut open = fx.fresh(&session);
+    open.permission_mode = Some("acceptEdits".into());
     let run = claude
-        .open("template", fx.fresh(&session), InitOptions::default())
+        .open("template", open, InitOptions::default())
         .await
         .unwrap();
     let pid = run.ready().identity.pid;
@@ -167,6 +169,12 @@ async fn backend_gets_the_spec_template_without_preload_and_with_the_four_old_mo
     };
     assert_eq!(value_of("--permission-prompt-tool"), "stdio");
     assert_eq!(value_of("--session-id"), session);
+    assert_eq!(value_of("--model"), MODEL);
+    assert_eq!(value_of("--permission-mode"), "acceptEdits");
+    assert_eq!(
+        run.ready().initialize["current_permission_mode"],
+        "acceptEdits"
+    );
     assert_eq!(
         cmdline.iter().filter(|a| *a == "--plugin-dir").count(),
         2,

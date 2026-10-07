@@ -4407,8 +4407,13 @@ async fn settings_native_window_changes_model_effort_and_title_through_nd_wire()
     let session = fx.create("create", "/sandbox/project", "hello").await;
     fx.wait(&session, "active", |s| header(s)["status"] == "active")
         .await;
-    let output = std::env::var("ND_NATIVE_SETTINGS_OUTPUT")
-        .unwrap_or_else(|_| fx.scenario.root().join("native-settings").to_string_lossy().into_owned());
+    let output = std::env::var("ND_NATIVE_SETTINGS_OUTPUT").unwrap_or_else(|_| {
+        fx.scenario
+            .root()
+            .join("native-settings")
+            .to_string_lossy()
+            .into_owned()
+    });
     let result = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
         .args([
@@ -4682,4 +4687,31 @@ async fn settings_title_waits_for_eligible_prompt_and_keeps_summary_on_empty_gen
     assert_eq!(header(&after)["title"], "hello");
     assert_eq!(header(&after)["title_source"], "summary");
     assert_eq!(endpoint.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn disabling_mcp_backgrounding_removes_the_send_now_preservation_promise() {
+    for (name, value) in [
+        ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"),
+        ("CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "true"),
+        ("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS", "0"),
+    ] {
+        let fx = Fixture::with_env(
+            "mcp-background-disabled",
+            3_600_000,
+            &format!("{name} = {value:?}"),
+        )
+        .await;
+        fx.scenario
+            .endpoint()
+            .enqueue(fx.main(), ModelReply::text("ready"));
+        let session = fx.create("disabled", "/sandbox/project", "hello").await;
+        let ready = fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
+        assert_eq!(
+            header(&ready)["interaction"]["immediate_preserves_mcp"],
+            false,
+            "{name}"
+        );
+        fx.close();
+    }
 }

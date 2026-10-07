@@ -232,3 +232,39 @@ fn recorded_human_rounds_keep_their_user_uuids_and_final_assistant_anchor() {
         );
     }
 }
+
+#[test]
+fn recorded_task_tables_keep_busy_work_and_malformed_tables_cannot_claim_drained() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl");
+    let (_, mut records) = read_fixture(&path).unwrap();
+    let table = records.iter().position(|r| matches!(&r.event, Event::Out { line } if line.contains("background_tasks_changed"))).unwrap();
+    assert!(
+        replay(&records[..=table])
+            .iter()
+            .flatten()
+            .any(|fact| matches!(
+                fact,
+                Convo::Tasks {
+                    drain: nd_backend::Drain::Busy
+                }
+            ))
+    );
+    let Event::Out { line } = &mut records[table].event else {
+        unreachable!()
+    };
+    let mut frame: serde_json::Value = serde_json::from_str(line).unwrap();
+    frame.as_object_mut().unwrap().remove("tasks");
+    *line = frame.to_string();
+    assert!(
+        replay(&records[..=table])
+            .iter()
+            .flatten()
+            .any(|fact| matches!(
+                fact,
+                Convo::Tasks {
+                    drain: nd_backend::Drain::Unknown { .. }
+                }
+            ))
+    );
+}

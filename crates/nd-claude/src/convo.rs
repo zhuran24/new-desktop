@@ -89,6 +89,8 @@ pub struct Conversation {
     /// 主对话当前流式输出的消息 id（`message_start` 给的）。
     streaming: Option<String>,
     tasks: BTreeSet<String>,
+    #[serde(default)]
+    tasks_unknown: bool,
     schedules: bool,
     lost: bool,
     reported: Option<Drain>,
@@ -153,6 +155,10 @@ impl Conversation {
         if self.lost {
             Drain::Unknown {
                 why: "看守流水丢过重建不出的行".into(),
+            }
+        } else if self.tasks_unknown {
+            Drain::Unknown {
+                why: "后端任务整表缺失或格式无法识别".into(),
             }
         } else if self.schedules {
             Drain::Unknown {
@@ -428,15 +434,24 @@ impl Conversation {
                     self.drain_changed(out);
                 }
                 Some("background_tasks_changed") => {
-                    self.tasks = frame["tasks"]
-                        .as_array()
-                        .map(|tasks| {
+                    let tasks: Option<BTreeSet<String>> =
+                        frame["tasks"].as_array().and_then(|tasks| {
                             tasks
                                 .iter()
-                                .filter_map(|t| t["task_id"].as_str().map(str::to_owned))
+                                .map(|t| {
+                                    t["task_id"]
+                                        .as_str()
+                                        .filter(|id| !id.is_empty())
+                                        .map(str::to_owned)
+                                })
                                 .collect()
-                        })
-                        .unwrap_or_default();
+                        });
+                    if let Some(tasks) = tasks {
+                        self.tasks = tasks;
+                        self.tasks_unknown = false;
+                    } else {
+                        self.tasks_unknown = true;
+                    }
                     self.drain_changed(out);
                 }
                 _ => {}
