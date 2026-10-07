@@ -281,6 +281,7 @@ impl Executor {
 
     /// 处理一个输入。`Died` 表示（测试构建里）模拟的崩溃：执行器就此停下，内存状态丢掉。
     pub fn handle(&mut self, input: Input) -> Flow {
+        self.clear_busy_idle_clock();
         if let Input::Batch(batch) = &input
             && batch.facts.is_empty()
             && batch.checkpoint.is_none()
@@ -433,6 +434,7 @@ impl Executor {
     }
 
     fn after_commit(&mut self, mut fx: Effects, live: Vec<Live>) {
+        self.clear_busy_idle_clock();
         fx.hand.sort_by_key(|ticket| {
             self.core
                 .outbox

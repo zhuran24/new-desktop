@@ -22,9 +22,16 @@ impl Executor {
             && self.shared.watchers.load(Ordering::Acquire) == 0
     }
 
-    pub(super) fn idle_due(&mut self) -> bool {
+    /// 忙碌输入可能始终压住 Tick；进入忙碌状态及处理输入时立即废弃旧起点。
+    pub(super) fn clear_busy_idle_clock(&mut self) {
         if !self.idle_now() {
             self.idle_since = None;
+        }
+    }
+
+    pub(super) fn idle_due(&mut self) -> bool {
+        self.clear_busy_idle_clock();
+        if !self.idle_now() {
             return false;
         }
         let since = *self.idle_since.get_or_insert_with(Instant::now);
