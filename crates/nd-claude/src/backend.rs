@@ -104,6 +104,47 @@ struct PendingInvoke {
     approval: Option<String>,
 }
 
+/// 适配器私有检查点。每个字段独立开放解码；缺失的旧版写入索引不冒充空索引。
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct ClaudeCheckpoint {
+    #[serde(default, deserialize_with = "checkpoint_field")]
+    seq: u64,
+    #[serde(default, deserialize_with = "checkpoint_field")]
+    convo: Conversation,
+    #[serde(default, deserialize_with = "checkpoint_field")]
+    writes: Option<HashMap<String, u64>>,
+    #[serde(default, deserialize_with = "checkpoint_field")]
+    controls: Option<HashMap<String, SavedControl>>,
+    #[serde(default, deserialize_with = "checkpoint_field")]
+    settings_controls: HashMap<String, Ticket>,
+    #[serde(default, deserialize_with = "checkpoint_field")]
+    invokes: BTreeMap<String, PendingInvoke>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SavedControl {
+    Control((Ticket, Act)),
+    LegacySetting(Ticket),
+}
+
+fn checkpoint_field<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    Ok(serde_json::from_value(Value::deserialize(deserializer)?).unwrap_or_default())
+}
+
+impl ClaudeCheckpoint {
+    fn decode(checkpoint: &Checkpoint) -> Self {
+        serde_json::from_value(checkpoint.0.clone()).unwrap_or_default()
+    }
+    fn encode(self) -> Checkpoint {
+        Checkpoint(serde_json::to_value(self).expect("checkpoint has only JSON-compatible fields"))
+    }
+}
+
 /// 等动作 mod 结论的上限：Bash 最长 10 分钟，压缩要等会话空闲。
 const INVOKE_WAIT: Duration = Duration::from_secs(3600);
 
@@ -803,20 +844,14 @@ impl Inner {
                 )
             })
             .collect();
-        let mut written: HashMap<String, u64> = record
+        let checkpoint = record
             .checkpoint
             .as_ref()
-            .and_then(|c| serde_json::from_value(c.0["writes"].clone()).ok())
+            .map(ClaudeCheckpoint::decode)
             .unwrap_or_default();
-        let cursor = record
-            .checkpoint
-            .as_ref()
-            .and_then(|c| c.0["seq"].as_u64())
-            .unwrap_or(0);
-        let known_prefix = record
-            .checkpoint
-            .as_ref()
-            .is_none_or(|c| c.0["writes"].is_object());
+        let mut written = checkpoint.writes.clone().unwrap_or_default();
+        let cursor = checkpoint.seq;
+        let known_prefix = record.checkpoint.is_none() || checkpoint.writes.is_some();
         let (scanned, through, complete) = self
             .written(
                 &run,
@@ -825,24 +860,16 @@ impl Inner {
             )
             .await;
         written.extend(scanned);
-        let control_prefix = record
-            .checkpoint
-            .as_ref()
-            .is_none_or(|c| c.0["controls"].is_object());
-        if let Some(c) = &record.checkpoint
-            && !c.0["writes"].is_object()
-            && let Some(previous) = c.0["controls"].as_object()
+        let control_prefix = record.checkpoint.is_none() || checkpoint.controls.is_some();
+        if checkpoint.writes.is_none()
+            && let Some(previous) = &checkpoint.controls
         {
             for id in previous.keys() {
                 written.entry(id.clone()).or_insert(0);
             }
         }
         // 交给动作 mod 的事：检查点里记着的（含没用掉的自动批准）加上引擎交来的未结票。
-        let saved: BTreeMap<String, PendingInvoke> = record
-            .checkpoint
-            .as_ref()
-            .and_then(|c| serde_json::from_value(c.0["invokes"].clone()).ok())
-            .unwrap_or_default();
+        let saved = &checkpoint.invokes;
         let invokes: BTreeMap<String, PendingInvoke> = pending
             .iter()
             .filter_map(|p| match &p.act {
@@ -965,13 +992,7 @@ impl Inner {
                 },
             ));
         }
-        let (cursor, convo) = match &record.checkpoint {
-            Some(Checkpoint(value)) => (
-                value["seq"].as_u64().unwrap_or(0),
-                serde_json::from_value(value["convo"].clone()).unwrap_or_default(),
-            ),
-            None => (0, Conversation::new()),
-        };
+        let convo = checkpoint.convo.clone();
         let recover_through = claude_run.cursor();
         claude_run.seek(cursor);
         if let Some(previous) = &caps
@@ -1035,9 +1056,11 @@ impl Inner {
                 let id = format!("title:{}", p.issued.ticket);
                 let (seen, _, complete) = self.written(&run, &HashSet::from([id.clone()]), 0).await;
                 let was_written = seen.contains_key(&id)
-                    || record.checkpoint.as_ref().is_some_and(|c| {
-                        !c.0["settings_controls"][&id].is_null() || !c.0["controls"][&id].is_null()
-                    });
+                    || (checkpoint.settings_controls.contains_key(&id)
+                        || checkpoint
+                            .controls
+                            .as_ref()
+                            .is_some_and(|controls| controls.contains_key(&id)));
                 if was_written {
                     restored_controls.insert(id, p.issued.ticket.clone());
                 } else if !complete {
@@ -1552,14 +1575,20 @@ impl Actor {
     }
 
     fn checkpoint(&self, through: u64) -> Checkpoint {
-        Checkpoint(json!({
-            "seq": through,
-            "convo": self.convo,
-            "writes": self.writes,
-            "controls": self.controls,
-            "settings_controls": self.settings_controls,
-            "invokes": self.invokes,
-        }))
+        ClaudeCheckpoint {
+            seq: through,
+            convo: self.convo.clone(),
+            writes: Some(self.writes.clone()),
+            controls: Some(
+                self.controls
+                    .iter()
+                    .map(|(id, control)| (id.clone(), SavedControl::Control(control.clone())))
+                    .collect(),
+            ),
+            settings_controls: self.settings_controls.clone(),
+            invokes: self.invokes.clone(),
+        }
+        .encode()
     }
 
     /// 交一批事实，带上当前的检查点（流水位置不变时也要记下未结的动作 mod 命令）。
@@ -2298,10 +2327,9 @@ impl BackendAdapter for ClaudeBackend {
     }
 
     fn committed(&self, ack: Ack) {
-        if let Some(seq) = ack.checkpoint.0["seq"].as_u64()
-            && let Some(slot) = self.inner.carriers.lock().unwrap().get(&ack.carrier)
-        {
-            let _ = slot.tx.send(Cmd::Ack(seq));
+        let checkpoint = ClaudeCheckpoint::decode(&ack.checkpoint);
+        if let Some(slot) = self.inner.carriers.lock().unwrap().get(&ack.carrier) {
+            let _ = slot.tx.send(Cmd::Ack(checkpoint.seq));
         }
     }
 
