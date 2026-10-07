@@ -167,20 +167,19 @@ tick_ms = 50
             .output()
             .await
             .unwrap();
+        if let Some(keep) = std::env::var_os("ND_NATIVE_OUTPUT") {
+            let target = Path::new(&keep).join(format!("invoke-{expect}"));
+            let _ = std::fs::create_dir_all(&target);
+            for entry in std::fs::read_dir(&output).into_iter().flatten().flatten() {
+                let _ = std::fs::copy(entry.path(), target.join(entry.file_name()));
+            }
+        }
         assert!(
             result.status.success(),
             "{}\n{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
-        if let Some(keep) = std::env::var_os("ND_NATIVE_OUTPUT") {
-            let target = Path::new(&keep).join(format!("invoke-{expect}"));
-            let _ = std::fs::create_dir_all(&target);
-            for entry in std::fs::read_dir(&output).unwrap() {
-                let entry = entry.unwrap();
-                let _ = std::fs::copy(entry.path(), target.join(entry.file_name()));
-            }
-        }
         serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap()
     }
     async fn create(&self, id: &str, text: &str) -> String {
@@ -341,6 +340,40 @@ async fn bang_runs_one_command_without_a_turn_and_the_next_request_reads_its_out
     );
     assert!(text.contains("FIRST"), "{text}");
     assert!(text.contains("VAR=[]"), "{text}");
+
+    // 回合进行中输入的 `!`：和终端一样，等这一回合结束再跑。
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("慢回答"));
+    fx.send("bang-busy-send", &session, "说慢一点").await;
+    fx.wait(&session, "a turn is running", |s| {
+        header(s)["process"]["turn_running"] == true
+    })
+    .await;
+    let mut ui = fx.ui().await;
+    let busy = Command {
+        id: "bang-busy".into(),
+        device: "test".into(),
+        name: "session.shell".into(),
+        args: json!({"session":session,"command":"echo AFTER_TURN"}),
+        expect: json!({}),
+    };
+    let pending = tokio::spawn(async move {
+        ui.command_waiting(&busy, Duration::from_secs(90))
+            .await
+            .unwrap()
+    });
+    fx.wait(&session, "the bang waits for the turn", |s| {
+        item(s, "invoke/bang-busy").is_some_and(|i| i.data["state"] == "waiting_turn")
+    })
+    .await;
+    gate.release();
+    let after_turn = pending.await.unwrap();
+    assert!(
+        done_value(&after_turn)["stdout"]
+            .as_str()
+            .is_some_and(|o| o.contains("AFTER_TURN")),
+        "{after_turn:?}"
+    );
+    fx.turn(&session, "慢回答").await;
 
     // 真窗口：在产品输入框打 `!` 命令提交，经同一条 nd-wire 命令跑完，输入框被守护进程清空。
     let verdict = fx.native(&session, "!echo NATIVE_BANG", "cleared").await;
@@ -789,6 +822,17 @@ async fn a_bang_running_across_a_daemon_restart_settles_once_from_the_mod_result
         "the daemon really restarted"
     );
     let _ = waiting.await;
+    // 接回之后命令还在跑：重启后的对账只能按操作 id 问到「还在跑」，不能当成不明。
+    fx.wait(&session, "recovered while the bang still runs", |s| {
+        header(s)["recovering"] == false
+            && item(s, "invoke/br-1").is_some_and(|i| i.data["state"] == "running")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        item(&fx.peek(&session).await, "invoke/br-1").unwrap().data["state"],
+        "running"
+    );
     fifo.release("go").unwrap();
     // 重启后按操作 id 问动作 mod，拿到这条命令的结论；收据只落一次。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);

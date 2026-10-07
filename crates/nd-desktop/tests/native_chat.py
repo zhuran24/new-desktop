@@ -110,8 +110,21 @@ def inner():
                 screenshot('degraded')
                 (out / 'result.json').write_text(json.dumps({'pass': True, 'notice': notice, 'editor': editor}, ensure_ascii=False))
             else:
-                editor = sequence('invoke', 'rendered_editor', lambda s: s['text'] == settings['invoke'],
-                                  lambda s: s['text'] == '' and s['saved'])
+                # 输入、保存、受理可能在一帧之内完成（同 #16），不要求中间正文单独占一帧：
+                # 先等本窗口的会话副本里出现这条命令跑完的条目，再看输入框最终为空且已保存。
+                command = settings['invoke'][1:].strip()
+                settings['watch'] = 'rendered_session'
+                wait('invoke', lambda s: any(i['kind'] == 'shell' and i['data'].get('command') == command
+                                             and i['data'].get('state') == 'done' for i in s['items']))
+                deadline = time.monotonic() + 20
+                while True:
+                    editors = [json.loads(line)['rendered_editor'] for line in (out / 'invoke.jsonl').read_text().splitlines()
+                               if line.startswith('{"rendered_editor"')]
+                    editor = editors[-1] if editors else None
+                    if editor and editor['text'] == '' and editor['saved']:
+                        break
+                    assert time.monotonic() < deadline, f'composer not cleared after the bang ran: {editor}'
+                    time.sleep(0.05)
                 screenshot('bang')
                 (out / 'result.json').write_text(json.dumps({'pass': True, 'editor': editor}, ensure_ascii=False))
             return
