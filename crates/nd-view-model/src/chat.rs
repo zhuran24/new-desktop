@@ -62,18 +62,161 @@ pub struct MessageView {
     pub withdraw: Option<String>,
     pub detail: String,
     pub resend: Option<String>,
+    /// 这条提示还在对话里、能从它总结：值是消息 id（`session.compact` 的 `message`）。
+    pub summarize: Option<String>,
     pub blocks: Vec<crate::MessageBlock>,
     pub attachments: Vec<nd_wire::Attachment>,
+}
+/// 后端进程此刻能做的事（端口能力表）；界面据此显示或隐藏入口。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Abilities {
+    pub summarize: bool,
+    pub shell: bool,
+    pub subtask: bool,
+}
+impl Default for Abilities {
+    fn default() -> Self {
+        Self {
+            summarize: true,
+            shell: true,
+            subtask: true,
+        }
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConversationView {
     pub messages: Vec<MessageView>,
     pub header: String,
     pub can_send: bool,
+    /// 只能聊天的降级提示：原因和这时用不了的功能。
+    pub degraded: Option<String>,
+    pub abilities: Abilities,
+}
+
+/// 输入框里的一段文字是什么：普通消息、`!` 命令、`/subtask` 子任务，或缺了内容的命令。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposerInput {
+    Message,
+    Shell(String),
+    Subtask(String),
+    Empty(&'static str),
+}
+/// 和终端一样：`!` 开头是 shell 命令，`/subtask ` 开头派 fork 型子代理。
+pub fn composer_input(text: &str) -> ComposerInput {
+    if let Some(command) = text.strip_prefix('!') {
+        let command = command.trim();
+        return if command.is_empty() {
+            ComposerInput::Empty("! 后面写要跑的命令")
+        } else {
+            ComposerInput::Shell(command.into())
+        };
+    }
+    if let Some(rest) = text.strip_prefix("/subtask")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        let prompt = rest.trim();
+        return if prompt.is_empty() {
+            ComposerInput::Empty("/subtask 后面写子任务要做什么")
+        } else {
+            ComposerInput::Subtask(prompt.into())
+        };
+    }
+    ComposerInput::Message
+}
+
+fn abilities(header: Option<&nd_wire::Item>) -> Abilities {
+    let Some(header) = header else {
+        return Abilities::default();
+    };
+    let features = header.data["process"]["features"].as_array();
+    let degraded = !header.data["degraded"].is_null();
+    let able = |id: &str| match features.and_then(|f| f.iter().find(|f| f["id"] == id)) {
+        Some(f) => f["available"] != false,
+        None => !degraded,
+    };
+    Abilities {
+        summarize: able("summarize"),
+        shell: able("bang_mode"),
+        subtask: able("fork_subagent"),
+    }
+}
+
+fn invocation_view(i: &nd_wire::Item) -> Option<(String, String, String, String)> {
+    let state = i.data["state"].as_str().unwrap_or_default();
+    let reason = i.data["reason"].as_str().unwrap_or_default().to_owned();
+    let pending = match state {
+        "held" => Some("代持中"),
+        "waiting" => Some("等待可写"),
+        "waiting_turn" => Some("等这一回合结束"),
+        "pending" => Some("等待写出"),
+        "running" => Some("进行中"),
+        "rejected" => Some("没有执行"),
+        "failed" => Some("失败"),
+        "unknown" => Some("结果不明"),
+        _ => None,
+    };
+    let (title, text, done) = match i.kind.as_str() {
+        "shell" => {
+            let output = format!(
+                "{}{}",
+                i.data["stdout"].as_str().unwrap_or_default(),
+                i.data["stderr"].as_str().unwrap_or_default()
+            );
+            let mut text = format!("! {}", i.data["command"].as_str().unwrap_or_default());
+            if !output.is_empty() {
+                text.push('\n');
+                text.push_str(output.trim_end());
+            }
+            let done = match i.data["exit"].as_i64() {
+                Some(0) => "已完成".to_owned(),
+                Some(code) => format!("退出码 {code}"),
+                None => "已结束".to_owned(),
+            };
+            ("! 命令", text, done)
+        }
+        "compact" => (
+            "总结",
+            if i.data["scope"] == "from" {
+                "从这里总结".to_owned()
+            } else {
+                "总结到这里".to_owned()
+            },
+            "已总结".to_owned(),
+        ),
+        "subtask" => {
+            let mut text = format!("/subtask {}", i.data["prompt"].as_str().unwrap_or_default());
+            if let Some(agent) = i.data["agent"].as_str() {
+                text.push_str(&format!("\n子代理 {agent}"));
+            }
+            ("fork 型子代理", text, "已派出".to_owned())
+        }
+        _ => return None,
+    };
+    let status = match pending {
+        Some(p) => p.to_owned(),
+        None if state == "done" => done,
+        None => state.to_owned(),
+    };
+    Some((title.into(), text, status, reason))
 }
 /// 累积正文整体投影；未知条目显示后备文字，不解析 CLI 流水。
 pub fn conversation(snapshot: &Snapshot) -> ConversationView {
     let header = snapshot.items.iter().find(|i| i.kind == "header");
+    let abilities = abilities(header);
+    let lineage = snapshot.items.iter().find(|i| i.kind == "lineage");
+    let in_rounds: std::collections::BTreeSet<&str> = lineage
+        .and_then(|l| l.data["rounds"].as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|r| r["messages"].as_array().into_iter().flatten())
+        .filter_map(|m| m.as_str())
+        .collect();
+    let summarized: std::collections::BTreeSet<&str> = lineage
+        .and_then(|l| l.data["summarized"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.as_str())
+        .collect();
     let mut items: Vec<_> = snapshot
         .items
         .iter()
@@ -83,6 +226,24 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
         .collect();
     items.sort_by_key(|i| i.data["seq"].as_u64().unwrap_or(u64::MAX));
     ConversationView {
+        abilities,
+        degraded: header.and_then(|i| {
+            let degraded = &i.data["degraded"];
+            if degraded.is_null() {
+                return None;
+            }
+            let unavailable: Vec<&str> = degraded["unavailable"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .collect();
+            Some(format!(
+                "只能聊天：{}。这时用不了：{}",
+                degraded["why"].as_str().unwrap_or("后端进程降级"),
+                unavailable.join("、")
+            ))
+        }),
         can_send: header
             .is_some_and(|i| matches!(i.data["status"].as_str(), Some("active" | "preparing"))),
         header: header
@@ -117,77 +278,100 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
             .unwrap_or_default(),
         messages: items
             .into_iter()
-            .map(|i| MessageView {
-                id: i.id.clone(),
-                kind: i.kind.clone(),
-                title: if i.kind == "op" {
-                    match i.data["kind"].as_str() {
-                        Some("create") => "新建会话",
-                        Some("launch") => "连接会话",
-                        Some("reclaim") => "回收闲置进程",
-                        _ => &i.fallback.title,
-                    }
-                    .into()
-                } else {
-                    i.fallback.title.clone()
-                },
-                text: if i.kind == "op" {
-                    i.data["reason"]
-                        .as_str()
-                        .unwrap_or(match i.data["phase"].as_str() {
-                            Some("running") => "进行中",
-                            Some("compensated") => "已撤销",
-                            Some("partial") => "部分完成",
-                            Some("unresolved") => "等待处理",
-                            Some("rejected") => "未受理",
-                            _ => &i.fallback.text,
-                        })
-                } else {
-                    i.data["text"].as_str().unwrap_or(&i.fallback.text)
+            .map(|i| {
+                if let Some((title, text, status, detail)) = invocation_view(i) {
+                    return MessageView {
+                        id: i.id.clone(),
+                        kind: i.kind.clone(),
+                        title,
+                        blocks: vec![crate::MessageBlock::Plain(text.clone())],
+                        text,
+                        status,
+                        markdown: false,
+                        withdraw: None,
+                        detail,
+                        resend: None,
+                        summarize: None,
+                        attachments: vec![],
+                    };
                 }
-                .into(),
-                markdown: i.kind == "text",
-                withdraw: (header.is_some_and(|h| h.data["interaction"]["withdraw"] == true)
-                    && i.kind == "prompt"
-                    && matches!(
-                        i.data["state"].as_str(),
-                        Some("held" | "waiting" | "pending" | "written" | "queued")
-                    ))
-                .then(|| i.data["message"].as_str().map(str::to_owned))
-                .flatten(),
-                detail: i.data["reason"].as_str().unwrap_or_default().into(),
-                resend: (i.kind == "prompt" && i.data["state"] == "not_delivered")
+                MessageView {
+                    summarize: (i.kind == "prompt" && abilities.summarize)
+                        .then(|| i.data["message"].as_str())
+                        .flatten()
+                        .filter(|m| in_rounds.contains(m) && !summarized.contains(m))
+                        .map(str::to_owned),
+                    id: i.id.clone(),
+                    kind: i.kind.clone(),
+                    title: if i.kind == "op" {
+                        match i.data["kind"].as_str() {
+                            Some("create") => "新建会话",
+                            Some("launch") => "连接会话",
+                            Some("reclaim") => "回收闲置进程",
+                            _ => &i.fallback.title,
+                        }
+                        .into()
+                    } else {
+                        i.fallback.title.clone()
+                    },
+                    text: if i.kind == "op" {
+                        i.data["reason"]
+                            .as_str()
+                            .unwrap_or(match i.data["phase"].as_str() {
+                                Some("running") => "进行中",
+                                Some("compensated") => "已撤销",
+                                Some("partial") => "部分完成",
+                                Some("unresolved") => "等待处理",
+                                Some("rejected") => "未受理",
+                                _ => &i.fallback.text,
+                            })
+                    } else {
+                        i.data["text"].as_str().unwrap_or(&i.fallback.text)
+                    }
+                    .into(),
+                    markdown: i.kind == "text",
+                    withdraw: (header.is_some_and(|h| h.data["interaction"]["withdraw"] == true)
+                        && i.kind == "prompt"
+                        && matches!(
+                            i.data["state"].as_str(),
+                            Some("held" | "waiting" | "pending" | "written" | "queued")
+                        ))
                     .then(|| i.data["message"].as_str().map(str::to_owned))
                     .flatten(),
-                blocks: crate::message_blocks(
-                    &i.kind,
-                    i.data["text"].as_str().unwrap_or(&i.fallback.text),
-                    &i.data["raw"],
-                ),
-                attachments: serde_json::from_value(i.data["attachments"].clone())
-                    .unwrap_or_default(),
-                status: if i.kind == "prompt" {
-                    match i.data["state"].as_str() {
-                        Some("held") => "代持中",
-                        Some("waiting") => "等待可写",
-                        Some("pending") => "等待写出",
-                        Some("written") => "已写出",
-                        Some("queued") => "排队中",
-                        Some("withdrawing") => "撤回中",
-                        Some("withdrawn") => "已撤回",
-                        Some("landed") => "已送达",
-                        Some("failed") => "发送失败",
-                        Some("unknown") => "交付不明",
-                        Some("not_delivered") => "未送达",
-                        Some("resent") => "已重发",
-                        _ => "",
+                    detail: i.data["reason"].as_str().unwrap_or_default().into(),
+                    resend: (i.kind == "prompt" && i.data["state"] == "not_delivered")
+                        .then(|| i.data["message"].as_str().map(str::to_owned))
+                        .flatten(),
+                    blocks: crate::message_blocks(
+                        &i.kind,
+                        i.data["text"].as_str().unwrap_or(&i.fallback.text),
+                        &i.data["raw"],
+                    ),
+                    attachments: serde_json::from_value(i.data["attachments"].clone())
+                        .unwrap_or_default(),
+                    status: if i.kind == "prompt" {
+                        match i.data["state"].as_str() {
+                            Some("held") => "代持中",
+                            Some("waiting") => "等待可写",
+                            Some("pending") => "等待写出",
+                            Some("written") => "已写出",
+                            Some("queued") => "排队中",
+                            Some("withdrawing") => "撤回中",
+                            Some("withdrawn") => "已撤回",
+                            Some("landed") => "已送达",
+                            Some("failed") => "发送失败",
+                            Some("unknown") => "交付不明",
+                            Some("not_delivered") => "未送达",
+                            Some("resent") => "已重发",
+                            _ => "",
+                        }
+                    } else if i.data["complete"] == false {
+                        "生成中"
+                    } else {
+                        ""
                     }
-                } else if i.data["complete"] == false {
-                    "生成中"
-                } else {
-                    ""
+                    .into(),
                 }
-                .into(),
             })
             .collect(),
     }

@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Invoked",
+  "description": "`session.shell`、`session.subtask`、`session.compact` 的 `Done.value`。字段按种类出现。",
+  "type": "object",
+  "properties": {
+    "agent": {
+      "description": "fork 型子代理的 id。",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "appended": {
+      "description": "`!` 的命令和输出已追加进对话（模型下一次请求读得到）。",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "draft": {
+      "description": "结果落定那一刻的当前草稿（总结的回填已在里面）。",
+      "$ref": "#/$defs/Draft"
+    },
+    "exit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32"
+    },
+    "invoke": {
+      "description": "起它的命令 id，也是会话流里 `invoke/<id>` 条目的 id。",
+      "type": "string"
+    },
+    "saved": {
+      "description": "总结回填时另存的稿（被替换的旧稿、或基准过时没能回填的原文）。",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "stderr": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stdout": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "invoke",
+    "draft"
+  ],
+  "$defs": {
+    "Attachment": {
+      "description": "附件正文经鉴权 HTTP GET/PUT，消息和草稿只携带内容寻址引用。",
+      "type": "object",
+      "properties": {
+        "blob": {
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "blob",
+        "name",
+        "media_type",
+        "size"
+      ]
+    },
+    "Draft": {
+      "description": "会话持久草稿；光标、选区和输入法组词不在此协议中。",
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Attachment"
+          }
+        },
+        "device": {
+          "type": "string"
+        },
+        "saved": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SavedDraft"
+          }
+        },
+        "text": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "version",
+        "text",
+        "device"
+      ]
+    },
+    "SavedDraft": {
+      "description": "版本比较落败的原文；id 是原编辑命令的 id，重试不重复另存。",
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Attachment"
+          }
+        },
+        "base_version": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "device": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "base_version",
+        "text",
+        "device"
+      ]
+    }
+  }
+}

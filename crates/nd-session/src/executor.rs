@@ -9,18 +9,19 @@ use crate::{
     lineage::{Event as LineageEvent, NativePosition},
     ops::{Create, Launch, OpSpec, Reclaim},
     projection::{Projection, Shown},
-    state::{self, Carrier, Core, Issuer, Message, Meta, OutRow, Status},
+    state::{self, Carrier, Core, Invoke, Issuer, Message, Meta, OutRow, Status},
 };
 use nd_backend::{
-    Ack, Act, Admit, AdoptPart, BackendKind, Backends, Batch, CarrierRecord, Done, Drain, FactBody,
-    Intent, Issued, Live, Outcome, PendingTicket, Refusal, SessionId, Ticket,
+    Ack, Act, Admit, AdoptPart, BackendKind, Backends, Batch, CarrierRecord, CompactScope, Done,
+    Drain, FactBody, Intent, Invocation, Invoked, Issued, Live, Outcome, PendingTicket, Refusal,
+    SessionId, Ticket,
 };
 use nd_claims::Exclusivity;
 use nd_store::{Store, Tx};
 use nd_wire::{Command, CommandReply, Item, Receipt};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -69,7 +70,12 @@ struct Effects {
     publish: Vec<(u64, Item)>,
     acks: Vec<(BackendKind, Ack)>,
     hand: Vec<Ticket>,
+    /// 收据等动作有结果的命令：这个事务里落了收据，提交后回给还在等的连接。
+    replies: Vec<(String, CommandReply)>,
 }
+
+/// 收据等动作有结果的命令（规格「收据时点」）：`!` 命令、总结、派 fork 型子代理。
+pub(crate) const DELIVERY: [&str; 3] = ["session.shell", "session.compact", "session.subtask"];
 
 enum Work {
     Command(Command),
@@ -98,6 +104,8 @@ pub(crate) struct Executor {
     /// 新建的会话在第一次提交之后才交端口 adopt（之前收件地址无处可交）。
     adopt_pending: bool,
     recovering: BTreeSet<nd_backend::CarrierId>,
+    /// 等收据的连接：命令 id → 回应。只在内存里；断开的界面按命令 id 查收据。
+    waiters: HashMap<String, Vec<oneshot::Sender<CommandReply>>>,
 }
 
 const CRASH: &str = "nd-session: simulated crash";
@@ -168,6 +176,7 @@ impl Executor {
             idle_since: None,
             adopt_pending: false,
             recovering,
+            waiters: HashMap::new(),
         };
         if born {
             this.adopt();
@@ -282,6 +291,7 @@ impl Executor {
             && self.recovering.is_empty()
             && self.core.ops.is_empty()
             && self.core.messages.values().all(|m| m.ticket.is_some())
+            && self.core.invokes.values().all(|i| i.ticket.is_some())
             && self
                 .projection
                 .items()
@@ -290,6 +300,28 @@ impl Executor {
         {
             return Flow::Continue;
         }
+        let pending_digest = match &input {
+            Input::Command { command, .. } => {
+                self.core.invokes.get(&command.id).map(|p| p.digest.clone())
+            }
+            _ => None,
+        };
+        let input = match (pending_digest, input) {
+            (Some(digest), Input::Command { command, reply }) => {
+                // 收据还没落：同内容的重试等同一个结果，不同内容回 conflict。
+                if digest == command.content_hash() {
+                    self.waiters.entry(command.id).or_default().push(reply);
+                } else {
+                    let _ = reply.send(CommandReply::Conflict);
+                }
+                return Flow::Continue;
+            }
+            (_, input) => input,
+        };
+        let deferred = match &input {
+            Input::Command { command, .. } => Some(command.id.clone()),
+            _ => None,
+        };
         let (reply, work) = match input {
             Input::Command { command, reply } => (Some(reply), Work::Command(command)),
             Input::Batch(batch) => (None, Work::Batch(batch)),
@@ -340,6 +372,17 @@ impl Executor {
         };
         if self.fault(Fault::AfterCommit) {
             return Flow::Died;
+        }
+        // 受理了、收据等动作有结果：先挂着。结果可能就在这个事务里定了（例如当场被拒），
+        // 所以挂在交出回应之前，结果入账的事务提交后统一回。
+        let mut reply = reply;
+        if value.is_none()
+            && let Some(id) = deferred.filter(|id| {
+                self.core.invokes.contains_key(id) || fx.replies.iter().any(|(r, _)| r == id)
+            })
+            && let Some(reply) = reply.take()
+        {
+            self.waiters.entry(id).or_default().push(reply);
         }
         // 提交之后：先追加事件、交出发件，命令的回应最后给（C1）。
         self.after_commit(fx, live);
@@ -415,6 +458,11 @@ impl Executor {
         }
         self.shared.feed.lock().unwrap().publish(fx.publish, false);
         self.publish_live(live);
+        for (id, reply) in fx.replies {
+            for waiter in self.waiters.remove(&id).unwrap_or_default() {
+                let _ = waiter.send(reply.clone());
+            }
+        }
         self.deps.listing.update(&self.core);
         for (kind, ack) in fx.acks {
             self.deps.backends.committed(&kind, ack);
@@ -459,6 +507,25 @@ impl Executor {
         live: &mut Vec<Live>,
     ) -> nd_store::Result<Option<CommandReply>> {
         match work {
+            Work::Command(command) if DELIVERY.contains(&command.name.as_str()) => {
+                let keep = self.deps.config.receipt_keep_ms;
+                let receipt = match nd_ledger::begin(tx, &command)? {
+                    nd_ledger::Begin::Prior(reply) => return Ok(Some(reply)),
+                    nd_ledger::Begin::Invalid => nd_ledger::invalid(),
+                    nd_ledger::Begin::New => {
+                        if self.recovering() {
+                            return Err(aborted("守护进程恢复中，命令未受理"));
+                        }
+                        match self.invoke_command(tx, &command, fx)? {
+                            Some(receipt) => receipt,
+                            // 受理了：意图已在核心里，收据等结果。
+                            None => return Ok(None),
+                        }
+                    }
+                };
+                nd_ledger::record(tx, &command.id, &command.content_hash(), &receipt, keep)?;
+                Ok(Some(CommandReply::Receipt { receipt }))
+            }
             Work::Command(command) => {
                 let keep = self.deps.config.receipt_keep_ms;
                 let reply = nd_ledger::execute(tx, &command, keep, |tx| {
@@ -1261,6 +1328,33 @@ impl Executor {
                 FactBody::Done { ticket, outcome } => {
                     self.record_outcome(tx, fx, &ticket, outcome)?
                 }
+                FactBody::Written { ticket, .. }
+                    if self
+                        .core
+                        .outbox
+                        .get(&ticket)
+                        .is_some_and(|r| matches!(r.issuer, Issuer::Invoke { .. })) =>
+                {
+                    let Some(Issuer::Invoke { id }) =
+                        self.core.outbox.get(&ticket).map(|r| r.issuer.clone())
+                    else {
+                        continue;
+                    };
+                    if let Some(invoke) = self.core.invokes.get(&id).cloned()
+                        && invoke.ticket.as_ref() == Some(&ticket)
+                    {
+                        self.show_invoke(tx, fx, &invoke, "running", None)?;
+                    }
+                }
+                FactBody::CapsChanged {
+                    readiness,
+                    features,
+                } => {
+                    if let Some(c) = self.core.carriers.get_mut(&batch.carrier) {
+                        c.readiness = Some(readiness);
+                        c.features = features;
+                    }
+                }
                 FactBody::Written { ticket, native } => {
                     if let Some(row) = self.core.outbox.get(&ticket)
                         && row.outcome.is_none()
@@ -1403,6 +1497,7 @@ impl Executor {
                             readiness,
                             interaction,
                             adopt,
+                            features,
                             ..
                         },
                 },
@@ -1412,6 +1507,7 @@ impl Executor {
                     c.alive = true;
                     c.readiness = Some(readiness.clone());
                     c.interaction = interaction.clone();
+                    c.features = features.clone();
                     c.adopt = adopt.clone();
                     c.checkpoint = None;
                     c.turn_running = false;
@@ -1702,6 +1798,22 @@ impl Executor {
                 }
                 self.core.ops.insert(op, record);
             }
+            Issuer::Invoke { id } => {
+                if matches!(
+                    outcome,
+                    Outcome::Refused {
+                        refusal: Refusal::Withheld
+                    }
+                ) {
+                    // 证明没写出：回到等待，按当下事实重新放行、另发尝试。
+                    if let Some(i) = self.core.invokes.get_mut(&id) {
+                        i.ticket = None;
+                        i.attempt += 1;
+                    }
+                } else {
+                    self.finish_invoke(tx, fx, &id, outcome)?;
+                }
+            }
             Issuer::Message { id, .. } => {
                 if matches!(
                     outcome,
@@ -1825,6 +1937,7 @@ impl Executor {
                 progress |= self.advance(tx, fx, &id)?;
             }
             progress |= self.pump(tx, fx)?;
+            progress |= self.pump_invokes(tx, fx)?;
             if !progress {
                 return Ok(());
             }
@@ -2098,6 +2211,7 @@ impl Executor {
                     },
                     turn_running: false,
                     turns: 0,
+                    features: vec![],
                 });
         }
         let Some(kind) = self.core.carriers.get(carrier).map(|c| c.kind.clone()) else {
@@ -2529,6 +2643,499 @@ impl Executor {
         )
     }
 
+    // —— 总结、`!` 命令、fork 型子代理（收据等动作有结果）——
+
+    /// 受理一条收据等动作有结果的命令：校验、记下意图（核心里的 `Invoke`）、按需清掉匹配的草稿。
+    /// 返回 `Some` 是立即可定的拒绝收据；`None` 表示已受理，收据等结果。
+    fn invoke_command(
+        &mut self,
+        tx: &mut Tx<'_>,
+        command: &Command,
+        fx: &mut Effects,
+    ) -> nd_store::Result<Option<Receipt>> {
+        if !self.born {
+            return Ok(Some(rejected("not_found", Value::Null)));
+        }
+        let status = self.core.meta().status;
+        if status == Status::Withdrawn {
+            return Ok(Some(rejected(
+                "precondition",
+                json!({"status": status.as_str()}),
+            )));
+        }
+        let feature = match command.name.as_str() {
+            "session.shell" => "bang_mode",
+            "session.subtask" => "fork_subagent",
+            _ => "summarize",
+        };
+        if let Some(why) = self
+            .core
+            .current_carrier()
+            .and_then(|c| c.unavailable(feature))
+        {
+            // 降级的进程（mod 没装上、只能聊天）做不了：会话头已写明原因。
+            return Ok(Some(rejected(
+                "unsupported",
+                json!({"feature": feature, "why": why}),
+            )));
+        }
+        let args = &command.args;
+        let mut message = None;
+        let mut restore = None;
+        let mut covers = vec![];
+        let mut input = None;
+        let invocation = match command.name.as_str() {
+            "session.shell" => match serde_json::from_value::<nd_wire::ShellArgs>(args.clone()) {
+                Ok(a) if !a.command.trim().is_empty() => {
+                    input = a.input;
+                    Invocation::Shell {
+                        command: a.command.trim().to_owned(),
+                    }
+                }
+                _ => return Ok(Some(rejected("invalid", json!({"need":["command"]})))),
+            },
+            "session.subtask" => {
+                match serde_json::from_value::<nd_wire::SubtaskArgs>(args.clone()) {
+                    Ok(a) if !a.prompt.trim().is_empty() => {
+                        input = a.input;
+                        Invocation::ForkAgent {
+                            prompt: a.prompt.trim().to_owned(),
+                        }
+                    }
+                    _ => return Ok(Some(rejected("invalid", json!({"need":["prompt"]})))),
+                }
+            }
+            _ => {
+                let Ok(a) = serde_json::from_value::<nd_wire::CompactArgs>(args.clone()) else {
+                    return Ok(Some(rejected(
+                        "invalid",
+                        json!({"need":["message","scope: from | up_to"]}),
+                    )));
+                };
+                let scope = match a.scope {
+                    nd_wire::CompactScope::From => CompactScope::From,
+                    nd_wire::CompactScope::UpTo => CompactScope::UpTo,
+                };
+                let target = a.message.as_str();
+                match self.anchor(target, scope) {
+                    Ok((anchor, text, attachments, covered)) => {
+                        message = Some(target.to_owned());
+                        if scope == CompactScope::From {
+                            restore = Some((text, attachments));
+                        }
+                        covers = covered;
+                        Invocation::Compact { scope, anchor }
+                    }
+                    Err(reason) => {
+                        return Ok(Some(rejected(
+                            "precondition",
+                            json!({"message": target, "reason": reason}),
+                        )));
+                    }
+                }
+            }
+        };
+        let mut invoke = Invoke {
+            id: command.id.clone(),
+            digest: command.content_hash(),
+            device: command.device.clone(),
+            invocation,
+            message,
+            restore,
+            draft_base: self.core.draft.version,
+            covers,
+            ticket: None,
+            attempt: 0,
+            waiting: None,
+            arrival: 0,
+        };
+        if matches!(invoke.invocation, Invocation::Compact { .. })
+            && self
+                .core
+                .invokes
+                .values()
+                .any(|i| matches!(i.invocation, Invocation::Compact { .. }))
+        {
+            return Ok(Some(rejected(
+                "precondition",
+                json!({"reason": "已有一次总结在进行，等它结束再选"}),
+            )));
+        }
+        self.core.arrivals += 1;
+        invoke.arrival = self.core.arrivals;
+        // `!` 和 /subtask 从输入框发出：输入框原文（`input`）等于当前稿且版本对得上，就同事务清稿。
+        if let Some(input) = input.as_deref()
+            && command.expect["draft_version"].as_u64() == Some(self.core.draft.version)
+            && self.core.draft.text == input
+            && self.core.draft.attachments.is_empty()
+        {
+            self.core.draft.version += 1;
+            self.core.draft.text.clear();
+            self.core.draft.device = command.device.clone();
+            invoke.draft_base = self.core.draft.version;
+        }
+        let shown = invoke_shown(&invoke, "held", json!({}));
+        self.core.invokes.insert(invoke.id.clone(), invoke);
+        self.show(tx, fx, shown)?;
+        Ok(None)
+    }
+
+    /// 当前段里还是 CLI 对话行的人类提示，按出现先后。
+    fn visible_prompts(&self) -> Vec<String> {
+        let lineage = &self.core.lineage;
+        lineage
+            .current()
+            .and_then(|segment| lineage.turns(segment).ok())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|turn| turn.messages.clone())
+            .filter(|m| !self.core.summarized.contains(m))
+            .collect()
+    }
+
+    fn prompt_content(&self, message: &str) -> Option<(String, Vec<nd_wire::Attachment>)> {
+        let id = format!("prompt/{message}");
+        self.projection
+            .items()
+            .into_iter()
+            .find(|i| i.id == id)
+            .map(|i| {
+                (
+                    i.data["text"].as_str().unwrap_or_default().to_owned(),
+                    serde_json::from_value(i.data["attachments"].clone()).unwrap_or_default(),
+                )
+            })
+    }
+
+    /// 所选提示的定位（原文与同一原文里的次序）和这次总结覆盖的提示；不能总结时回原因。
+    #[allow(clippy::type_complexity)]
+    fn anchor(
+        &self,
+        message: &str,
+        scope: CompactScope,
+    ) -> Result<
+        (
+            nd_backend::Anchor,
+            String,
+            Vec<nd_wire::Attachment>,
+            Vec<String>,
+        ),
+        String,
+    > {
+        if self.core.summarized.contains(message) {
+            return Err("这条提示已经被总结过".into());
+        }
+        let visible = self.visible_prompts();
+        let Some(at) = visible.iter().position(|m| m == message) else {
+            return Err("这条提示不在当前对话里，或还没有送达".into());
+        };
+        if scope == CompactScope::UpTo && at == 0 {
+            return Err("这条提示之前没有可总结的内容".into());
+        }
+        let Some((text, attachments)) = self.prompt_content(message) else {
+            return Err("找不到这条提示的原文".into());
+        };
+        let same: Vec<&String> = visible
+            .iter()
+            .filter(|m| {
+                self.prompt_content(m).as_ref() == Some(&(text.clone(), attachments.clone()))
+            })
+            .collect();
+        let nth = same.iter().position(|m| *m == message).unwrap_or(0) as u32 + 1;
+        let covers = match scope {
+            CompactScope::From => visible[at..].to_vec(),
+            CompactScope::UpTo => visible[..at].to_vec(),
+        };
+        Ok((
+            nd_backend::Anchor {
+                text: text.clone(),
+                attachments: attachments.clone(),
+                nth,
+                of: same.len() as u32,
+            },
+            text,
+            attachments,
+            covers,
+        ))
+    }
+
+    /// 发送台的另一半：按到达次序签发等着的总结、`!` 命令和 fork 型子代理。
+    /// 结构操作中、没有当前承载位时代持；当前承载位没有活进程就起按需拉起；`!` 等当前回合结束再跑。
+    fn pump_invokes(&mut self, tx: &mut Tx<'_>, fx: &mut Effects) -> nd_store::Result<bool> {
+        let mut queued: Vec<Invoke> = self
+            .core
+            .invokes
+            .values()
+            .filter(|i| i.ticket.is_none())
+            .cloned()
+            .collect();
+        if queued.is_empty() {
+            return Ok(false);
+        }
+        queued.sort_by_key(|i| i.arrival);
+        let mut progress = false;
+        for invoke in queued {
+            let structural = !self.core.ops.is_empty();
+            let current = self.core.current_carrier().cloned();
+            let Some(carrier) = current.filter(|_| !structural) else {
+                self.show_invoke(tx, fx, &invoke, "held", None)?;
+                continue;
+            };
+            if !carrier.alive {
+                self.show_invoke(tx, fx, &invoke, "held", None)?;
+                self.start_op(
+                    tx,
+                    fx,
+                    OpSpec::Launch(Launch {
+                        carrier: carrier.id.clone(),
+                    }),
+                    None,
+                )?;
+                return Ok(true);
+            }
+            if let Some(why) = carrier.unavailable(invoke.feature()) {
+                self.finish_invoke(
+                    tx,
+                    fx,
+                    &invoke.id,
+                    Outcome::Rejected {
+                        reject: nd_backend::Reject::Unsupported { why },
+                    },
+                )?;
+                progress = true;
+                continue;
+            }
+            if matches!(invoke.invocation, Invocation::Shell { .. }) && carrier.turn_running {
+                // 和终端一样：回合进行中输入的 `!` 等这一回合结束再跑。
+                self.show_invoke(tx, fx, &invoke, "waiting_turn", None)?;
+                continue;
+            }
+            let ticket = Ticket(format!("i:{}#{}", invoke.id, invoke.attempt));
+            match self.deps.claims.admit(
+                tx,
+                &ticket.0,
+                &nd_claims::Act::Write {
+                    session: self.id.0.clone(),
+                    bs: carrier.bs.clone(),
+                },
+            )? {
+                nd_claims::Admit::Go(nd_claims::Pass {
+                    route: nd_claims::Route::Live(run),
+                }) if carrier.run.as_ref().is_some_and(|r| r.0 == run) => {
+                    let row = OutRow {
+                        issued: Issued {
+                            ticket: ticket.clone(),
+                            session: self.id.clone(),
+                            write_gen: self.write_gen,
+                        },
+                        act: Act::Invoke {
+                            to: carrier.id.clone(),
+                            invocation: invoke.invocation.clone(),
+                        },
+                        kind: carrier.kind.clone(),
+                        issuer: Issuer::Invoke {
+                            id: invoke.id.clone(),
+                        },
+                        display: None,
+                        outcome: None,
+                        handed: false,
+                    };
+                    self.core.outbox.insert(ticket.clone(), row);
+                    if let Some(i) = self.core.invokes.get_mut(&invoke.id) {
+                        i.ticket = Some(ticket.clone());
+                        i.waiting = None;
+                    }
+                    fx.hand.push(ticket);
+                    self.show_invoke(tx, fx, &invoke, "pending", None)?;
+                    progress = true;
+                }
+                nd_claims::Admit::Go(_) => self.show_invoke(tx, fx, &invoke, "held", None)?,
+                nd_claims::Admit::Wait(obstacle) => {
+                    let why = format!("{obstacle:?}");
+                    if let Some(i) = self.core.invokes.get_mut(&invoke.id) {
+                        i.waiting = Some(why.clone());
+                    }
+                    self.show_invoke(tx, fx, &invoke, "waiting", Some(why))?;
+                }
+                nd_claims::Admit::No(refusal) => {
+                    self.finish_invoke(
+                        tx,
+                        fx,
+                        &invoke.id,
+                        Outcome::Refused {
+                            refusal: Refusal::Other {
+                                why: format!("独占登记不放行：{refusal:?}"),
+                            },
+                        },
+                    )?;
+                    progress = true;
+                }
+            }
+        }
+        Ok(progress)
+    }
+
+    fn show_invoke(
+        &mut self,
+        tx: &Tx<'_>,
+        fx: &mut Effects,
+        invoke: &Invoke,
+        state: &str,
+        reason: Option<String>,
+    ) -> nd_store::Result<()> {
+        let shown = invoke_shown(invoke, state, json!({"reason": reason}));
+        self.show(tx, fx, shown)
+    }
+
+    /// 一件 Invoke 有了结果：落收据（同事务），更新条目；总结成功时记下被总结的提示并回填草稿。
+    fn finish_invoke(
+        &mut self,
+        tx: &mut Tx<'_>,
+        fx: &mut Effects,
+        id: &str,
+        outcome: Outcome,
+    ) -> nd_store::Result<()> {
+        let Some(invoke) = self.core.invokes.remove(id) else {
+            return Ok(());
+        };
+        let reason = outcome.reason();
+        let (receipt, state, mut extra) = match &outcome {
+            Outcome::Ok {
+                done: Done::Invoked { result },
+            } => {
+                let value = match result {
+                    Invoked::Compacted => json!({}),
+                    Invoked::Shell {
+                        exit,
+                        stdout,
+                        stderr,
+                        appended,
+                    } => {
+                        json!({"exit": exit, "stdout": stdout, "stderr": stderr, "appended": appended})
+                    }
+                    Invoked::Forked { agent } => json!({"agent": agent}),
+                };
+                (None, "done", value)
+            }
+            Outcome::Ok { .. } => (None, "done", json!({})),
+            Outcome::Rejected { reject } => {
+                let code = match reject {
+                    nd_backend::Reject::Unsupported { .. } => "unsupported",
+                    nd_backend::Reject::Gone | nd_backend::Reject::NoCarrier => "precondition",
+                    nd_backend::Reject::Invalid { .. } => "invalid",
+                    nd_backend::Reject::NotAdopted | nd_backend::Reject::Busy => "unavailable",
+                    nd_backend::Reject::Conflict => "internal",
+                };
+                (Some(code), "rejected", json!({"reason": reason}))
+            }
+            Outcome::Refused {
+                refusal: Refusal::AnchorGone { why },
+            } => (Some("anchor_gone"), "rejected", json!({"reason": why})),
+            Outcome::Refused { .. } => {
+                (Some("not_executed"), "rejected", json!({"reason": reason}))
+            }
+            Outcome::Failed { .. } => (Some("failed"), "failed", json!({"reason": reason})),
+            Outcome::Unknown { .. } => (Some("unknown"), "unknown", json!({"reason": reason})),
+        };
+        if state == "done"
+            && let Invocation::Compact { scope, .. } = &invoke.invocation
+        {
+            self.core.summarized.extend(invoke.covers.iter().cloned());
+            let (text, attachments) = match scope {
+                CompactScope::From => invoke.restore.clone().unwrap_or_default(),
+                CompactScope::UpTo => (String::new(), vec![]),
+            };
+            let saved = self.backfill(tx, &invoke, text, attachments)?;
+            extra["saved"] = json!(saved);
+        }
+        extra["invoke"] = json!(invoke.id);
+        let mut value = extra.clone();
+        value["draft"] = json!(self.core.draft);
+        let receipt = match receipt {
+            None => Receipt::Done {
+                // 成功收据的形状只在 nd-wire 定义一次（`Invoked`）。
+                value: serde_json::to_value(
+                    serde_json::from_value::<nd_wire::Invoked>(value)
+                        .map_err(|e| aborted(format!("Invoked 收据：{e}")))?,
+                )
+                .expect("Invoked serializes"),
+            },
+            Some("unknown") => Receipt::Unknown {
+                now: json!({"invoke": invoke.id, "stream": format!("session/{}", self.id)}),
+            },
+            Some(code) => rejected(code, value),
+        };
+        let keep = self.deps.config.receipt_keep_ms;
+        nd_ledger::record(tx, &invoke.id, &invoke.digest, &receipt, keep)?;
+        let shown = invoke_shown(&invoke, state, extra);
+        self.show(tx, fx, shown)?;
+        fx.replies
+            .push((invoke.id.clone(), CommandReply::Receipt { receipt }));
+        Ok(())
+    }
+
+    /// 总结之后的草稿回填（#16 的回填约定）：以受理时的版本为基准；之后改过的不覆盖，
+    /// 回填的原文另存。被替换掉的非空草稿也另存，不丢。返回另存稿的 id。
+    fn backfill(
+        &mut self,
+        tx: &mut Tx<'_>,
+        invoke: &Invoke,
+        text: String,
+        attachments: Vec<nd_wire::Attachment>,
+    ) -> nd_store::Result<Vec<String>> {
+        let draft_owner = format!("draft/{}", self.id);
+        let mut saved = vec![];
+        if invoke.draft_base != self.core.draft.version {
+            if text.is_empty() && attachments.is_empty() {
+                // 「总结到这里」留空：输入框已经被改过，就不动它。
+                return Ok(saved);
+            }
+            let id = format!("{}/backfill", invoke.id);
+            for a in &attachments {
+                self.deps
+                    .blobs
+                    .hold(tx, &a.blob, &format!("draft-saved/{}/{id}", self.id))?;
+            }
+            self.core
+                .update_draft(&id, &invoke.device, invoke.draft_base, text, attachments);
+            saved.push(id);
+            return Ok(saved);
+        }
+        let old = self.core.draft.clone();
+        if (!old.text.is_empty() || !old.attachments.is_empty())
+            && (old.text != text || old.attachments != attachments)
+        {
+            let id = format!("{}/displaced", invoke.id);
+            for a in &old.attachments {
+                self.deps
+                    .blobs
+                    .hold(tx, &a.blob, &format!("draft-saved/{}/{id}", self.id))?;
+            }
+            self.core.draft.saved.push(nd_wire::SavedDraft {
+                attachments: old.attachments.clone(),
+                id: id.clone(),
+                base_version: old.version,
+                text: old.text.clone(),
+                device: old.device.clone(),
+            });
+            saved.push(id);
+        }
+        for a in &old.attachments {
+            self.deps.blobs.release(tx, &a.blob, &draft_owner)?;
+        }
+        for a in &attachments {
+            self.deps.blobs.hold(tx, &a.blob, &draft_owner)?;
+        }
+        self.core.update_draft(
+            &format!("{}/backfill", invoke.id),
+            &invoke.device,
+            invoke.draft_base,
+            text,
+            attachments,
+        );
+        Ok(saved)
+    }
+
     // —— 闲置回收 ——
 
     /// 当前进程闲置：没有操作、没有回合、发送台空、没有未结的票、后台任务确知已收尾、没人在看。
@@ -2542,6 +3149,7 @@ impl Executor {
         matches!(meta.status, Status::Active | Status::Partial)
             && self.core.ops.is_empty()
             && self.core.messages.is_empty()
+            && self.core.invokes.is_empty()
             && self.core.outbox.is_empty()
             && carrier.alive
             && !carrier.turn_running
@@ -2582,11 +3190,39 @@ impl Executor {
                 value
             })
             .collect();
-        let data = json!({"current": lineage.current(), "rounds": rounds, "inactive_messages": lineage.inactive_messages(), "topology": lineage.topology(),
+        let data = json!({"current": lineage.current(), "rounds": rounds, "summarized": self.core.summarized, "inactive_messages": lineage.inactive_messages(), "topology": lineage.topology(),
             "origin": lineage.origin(), "edges": lineage.edges(), "switches": lineage.switches(), "carriers": lineage.carriers(),
             "segments": lineage.topology().iter().map(|n| lineage.segment(&n.segment).unwrap()).collect::<Vec<_>>()});
         self.show(tx, fx, Shown::Lineage { data })?;
         state::save(tx, &self.core)
+    }
+}
+
+/// `invoke/<命令 id>` 条目：种类、内容、状态，再并上结果字段。
+fn invoke_shown(invoke: &Invoke, state: &str, extra: Value) -> Shown {
+    let mut data = match &invoke.invocation {
+        Invocation::Shell { command } => json!({"command": command}),
+        Invocation::ForkAgent { prompt } => json!({"prompt": prompt}),
+        Invocation::Compact { scope, .. } => json!({
+            "scope": match scope { CompactScope::From => "from", CompactScope::UpTo => "up_to" },
+            "message": invoke.message,
+        }),
+        // 改标题、生成标题不是收据等结果的命令，不进这里。
+        Invocation::Title { .. } | Invocation::GenerateTitle { .. } => json!({}),
+    };
+    data["invoke"] = json!(invoke.id);
+    data["state"] = json!(state);
+    if let Value::Object(extra) = extra {
+        for (k, v) in extra {
+            if !v.is_null() {
+                data[k] = v;
+            }
+        }
+    }
+    Shown::Invoke {
+        id: invoke.id.clone(),
+        kind: invoke.kind().into(),
+        data,
     }
 }
 
@@ -2628,8 +3264,17 @@ pub(crate) fn header(core: &Core) -> Value {
             "readiness": c.readiness,
             "turn_running": c.turn_running,
             "drain": c.drain,
+            "features": c.features,
         })),
         "interaction": carrier.map(|c| &c.interaction),
+        // 只能聊天的降级进程：会话头写明原因和这时用不了的功能（端口能力表给的名字）。
+        "degraded": carrier.and_then(|c| match &c.readiness {
+            Some(nd_backend::Readiness::ChatOnly { why }) => Some(json!({
+                "why": why,
+                "unavailable": c.features.iter().filter(|f| !f.available).map(|f| f.label.clone()).collect::<Vec<_>>(),
+            })),
+            _ => None,
+        }),
         "op": core.ops.values().next().map(|op| json!({"op": op.id, "kind": op.spec.kind(), "phase": op.phase.name()})),
     })
 }

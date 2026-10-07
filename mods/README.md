@@ -4,8 +4,8 @@
 
 | mod | 名字（plugin.json） | 挂的钩子 | 职责 |
 |---|---|---|---|
-| 钩子 mod | `new-desktop` | `session.start`、`classic.SessionStart`、`session.end` | 报到与控制循环；`/clear` 后用新 id 立即重报；把 `session.end` 作为报告交上来。以后挂退役、转接、Codex 子代理、总结的压缩钩子和只读命令。它不发起会引出模型请求的调用 |
-| 动作 mod | `new-desktop-actions` | 只有 `session.start` | 起控制循环，替守护进程发起调用、按操作 id 留结果。刻意保持薄 |
+| 钩子 mod | `new-desktop` | `session.start`、`classic.SessionStart`、`session.end`、`session.compact`（带 `.catch`） | 报到与控制循环；`/clear` 后用新 id 立即重报；把 `session.end` 作为报告交上来；总结的压缩钩子（`summarize.ts`）：只处理 `ND_SUM` 开头、主对话的那次压缩，按提示文字的 SHA-256 与次序定位，只把所选范围交给摘要器，定位不到或出错就 skip。以后挂退役、转接、Codex 子代理和只读命令。它不发起会引出模型请求的调用 |
+| 动作 mod | `new-desktop-actions` | 只有 `session.start` | 起控制循环，替守护进程发起调用、按操作 id 留结果：`compact`（`$.command.run` 发 `/compact ND_SUM …`）、`shell`（`$.tool.call` 调 Bash，再 `$.session.append` 追加命令与输出）、`fork`（`$.agent.spawn` 派 fork 型子代理）。长命令不挡住长轮询；`shell` 按到达次序一条一条跑。刻意保持薄 |
 
 两个 mod 的 `userConfig` 声明 `sock`（mod 通道 socket）和 `run`（后端进程编号），由守护进程经 `--settings` 的 `pluginConfigs` 传入。版本号与 `nd-mod-proto` 的 crate 版本一致。
 
@@ -17,7 +17,7 @@ CLI 装载前按固定规则扫描源码，违反就整个模块拒载（`claude
 - `$` 只能传给**同一文件**里的顶层函数，不能跨 `import` 传。
 - `on()` 的事件名、`$.env.get/set` 的名字都写字面量。
 
-所以按能力拆文件（N5）的做法是：每个能力文件放它自己的钩子和用 `$` 的辅助函数；`state.ts` 是共享状态的唯一位置，只放数据和纯函数，不碰 `$`；`proto.ts` 是生成的协议类型与常量。钩子 mod 现在有 `channel.ts`（报到、控制循环、命令执行）和 `lifecycle.ts`（会话结束报告）两个能力文件。新增的命令只要用到 `$`，就要写在控制循环所在的 `channel.ts` 里。
+所以按能力拆文件（N5）的做法是：每个能力文件放它自己的钩子和用 `$` 的辅助函数；`state.ts` 是共享状态的唯一位置，只放数据和纯函数，不碰 `$`；`proto.ts` 是生成的协议类型与常量。钩子 mod 现在有 `channel.ts`（报到、控制循环、命令执行）、`lifecycle.ts`（会话结束报告）和 `summarize.ts`（压缩钩子，不用 `$`）三个能力文件。新增的命令只要用到 `$`，就要写在控制循环所在的 `channel.ts` 里。
 
 模块重载（文件变动后 `reload_plugins`、worker 重生）会清零模块变量、再跑一次 `session.start`：mod 代次重新生成，旧代次的结果查不到。
 

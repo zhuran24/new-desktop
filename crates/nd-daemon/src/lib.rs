@@ -775,6 +775,16 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                         if !enqueue(&outgoing, response) { break; }
                         continue;
                     }
+                    Request::Execute { id, command } if greeted && nd_session::delivery(&command.name) => {
+                        // 收据等动作有结果（`!`、总结、fork 型子代理）：另起任务等，连接照常处理别的请求。
+                        let sessions = sessions.clone();
+                        let outgoing = outgoing.clone();
+                        tokio::spawn(async move {
+                            let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { reason: "没有这个会话命令".into() });
+                            enqueue(&outgoing, WireResponse::CommandReply { id, result });
+                        });
+                        continue;
+                    }
                     Request::Execute { id, command } if greeted && command.name.starts_with("session.") => {
                         let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { reason: "没有这个会话命令".into() });
                         if !enqueue(&outgoing, WireResponse::CommandReply { id, result }) { break; }

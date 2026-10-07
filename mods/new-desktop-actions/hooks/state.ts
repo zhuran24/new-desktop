@@ -11,6 +11,8 @@ export const self = {
   sid: '',
   epoch: 0,
   polling: false,
+  /** `!` 命令的串行链：上一条跑完才跑下一条。 */
+  shells: Promise.resolve() as Promise<void>,
 }
 
 /** 本代次已结束的操作，按操作 id 留着，供 query 和重连后补报。 */

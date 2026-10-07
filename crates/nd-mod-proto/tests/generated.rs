@@ -82,4 +82,25 @@ fn every_action_declares_whether_it_may_be_resent_after_reconnect() {
         Action::Query { op_ids: vec![] }.resend(),
         Resend::Resendable
     );
+    // 规格「两个 mod」：派子代理、调工具、压缩不可重发，查不到结果记 Unknown。
+    for action in [
+        Action::Compact {
+            spec: nd_mod_proto::SummarizeSpec {
+                scope: nd_mod_proto::CompactScope::From,
+                sha256: "0".repeat(64),
+                nth: 1,
+                of: 1,
+            },
+        },
+        Action::Shell {
+            command: "pwd".into(),
+            description: "!".into(),
+        },
+        Action::Fork {
+            prompt: "x".into(),
+            description: "x".into(),
+        },
+    ] {
+        assert_eq!(action.resend(), Resend::NotResendable, "{action:?}");
+    }
 }

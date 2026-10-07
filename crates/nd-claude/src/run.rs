@@ -65,6 +65,32 @@ impl Feature {
         Feature::SettingsRows,
         Feature::TaskOps,
     ];
+    /// 能力表里的稳定标识。
+    pub fn id(self) -> &'static str {
+        match self {
+            Feature::Retire => "retire",
+            Feature::CodexSubagent => "codex_subagent",
+            Feature::TellSubagent => "tell_subagent",
+            Feature::Summarize => "summarize",
+            Feature::BangMode => "bang_mode",
+            Feature::ForkSubagent => "fork_subagent",
+            Feature::SettingsRows => "settings_rows",
+            Feature::TaskOps => "task_ops",
+        }
+    }
+    /// 会话头列不可用功能时的名字（规格用户故事 28）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Feature::Retire => "退役",
+            Feature::CodexSubagent => "派 Codex 子代理",
+            Feature::TellSubagent => "给子代理直接发消息",
+            Feature::Summarize => "总结",
+            Feature::BangMode => "! 模式",
+            Feature::ForkSubagent => "fork 型子代理",
+            Feature::SettingsRows => "设置行",
+            Feature::TaskOps => "当前模型操作转接来的任务（只能看结果）",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +106,34 @@ pub struct Caps {
     pub features: BTreeMap<Feature, Availability>,
     /// Esc（`interrupt`）不停后台的子代理与 Workflow：声明了 perTaskStopAffordance 且 stdin 开着。
     pub interrupt_spares_background: bool,
+}
+impl Caps {
+    /// 后端端口的中立能力表（`nd_backend::Feature`），按 [`Feature::ALL`] 的次序。
+    pub fn table(&self) -> Vec<nd_backend::Feature> {
+        Feature::ALL
+            .iter()
+            .map(|f| {
+                let why = match self.features.get(f) {
+                    Some(Availability::Available) => None,
+                    Some(Availability::Unsupported { why }) => Some(why.clone()),
+                    None => Some("这个进程没有声明这项能力".into()),
+                };
+                nd_backend::Feature {
+                    id: f.id().into(),
+                    label: f.label().into(),
+                    available: why.is_none(),
+                    why,
+                }
+            })
+            .collect()
+    }
+    pub fn unsupported(&self, feature: Feature) -> Option<String> {
+        match self.features.get(&feature) {
+            Some(Availability::Available) => None,
+            Some(Availability::Unsupported { why }) => Some(why.clone()),
+            None => Some("这个进程没有声明这项能力".into()),
+        }
+    }
 }
 
 /// 就绪：initialize 已回应、两个 hello 都报了预期的后端会话 id（只能聊天时只有回应）。
@@ -421,6 +475,24 @@ impl ClaudeRun {
             },
         );
         Some(op_id)
+    }
+    /// 用指定的操作 id 按当前绑定发命令（不可重发的动作用票派生的 id，重启后能按它查）。
+    /// 这个 mod 没绑定在当前后端会话上就不发，返回 false。
+    pub fn send_as(&self, module: ModName, op_id: &str, action: Action) -> bool {
+        let binding = self.binding();
+        let Some(hello) = binding.mods.get(&module) else {
+            return false;
+        };
+        self.channel.send(
+            &self.ready.run,
+            module,
+            Command {
+                op_id: op_id.into(),
+                expected_backend_session_id: binding.backend_session_id,
+                expected_mod_gen: hello.mod_gen.clone(),
+                action,
+            },
+        )
     }
     /// 等某条命令的结论；None 表示到时限仍无结论。
     pub async fn result(&self, op_id: &str, timeout: Duration) -> Option<CommandResult> {

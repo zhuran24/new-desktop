@@ -220,6 +220,11 @@ pub struct Sessions {
     executors: Mutex<HashMap<SessionId, Arc<Handle>>>,
 }
 
+/// 收据等动作有结果的会话命令（`!` 命令、总结、派 fork 型子代理）：回应要等后端做完。
+pub fn delivery(name: &str) -> bool {
+    executor::DELIVERY.contains(&name)
+}
+
 /// 由建会话的命令 id 派生会话 id：同一条命令重试落在同一个会话上。
 pub fn session_id_for(command_id: &str) -> SessionId {
     use sha2::{Digest, Sha256};
@@ -368,7 +373,10 @@ impl Sessions {
             | "session.withdraw"
             | "session.configure"
             | "session.rename"
-            | "session.interrupt" => match command.args["session"].as_str() {
+            | "session.interrupt"
+            | "session.shell"
+            | "session.compact"
+            | "session.subtask" => match command.args["session"].as_str() {
                 Some(id) => SessionId(id.to_owned()),
                 None => return Some(self.reject_without_session(command, "invalid")),
             },

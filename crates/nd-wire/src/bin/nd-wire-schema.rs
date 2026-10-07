@@ -33,6 +33,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             schemars::schema_for!(nd_wire::DraftUpdated),
         ),
         (
+            "shell-args.schema.json",
+            schemars::schema_for!(nd_wire::ShellArgs),
+        ),
+        (
+            "subtask-args.schema.json",
+            schemars::schema_for!(nd_wire::SubtaskArgs),
+        ),
+        (
+            "compact-args.schema.json",
+            schemars::schema_for!(nd_wire::CompactArgs),
+        ),
+        (
+            "invoked.schema.json",
+            schemars::schema_for!(nd_wire::Invoked),
+        ),
+        (
             "attachments.schema.json",
             schemars::schema_for!(Vec<nd_wire::Attachment>),
         ),

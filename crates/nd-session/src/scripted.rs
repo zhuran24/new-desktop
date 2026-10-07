@@ -35,6 +35,8 @@ pub enum ActKind {
     Withdraw,
     Configure,
     Title,
+    /// 总结、`!`、派 fork 型子代理。
+    Invoke,
 }
 fn kind_of(act: &Act) -> ActKind {
     match act {
@@ -44,7 +46,25 @@ fn kind_of(act: &Act) -> ActKind {
         Act::Interrupt { .. } => ActKind::Interrupt,
         Act::Withdraw { .. } => ActKind::Withdraw,
         Act::Configure { .. } => ActKind::Configure,
-        Act::Invoke { .. } => ActKind::Title,
+        Act::Invoke {
+            invocation:
+                nd_backend::Invocation::Title { .. } | nd_backend::Invocation::GenerateTitle { .. },
+            ..
+        } => ActKind::Title,
+        Act::Invoke { .. } => ActKind::Invoke,
+    }
+}
+
+/// 原生步骤的名字：`invoke:compact:<范围>:<原文>`、`invoke:shell:<命令>`、`invoke:fork:<提示>`。
+fn invoke_step(what: &nd_backend::Invocation) -> String {
+    match what {
+        nd_backend::Invocation::Compact { scope, anchor } => {
+            format!("invoke:compact:{scope:?}:{}", anchor.text)
+        }
+        nd_backend::Invocation::Shell { command } => format!("invoke:shell:{command}"),
+        nd_backend::Invocation::ForkAgent { prompt } => format!("invoke:fork:{prompt}"),
+        nd_backend::Invocation::Title { title } => format!("title:{title}"),
+        nd_backend::Invocation::GenerateTitle { .. } => "generate-title".into(),
     }
 }
 
@@ -282,6 +302,7 @@ impl ScriptedAdapter {
                                 rewind_menu: true,
                             },
                             adopt: json!({"scripted": true}),
+                            features: vec![],
                         },
                     }),
                     fact(&format!("tasks:{ticket}"), FactBody::Tasks { drain }),
@@ -311,8 +332,20 @@ impl ScriptedAdapter {
                         },
                     ),
                     done(Outcome::Ok {
-                        done: Done::Landed { native },
+                        done: Done::Landed {
+                            native: native.clone(),
+                        },
                     }),
+                    // 后端确认的实际回合：一条消息一轮（谱系据此开轮，总结据此定位）。
+                    fact(
+                        &format!("turn:{ticket}"),
+                        FactBody::TurnMapped {
+                            turn: format!("turn-{native}"),
+                            natives: vec![native],
+                            complete: true,
+                            last_assistant: None,
+                        },
+                    ),
                 ]
             }
             (Act::Send { msg, .. }, Reply::Unknown(why)) => {
@@ -409,6 +442,56 @@ impl ScriptedAdapter {
                         title: Some("生成的标题".into()),
                     },
                 })]
+            }
+            (Act::Invoke { invocation, .. }, Reply::Ok) => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push(invoke_step(invocation));
+                let result = match invocation {
+                    nd_backend::Invocation::Compact { .. } => nd_backend::Invoked::Compacted,
+                    nd_backend::Invocation::Shell { command } => nd_backend::Invoked::Shell {
+                        exit: Some(0),
+                        stdout: format!("ran {command}"),
+                        stderr: String::new(),
+                        appended: true,
+                    },
+                    nd_backend::Invocation::ForkAgent { .. } => nd_backend::Invoked::Forked {
+                        agent: format!("agent-{}", nd_backend::native_uuid(&ticket)),
+                    },
+                    nd_backend::Invocation::Title { .. }
+                    | nd_backend::Invocation::GenerateTitle { .. } => {
+                        unreachable!("标题动作在前面的分支")
+                    }
+                };
+                vec![
+                    fact(
+                        &format!("written:{ticket}"),
+                        FactBody::Written {
+                            ticket: ticket.clone(),
+                            native: nd_backend::native_uuid(&ticket),
+                        },
+                    ),
+                    done(Outcome::Ok {
+                        done: Done::Invoked { result },
+                    }),
+                ]
+            }
+            (Act::Invoke { invocation, .. }, Reply::Unknown(why))
+                if !matches!(
+                    invocation,
+                    nd_backend::Invocation::Title { .. }
+                        | nd_backend::Invocation::GenerateTitle { .. }
+                ) =>
+            {
+                // 交给了后端、结论丢了：可能已生效。
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push(format!("{}?", invoke_step(invocation)));
+                vec![done(Outcome::Unknown { evidence: why })]
             }
             (Act::End { .. }, Reply::Ok) => {
                 let run = self.inner.lock().unwrap().live.remove(&carrier);

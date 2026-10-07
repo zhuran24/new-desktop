@@ -4,6 +4,9 @@ use nd_wire::{Command, CommandReply, Model, ReceiptLookup};
 use std::{io, path::Path, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
+/// 收据等动作有结果的命令最多等多久（Bash 最长 10 分钟，压缩要等会话空闲）。
+pub const DELIVERY_WAIT: Duration = Duration::from_secs(15 * 60);
+
 enum Work {
     Upload(
         AttachmentSource,
@@ -18,6 +21,8 @@ enum Work {
         oneshot::Sender<Result<nd_wire::Page, String>>,
     ),
     Receipt(String, oneshot::Sender<Result<ReceiptLookup, String>>),
+    /// 收据等动作有结果的命令：另开连接、另起任务等，不挡住草稿保存等别的命令。
+    Deliver(Command, oneshot::Sender<Result<CommandReply, String>>),
 }
 #[derive(Clone)]
 pub struct CommandClient {
@@ -35,6 +40,41 @@ impl CommandClient {
             .spawn(move || {
                 runtime.block_on(async move {
                     while let Some(work) = rx.recv().await {
+                        let work = match work {
+                            Work::Deliver(command, mut done) => {
+                                let path = path.clone();
+                                tokio::spawn(async move {
+                                    let result = async {
+                                        let mut ui = tokio::time::timeout(
+                                            Duration::from_secs(5),
+                                            SyncReplica::connect(&path),
+                                        )
+                                        .await
+                                        .map_err(|_| "连接守护进程超时".to_owned())?
+                                        .map_err(|e| e.to_string())?;
+                                        let result = ui
+                                            .command_waiting(&command, DELIVERY_WAIT)
+                                            .await
+                                            .map_err(|e| e.to_string());
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_millis(200),
+                                            ui.close(),
+                                        )
+                                        .await;
+                                        result
+                                    };
+                                    tokio::select! {
+                                        biased;
+                                        _ = done.closed() => {}
+                                        result = result => {
+                                            let _ = done.send(result);
+                                        }
+                                    }
+                                });
+                                continue;
+                            }
+                            work => work,
+                        };
                         let connected = tokio::time::timeout(
                             Duration::from_secs(5),
                             SyncReplica::connect(&path),
@@ -66,6 +106,7 @@ impl CommandClient {
                                     Work::Receipt(_, done) => {
                                         let _ = done.send(Err(why));
                                     }
+                                    Work::Deliver(..) => unreachable!("另起任务处理"),
                                 }
                                 continue;
                             }
@@ -108,6 +149,7 @@ impl CommandClient {
                                     }
                                 }
                             }
+                            Work::Deliver(..) => unreachable!("另起任务处理"),
                             Work::Models(backend, cwd, done) => {
                                 let result = tokio::time::timeout(
                                     Duration::from_secs(50),
@@ -150,6 +192,17 @@ impl CommandClient {
         let (done, result) = oneshot::channel();
         self.tx
             .try_send(Work::Command(command, done))
+            .map_err(|_| "命令队列已满或连接已关闭；未发送".to_owned())?;
+        result
+            .await
+            .map_err(|_| "命令连接已关闭；交付不明".to_owned())?
+    }
+    /// 收据等动作有结果的命令（`!`、总结、`/subtask`）：最多等 [`DELIVERY_WAIT`]，
+    /// 等的时候别的命令照常走。到时限没回应只查收据，不重发正文。
+    pub async fn deliver(&self, command: Command) -> Result<CommandReply, String> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .try_send(Work::Deliver(command, done))
             .map_err(|_| "命令队列已满或连接已关闭；未发送".to_owned())?;
         result
             .await

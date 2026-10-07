@@ -58,12 +58,34 @@ def inner():
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                value = event.get('rendered_history' if settings.get('history') else ('rendered_editor' if settings.get('drafts') else 'rendered_session'))
+                value = event.get(settings.get('watch') or ('rendered_history' if settings.get('history') else ('rendered_editor' if settings.get('drafts') else 'rendered_session')))
                 if value is not None and predicate(value):
                     return value
             time.sleep(0.03)
         screenshot('timeout')
         raise AssertionError(f'{name} never reached expected state: {(out / (name + ".jsonl")).read_text()[-4000:]}')
+
+    def sequence(name, kind, first, then, timeout=40):
+        """先出现满足 first 的一行，其后再出现满足 then 的一行（同一种呈现报告）。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if app.poll() is not None:
+                raise AssertionError(f'{name} exited {app.returncode}: {(out / (name + ".log")).read_text()[-3000:]}')
+            seen = False
+            for line in (out / f'{name}.jsonl').read_text().splitlines():
+                try:
+                    value = json.loads(line).get(kind)
+                except json.JSONDecodeError:
+                    continue
+                if value is None:
+                    continue
+                if not seen:
+                    seen = first(value)
+                elif then(value):
+                    return value
+            time.sleep(0.03)
+        screenshot('timeout')
+        raise AssertionError(f'{name} never reached the expected sequence: {(out / (name + ".jsonl")).read_text()[-4000:]}')
 
     def block(snapshot):
         return next((i for i in snapshot['items'] if i['kind'] == 'text'), None)
@@ -84,6 +106,37 @@ def inner():
         raise AssertionError(f'{name}: compositor only produced empty screenshots')
 
     try:
+        if settings.get('invoke'):
+            # 产品输入框里打 `!` 命令并提交：正常进程经 session.shell 跑完、草稿被守护进程清掉；
+            # 只能聊天的进程在会话头列出用不了的功能，`!` 不发出、正文留在输入框。
+            (Path('/sandbox/state') / 'ui.json').write_text(json.dumps({'selected_session': settings['session']}))
+            app = start('invoke', draft={'text': settings['invoke'], 'send': True})
+            if settings.get('expect') == 'refused':
+                settings['watch'] = 'rendered_notice'
+                notice = wait('invoke', lambda s: s.get('degraded') and '只能聊天' in (s.get('warning') or ''))
+                settings['watch'] = 'rendered_editor'
+                editor = wait('invoke', lambda s: s['text'] == settings['invoke'])
+                screenshot('degraded')
+                (out / 'result.json').write_text(json.dumps({'pass': True, 'notice': notice, 'editor': editor}, ensure_ascii=False))
+            else:
+                # 输入、保存、受理可能在一帧之内完成（同 #16），不要求中间正文单独占一帧：
+                # 先等本窗口的会话副本里出现这条命令跑完的条目，再看输入框最终为空且已保存。
+                command = settings['invoke'][1:].strip()
+                settings['watch'] = 'rendered_session'
+                wait('invoke', lambda s: any(i['kind'] == 'shell' and i['data'].get('command') == command
+                                             and i['data'].get('state') == 'done' for i in s['items']))
+                deadline = time.monotonic() + 20
+                while True:
+                    editors = [json.loads(line)['rendered_editor'] for line in (out / 'invoke.jsonl').read_text().splitlines()
+                               if line.startswith('{"rendered_editor"')]
+                    editor = editors[-1] if editors else None
+                    if editor and editor['text'] == '' and editor['saved']:
+                        break
+                    assert time.monotonic() < deadline, f'composer not cleared after the bang ran: {editor}'
+                    time.sleep(0.05)
+                screenshot('bang')
+                (out / 'result.json').write_text(json.dumps({'pass': True, 'editor': editor}, ensure_ascii=False))
+            return
         if settings.get('session_settings'):
             Path('/sandbox/state/ui.json').write_text(json.dumps({'selected_session': settings['session'], **({'theme_selection': {'kind': 'file', 'file': 'ocean.json'}} if settings.get('themes') else {})}))
             app = start('settings')
@@ -282,6 +335,8 @@ def inner():
 
 def run(args, script=None):
     themes = getattr(args, "themes", False)
+    invoke = getattr(args, "invoke", None)
+    expect = getattr(args, "expect", None)
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='nd-test-chat-'))
@@ -291,7 +346,7 @@ def run(args, script=None):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'themes': themes}))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings and not invoke, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'themes': themes, 'invoke': invoke, 'expect': expect}, ensure_ascii=False))
         if themes:
             shutil.copy(Path(__file__).parents[2] / 'nd-view-model/tests/fixtures/ocean.json', work / 'ocean.json')
         if args.attachments:
@@ -347,4 +402,6 @@ if __name__ == '__main__':
         parser.add_argument('--round')
         parser.add_argument('--text')
         parser.add_argument('--rounds', type=int)
+        parser.add_argument('--invoke', help='submit this text (e.g. "!pwd") in the native composer of --session')
+        parser.add_argument('--expect', choices=['cleared', 'refused'], default='cleared')
         run(parser.parse_args())

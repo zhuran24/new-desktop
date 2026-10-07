@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ShellArgs",
+  "description": "`session.shell` 的参数：`!` 模式在后端进程里跑一条 shell 命令，命令和输出追加进对话，本身不起回合。\n`input` 是输入框原文（含开头的 `!`）：等于当前稿且 `expect.draft_version` 对得上时同事务清稿。\n收据等动作有结果：`Done.value` 是 [`Invoked`]。",
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "input": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session",
+    "command"
+  ]
+}

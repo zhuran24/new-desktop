@@ -330,3 +330,62 @@ async fn unknown_delivery_survives_restart_and_only_confirmed_loss_allows_one_us
         1
     );
 }
+
+/// 收据等动作有结果：结果出来之前同 id 同内容的重试等同一个结果，不同内容回 conflict；
+/// 结果到了两个等待者拿到同一张收据，之后再查也是它，动作只执行一次。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_bang_answers_every_identical_retry_with_one_receipt() {
+    use nd_session::scripted::{ActKind, Reply};
+    let h = std::sync::Arc::new(Harness::new(config()).await);
+    let session = accepted_session(&h.create("bang-create", "你好").await);
+    h.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    h.adapter.script(ActKind::Invoke, Reply::Hold);
+    let bang = command(
+        "bang-1",
+        "session.shell",
+        serde_json::json!({"session":session,"command":"pwd"}),
+    );
+    let first = {
+        let (h, bang) = (h.clone(), bang.clone());
+        tokio::spawn(async move { h.sessions.execute(&bang).await.unwrap() })
+    };
+    h.wait(&session, "the bang was handed to the backend", |s| {
+        s.items
+            .iter()
+            .any(|i| i.id == "invoke/bang-1" && i.data["state"] == "pending")
+    })
+    .await;
+    let mut changed = bang.clone();
+    changed.args["command"] = serde_json::json!("ls");
+    assert_eq!(
+        h.sessions.execute(&changed).await,
+        Some(nd_wire::CommandReply::Conflict)
+    );
+    let second = {
+        let (h, bang) = (h.clone(), bang.clone());
+        tokio::spawn(async move { h.sessions.execute(&bang).await.unwrap() })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!first.is_finished() && !second.is_finished());
+    assert!(h.adapter.release(Reply::Ok));
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!(first, second);
+    let nd_wire::CommandReply::Receipt {
+        receipt: nd_wire::Receipt::Done { value },
+    } = &first
+    else {
+        panic!("{first:?}");
+    };
+    assert_eq!(value["invoke"], "bang-1");
+    assert_eq!(value["exit"], 0);
+    assert_eq!(h.sessions.execute(&bang).await, Some(first));
+    assert_eq!(
+        h.adapter
+            .applied()
+            .iter()
+            .filter(|s| *s == "invoke:shell:pwd")
+            .count(),
+        1
+    );
+}

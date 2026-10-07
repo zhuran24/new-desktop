@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CompactArgs",
+  "description": "`session.compact` 的参数：在一条人类提示上「从这里总结」（`from`）或「总结到这里」（`up_to`）。",
+  "type": "object",
+  "properties": {
+    "message": {
+      "description": "提示的消息 id（`prompt/<消息 id>` 条目的 `message`）。",
+      "type": "string"
+    },
+    "scope": {
+      "$ref": "#/$defs/CompactScope"
+    },
+    "session": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session",
+    "message",
+    "scope"
+  ],
+  "$defs": {
+    "CompactScope": {
+      "oneOf": [
+        {
+          "description": "从所选提示（含）到末尾；成功后提示原文回到输入框。",
+          "type": "string",
+          "const": "from"
+        },
+        {
+          "description": "从开头到所选提示（不含）；成功后输入框留空。",
+          "type": "string",
+          "const": "up_to"
+        }
+      ]
+    }
+  }
+}
