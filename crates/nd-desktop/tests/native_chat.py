@@ -49,12 +49,34 @@ def inner():
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                value = event.get('rendered_history' if settings.get('history') else ('rendered_editor' if settings.get('drafts') else 'rendered_session'))
+                value = event.get(settings.get('watch') or ('rendered_history' if settings.get('history') else ('rendered_editor' if settings.get('drafts') else 'rendered_session')))
                 if value is not None and predicate(value):
                     return value
             time.sleep(0.03)
         screenshot('timeout')
         raise AssertionError(f'{name} never reached expected state: {(out / (name + ".jsonl")).read_text()[-4000:]}')
+
+    def sequence(name, kind, first, then, timeout=40):
+        """先出现满足 first 的一行，其后再出现满足 then 的一行（同一种呈现报告）。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if app.poll() is not None:
+                raise AssertionError(f'{name} exited {app.returncode}: {(out / (name + ".log")).read_text()[-3000:]}')
+            seen = False
+            for line in (out / f'{name}.jsonl').read_text().splitlines():
+                try:
+                    value = json.loads(line).get(kind)
+                except json.JSONDecodeError:
+                    continue
+                if value is None:
+                    continue
+                if not seen:
+                    seen = first(value)
+                elif then(value):
+                    return value
+            time.sleep(0.03)
+        screenshot('timeout')
+        raise AssertionError(f'{name} never reached the expected sequence: {(out / (name + ".jsonl")).read_text()[-4000:]}')
 
     def block(snapshot):
         return next((i for i in snapshot['items'] if i['kind'] == 'text'), None)
@@ -75,6 +97,24 @@ def inner():
         raise AssertionError(f'{name}: compositor only produced empty screenshots')
 
     try:
+        if settings.get('invoke'):
+            # 产品输入框里打 `!` 命令并提交：正常进程经 session.shell 跑完、草稿被守护进程清掉；
+            # 只能聊天的进程在会话头列出用不了的功能，`!` 不发出、正文留在输入框。
+            (Path('/sandbox/state') / 'ui.json').write_text(json.dumps({'selected_session': settings['session']}))
+            app = start('invoke', draft={'text': settings['invoke'], 'send': True})
+            if settings.get('expect') == 'refused':
+                settings['watch'] = 'rendered_notice'
+                notice = wait('invoke', lambda s: s.get('degraded') and '只能聊天' in (s.get('warning') or ''))
+                settings['watch'] = 'rendered_editor'
+                editor = wait('invoke', lambda s: s['text'] == settings['invoke'])
+                screenshot('degraded')
+                (out / 'result.json').write_text(json.dumps({'pass': True, 'notice': notice, 'editor': editor}, ensure_ascii=False))
+            else:
+                editor = sequence('invoke', 'rendered_editor', lambda s: s['text'] == settings['invoke'],
+                                  lambda s: s['text'] == '' and s['saved'])
+                screenshot('bang')
+                (out / 'result.json').write_text(json.dumps({'pass': True, 'editor': editor}, ensure_ascii=False))
+            return
         if settings.get('history'):
             (Path('/sandbox/state') / 'ui.json').write_text(json.dumps({'selected_session': settings['session']}))
             app = start('history')
@@ -178,7 +218,7 @@ def run(args):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None and not args.history, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments}))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None and not args.history and not args.invoke, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'invoke': args.invoke, 'expect': args.expect}, ensure_ascii=False))
         if args.attachments:
             shutil.copy(Path(__file__).resolve().parents[2] / 'nd-daemon/tests/fixtures/preview.png', work / 'pixel.png')
             (work / 'pasted.txt').write_text('复制文件里的中文正文')
@@ -229,4 +269,6 @@ if __name__ == '__main__':
         parser.add_argument('--round')
         parser.add_argument('--text')
         parser.add_argument('--rounds', type=int)
+        parser.add_argument('--invoke', help='submit this text (e.g. "!pwd") in the native composer of --session')
+        parser.add_argument('--expect', choices=['cleared', 'refused'], default='cleared')
         run(parser.parse_args())

@@ -146,6 +146,43 @@ tick_ms = 50
             .await
             .unwrap()
     }
+    /// 真窗口（私有 KWin）里在产品输入框提交 `text`，见 nd-desktop/tests/native_chat.py 的 invoke 模式。
+    async fn native(&self, session: &str, text: &str, expect: &str) -> Value {
+        let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
+        let output = self.root().join(format!("native-{expect}"));
+        let result = tokio::process::Command::new("python")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
+            .arg("--desktop")
+            .arg(desktop)
+            .arg("--socket")
+            .arg(self.root().join("runtime/nd.sock"))
+            .arg("--output")
+            .arg(&output)
+            .arg("--session")
+            .arg(session)
+            .arg("--invoke")
+            .arg(text)
+            .arg("--expect")
+            .arg(expect)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if let Some(keep) = std::env::var_os("ND_NATIVE_OUTPUT") {
+            let target = Path::new(&keep).join(format!("invoke-{expect}"));
+            let _ = std::fs::create_dir_all(&target);
+            for entry in std::fs::read_dir(&output).unwrap() {
+                let entry = entry.unwrap();
+                let _ = std::fs::copy(entry.path(), target.join(entry.file_name()));
+            }
+        }
+        serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap()
+    }
     async fn create(&self, id: &str, text: &str) -> String {
         match self
             .command(
@@ -304,6 +341,23 @@ async fn bang_runs_one_command_without_a_turn_and_the_next_request_reads_its_out
     );
     assert!(text.contains("FIRST"), "{text}");
     assert!(text.contains("VAR=[]"), "{text}");
+
+    // 真窗口：在产品输入框打 `!` 命令提交，经同一条 nd-wire 命令跑完，输入框被守护进程清空。
+    let verdict = fx.native(&session, "!echo NATIVE_BANG", "cleared").await;
+    assert_eq!(verdict["pass"], true, "{verdict}");
+    let native = fx
+        .wait(&session, "the native bang finished", |s| {
+            s.items.iter().any(|i| {
+                i.kind == "shell"
+                    && i.data["command"] == "echo NATIVE_BANG"
+                    && i.data["state"] == "done"
+                    && i.data["stdout"]
+                        .as_str()
+                        .is_some_and(|o| o.contains("NATIVE_BANG"))
+            })
+        })
+        .await;
+    assert_eq!(draft(&native)["text"], "");
 
     // 模型自己要跑同一条原文的 Bash：不是守护进程派发的，不自动批准，等界面回答。
     endpoint.enqueue(
@@ -644,7 +698,7 @@ async fn without_the_hook_mod_the_header_lists_what_cannot_be_used_and_chat_stil
         "派 Codex 子代理",
         "给子代理直接发消息",
         "总结",
-        "`!` 模式",
+        "! 模式",
         "fork 型子代理",
         "设置行",
         "当前模型操作转接来的任务（只能看结果）",
@@ -678,6 +732,21 @@ async fn without_the_hook_mod_the_header_lists_what_cannot_be_used_and_chat_stil
             "{name}: {reply:?}"
         );
     }
+    // 真窗口：会话头列出用不了的功能；输入框里的 `!` 不发出，正文留着。
+    let verdict = fx.native(&session, "!pwd", "refused").await;
+    let notice = verdict["notice"]["degraded"].as_str().unwrap();
+    assert!(
+        notice.contains("总结") && notice.contains("! 模式"),
+        "{verdict}"
+    );
+    assert!(
+        fx.peek(&session)
+            .await
+            .items
+            .iter()
+            .all(|i| i.kind != "shell"),
+        "a refused bang must not reach the daemon"
+    );
     // 聊天照常。
     fx.round(&session, "chatonly-2", "再问一句", "还能答").await;
     fx.close();

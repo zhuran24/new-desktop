@@ -43,6 +43,10 @@ pub struct Desktop {
     device: String,
     draft_writes: std::collections::BTreeSet<String>,
     queued_send: Option<(String, String, u64)>,
+    /// 已发出、输入框还没被守护进程清掉的 `!`/`/subtask`（会话，草稿修订号）：防止同一段文字连发两次。
+    invoking: Option<(Option<String>, u64)>,
+    /// 总结在途：这时不再接受另一次总结。
+    compacting: bool,
     drafts: std::collections::BTreeMap<Option<String>, nd_view_model::Draft>,
     subscriptions: Vec<Subscription>,
     composer: Entity<composer::Composer>,
@@ -62,6 +66,8 @@ pub struct Desktop {
     last_session_report: Option<Snapshot>,
     #[cfg(feature = "scenarios")]
     last_editor_report: Option<serde_json::Value>,
+    #[cfg(feature = "scenarios")]
+    last_notice_report: Option<serde_json::Value>,
 }
 impl Desktop {
     pub fn new(
@@ -164,6 +170,8 @@ impl Desktop {
             device: format!("desktop-{}", uuid::Uuid::new_v4()),
             draft_writes: Default::default(),
             queued_send: None,
+            invoking: None,
+            compacting: false,
             drafts: Default::default(),
             subscriptions: vec![],
             composer,
@@ -183,6 +191,8 @@ impl Desktop {
             last_session_report: None,
             #[cfg(feature = "scenarios")]
             last_editor_report: None,
+            #[cfg(feature = "scenarios")]
+            last_notice_report: None,
         };
         this.connect_chat(window, cx);
         Ok(this)
@@ -286,6 +296,23 @@ impl Render for Desktop {
             if self.last_editor_report.as_ref() != Some(&report) {
                 println!("{}", serde_json::json!({"rendered_editor":report}));
                 self.last_editor_report = Some(report);
+            }
+        }
+        #[cfg(feature = "scenarios")]
+        {
+            // 会话头的降级提示与界面提示：真窗口场景据此核对界面算出的文字。
+            let view = self
+                .session_snapshot
+                .as_ref()
+                .map(nd_view_model::conversation);
+            let report = serde_json::json!({
+                "degraded": view.as_ref().and_then(|v| v.degraded.clone()),
+                "abilities": view.as_ref().map(|v| serde_json::json!({"summarize":v.abilities.summarize,"shell":v.abilities.shell,"subtask":v.abilities.subtask})),
+                "warning": self.warning,
+            });
+            if self.last_notice_report.as_ref() != Some(&report) {
+                println!("{}", serde_json::json!({"rendered_notice":report}));
+                self.last_notice_report = Some(report);
             }
         }
         #[cfg(feature = "scenarios")]
@@ -404,6 +431,7 @@ impl Render for Desktop {
                                             .id("content")
                                             .track_scroll(&self.scroll)
                                             .flex_1()
+                                            .min_w_0()
                                             .min_h_0()
                                             .overflow_y_scroll()
                                             .flex()

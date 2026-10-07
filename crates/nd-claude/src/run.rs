@@ -85,7 +85,7 @@ impl Feature {
             Feature::CodexSubagent => "派 Codex 子代理",
             Feature::TellSubagent => "给子代理直接发消息",
             Feature::Summarize => "总结",
-            Feature::BangMode => "`!` 模式",
+            Feature::BangMode => "! 模式",
             Feature::ForkSubagent => "fork 型子代理",
             Feature::SettingsRows => "设置行",
             Feature::TaskOps => "当前模型操作转接来的任务（只能看结果）",

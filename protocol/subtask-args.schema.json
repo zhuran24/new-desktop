@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SubtaskArgs",
+  "description": "`session.subtask` 的参数：派 fork 型子代理，带着当前上下文分出一件子任务。`input` 同 [`ShellArgs`]。",
+  "type": "object",
+  "properties": {
+    "input": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "session": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session",
+    "prompt"
+  ]
+}

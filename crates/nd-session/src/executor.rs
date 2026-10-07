@@ -2011,33 +2011,40 @@ impl Executor {
         let mut message = None;
         let mut restore = None;
         let mut covers = vec![];
+        let mut input = None;
         let invocation = match command.name.as_str() {
-            "session.shell" => match args["command"].as_str().map(str::trim) {
-                Some(line) if !line.is_empty() => Invocation::Shell {
-                    command: line.to_owned(),
-                },
+            "session.shell" => match serde_json::from_value::<nd_wire::ShellArgs>(args.clone()) {
+                Ok(a) if !a.command.trim().is_empty() => {
+                    input = a.input;
+                    Invocation::Shell {
+                        command: a.command.trim().to_owned(),
+                    }
+                }
                 _ => return Ok(Some(rejected("invalid", json!({"need":["command"]})))),
             },
-            "session.subtask" => match args["prompt"].as_str().map(str::trim) {
-                Some(prompt) if !prompt.is_empty() => Invocation::ForkAgent {
-                    prompt: prompt.to_owned(),
-                },
-                _ => return Ok(Some(rejected("invalid", json!({"need":["prompt"]})))),
-            },
-            _ => {
-                let scope = match args["scope"].as_str() {
-                    Some("from") => CompactScope::From,
-                    Some("up_to") => CompactScope::UpTo,
-                    _ => {
-                        return Ok(Some(rejected(
-                            "invalid",
-                            json!({"need":["message","scope: from | up_to"]}),
-                        )));
+            "session.subtask" => {
+                match serde_json::from_value::<nd_wire::SubtaskArgs>(args.clone()) {
+                    Ok(a) if !a.prompt.trim().is_empty() => {
+                        input = a.input;
+                        Invocation::ForkAgent {
+                            prompt: a.prompt.trim().to_owned(),
+                        }
                     }
+                    _ => return Ok(Some(rejected("invalid", json!({"need":["prompt"]})))),
+                }
+            }
+            _ => {
+                let Ok(a) = serde_json::from_value::<nd_wire::CompactArgs>(args.clone()) else {
+                    return Ok(Some(rejected(
+                        "invalid",
+                        json!({"need":["message","scope: from | up_to"]}),
+                    )));
                 };
-                let Some(target) = args["message"].as_str() else {
-                    return Ok(Some(rejected("invalid", json!({"need":["message"]}))));
+                let scope = match a.scope {
+                    nd_wire::CompactScope::From => CompactScope::From,
+                    nd_wire::CompactScope::UpTo => CompactScope::UpTo,
                 };
+                let target = a.message.as_str();
                 match self.anchor(target, scope) {
                     Ok((anchor, text, attachments, covered)) => {
                         message = Some(target.to_owned());
@@ -2085,7 +2092,7 @@ impl Executor {
         self.core.arrivals += 1;
         invoke.arrival = self.core.arrivals;
         // `!` 和 /subtask 从输入框发出：输入框原文（`input`）等于当前稿且版本对得上，就同事务清稿。
-        if let Some(input) = args["input"].as_str()
+        if let Some(input) = input.as_deref()
             && command.expect["draft_version"].as_u64() == Some(self.core.draft.version)
             && self.core.draft.text == input
             && self.core.draft.attachments.is_empty()
@@ -2373,7 +2380,14 @@ impl Executor {
         let mut value = extra.clone();
         value["draft"] = json!(self.core.draft);
         let receipt = match receipt {
-            None => Receipt::Done { value },
+            None => Receipt::Done {
+                // 成功收据的形状只在 nd-wire 定义一次（`Invoked`）。
+                value: serde_json::to_value(
+                    serde_json::from_value::<nd_wire::Invoked>(value)
+                        .map_err(|e| aborted(format!("Invoked 收据：{e}")))?,
+                )
+                .expect("Invoked serializes"),
+            },
             Some("unknown") => Receipt::Unknown {
                 now: json!({"invoke": invoke.id, "stream": format!("session/{}", self.id)}),
             },

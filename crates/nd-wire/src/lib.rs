@@ -50,6 +50,68 @@ pub struct DraftExpected {
     pub draft_version: u64,
 }
 
+/// `session.shell` 的参数：`!` 模式在后端进程里跑一条 shell 命令，命令和输出追加进对话，本身不起回合。
+/// `input` 是输入框原文（含开头的 `!`）：等于当前稿且 `expect.draft_version` 对得上时同事务清稿。
+/// 收据等动作有结果：`Done.value` 是 [`Invoked`]。
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ShellArgs {
+    pub session: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+}
+
+/// `session.subtask` 的参数：派 fork 型子代理，带着当前上下文分出一件子任务。`input` 同 [`ShellArgs`]。
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SubtaskArgs {
+    pub session: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+}
+
+/// `session.compact` 的参数：在一条人类提示上「从这里总结」（`from`）或「总结到这里」（`up_to`）。
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CompactArgs {
+    pub session: String,
+    /// 提示的消息 id（`prompt/<消息 id>` 条目的 `message`）。
+    pub message: String,
+    pub scope: CompactScope,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactScope {
+    /// 从所选提示（含）到末尾；成功后提示原文回到输入框。
+    From,
+    /// 从开头到所选提示（不含）；成功后输入框留空。
+    UpTo,
+}
+
+/// `session.shell`、`session.subtask`、`session.compact` 的 `Done.value`。字段按种类出现。
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct Invoked {
+    /// 起它的命令 id，也是会话流里 `invoke/<id>` 条目的 id。
+    pub invoke: String,
+    /// 结果落定那一刻的当前草稿（总结的回填已在里面）。
+    pub draft: Draft,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    /// `!` 的命令和输出已追加进对话（模型下一次请求读得到）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appended: Option<bool>,
+    /// fork 型子代理的 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// 总结回填时另存的稿（被替换的旧稿、或基准过时没能回填的原文）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved: Vec<String>,
+}
+
 /// 后端实时给出的模型选项；value 原样用于 session.create，不从显示名称推导。
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Model {

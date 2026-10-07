@@ -9,7 +9,7 @@ use gpui_kit::{
 };
 use nd_composer::ComposerAction;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
-use nd_view_model::{Slot, accepted, conversation, sidebar};
+use nd_view_model::{ComposerInput, Slot, accepted, composer_input, conversation, sidebar};
 use nd_wire::{Command, CommandReply, Receipt};
 use serde_json::json;
 
@@ -186,6 +186,13 @@ impl Desktop {
         let enabled = !self.sending
             && self.uploading == 0
             && self.queued_send.is_none()
+            && self.invoking.as_ref().is_none_or(|(key, revision)| {
+                *key != self.draft_key()
+                    || self
+                        .drafts
+                        .get(key)
+                        .is_none_or(|d| d.revision() != *revision)
+            })
             && !self
                 .drafts
                 .get(&self.draft_key())
@@ -358,12 +365,27 @@ impl Desktop {
         {
             return;
         }
+        let input = if self.creating {
+            ComposerInput::Message
+        } else {
+            composer_input(&text)
+        };
+        if let ComposerInput::Empty(hint) = input {
+            self.warning = Some(hint.into());
+            cx.notify();
+            return;
+        }
         let key = self.draft_key();
         let draft = self.drafts.entry(key.clone()).or_default();
         draft.edit(text.clone());
         let revision = draft.revision();
         let attachments = draft.attachments().to_vec();
         let version = draft.version();
+        if !matches!(input, ComposerInput::Message) && !attachments.is_empty() {
+            self.warning = Some("! 命令和 /subtask 不带附件；先移除附件".into());
+            cx.notify();
+            return;
+        }
         if let Some(session) = key.clone()
             && !draft.is_saved()
         {
@@ -371,6 +393,11 @@ impl Desktop {
             self.persist_draft(session, window, cx);
             self.refresh_send(cx);
             cx.notify();
+            return;
+        }
+        if let (ComposerInput::Shell(_) | ComposerInput::Subtask(_), Some(session)) = (&input, &key)
+        {
+            self.send_invocation(input, session.clone(), text, revision, version, window, cx);
             return;
         }
         let command = Command {
@@ -468,6 +495,174 @@ impl Desktop {
         })
         .detach();
     }
+    /// `!` 命令与 `/subtask`：收据等动作有结果。守护进程受理时同事务清掉匹配的草稿，
+    /// 输入框跟着快照变空；等结果期间仍能发消息、改草稿。
+    #[allow(clippy::too_many_arguments)]
+    fn send_invocation(
+        &mut self,
+        input: ComposerInput,
+        session: String,
+        text: String,
+        revision: u64,
+        version: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let abilities = self
+            .session_snapshot
+            .as_ref()
+            .map(|s| conversation(s).abilities)
+            .unwrap_or_default();
+        let (name, args, able) = match input {
+            ComposerInput::Shell(command) => (
+                "session.shell",
+                json!(nd_wire::ShellArgs {
+                    session: session.clone(),
+                    command,
+                    input: Some(text),
+                }),
+                abilities.shell,
+            ),
+            ComposerInput::Subtask(prompt) => (
+                "session.subtask",
+                json!(nd_wire::SubtaskArgs {
+                    session: session.clone(),
+                    prompt,
+                    input: Some(text),
+                }),
+                abilities.subtask,
+            ),
+            _ => return,
+        };
+        if !able {
+            self.warning = Some("这个后端进程只能聊天，用不了这个功能（见会话头）".into());
+            cx.notify();
+            return;
+        }
+        let command = Command {
+            id: uuid::Uuid::new_v4().to_string(),
+            device: self.device.clone(),
+            name: name.into(),
+            args,
+            expect: json!({"draft_version":version}),
+        };
+        let key = Some(session);
+        self.invoking = Some((key.clone(), revision));
+        self.warning = None;
+        self.refresh_send(cx);
+        let client = self.client.clone();
+        cx.spawn_in(window, async move |weak, cx| {
+            let result = client.deliver(command).await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                if this.invoking.as_ref() == Some(&(key.clone(), revision)) {
+                    this.invoking = None;
+                }
+                match result {
+                    Ok(CommandReply::Receipt {
+                        receipt: Receipt::Done { value },
+                    }) => {
+                        if let Ok(remote) =
+                            serde_json::from_value::<nd_wire::Draft>(value["draft"].clone())
+                        {
+                            let composing = this
+                                .composer
+                                .update(cx, |c, cx| c.snapshot(window, cx))
+                                .composing;
+                            let same_view = this.draft_key() == key;
+                            this.drafts.entry(key.clone()).or_default().sent(
+                                revision,
+                                remote,
+                                same_view && composing,
+                            );
+                            if same_view {
+                                this.restore_draft(window, cx);
+                            }
+                        }
+                    }
+                    Ok(CommandReply::Receipt {
+                        receipt: Receipt::Rejected { code, now },
+                    }) => {
+                        this.warning = Some(format!(
+                            "没有执行（{code}）：{}",
+                            now["why"]
+                                .as_str()
+                                .or(now["reason"].as_str())
+                                .unwrap_or_default()
+                        ))
+                    }
+                    Ok(CommandReply::Receipt {
+                        receipt: Receipt::Unknown { .. },
+                    })
+                    | Ok(CommandReply::DeliveryUnknown) => {
+                        this.warning = Some("结果不明，请看对话里这条命令的状态".into())
+                    }
+                    Ok(other) => this.warning = Some(format!("没有确认受理：{other:?}")),
+                    Err(e) => this.warning = Some(format!("没有确认受理，正文已保留：{e}")),
+                }
+                this.refresh_send(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 「从这里总结」「总结到这里」：守护进程按提示原文和次序定位，成功后回填草稿。
+    fn compact(&mut self, message: String, scope: nd_wire::CompactScope, cx: &mut Context<Self>) {
+        if self.compacting {
+            return;
+        }
+        let Some(session) = self.state.selected_session.clone() else {
+            return;
+        };
+        self.compacting = true;
+        self.warning = None;
+        let client = self.client.clone();
+        let command = Command {
+            id: uuid::Uuid::new_v4().to_string(),
+            device: self.device.clone(),
+            name: "session.compact".into(),
+            args: json!(nd_wire::CompactArgs {
+                session,
+                message,
+                scope,
+            }),
+            expect: json!({}),
+        };
+        cx.spawn(async move |weak, cx| {
+            let result = client.deliver(command).await;
+            let _ = weak.update(cx, |this, cx| {
+                this.compacting = false;
+                match result {
+                    Ok(CommandReply::Receipt {
+                        receipt: Receipt::Done { .. },
+                    }) => {}
+                    Ok(CommandReply::Receipt {
+                        receipt: Receipt::Rejected { code, now },
+                    }) => {
+                        this.warning = Some(format!(
+                            "没有总结（{code}）：{}",
+                            now["reason"]
+                                .as_str()
+                                .or(now["why"].as_str())
+                                .unwrap_or_default()
+                        ))
+                    }
+                    Ok(CommandReply::Receipt {
+                        receipt: Receipt::Unknown { .. },
+                    })
+                    | Ok(CommandReply::DeliveryUnknown) => {
+                        this.warning = Some("总结的结果不明，请看对话里的状态".into())
+                    }
+                    other => this.warning = Some(format!("总结没有确认受理：{other:?}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn resend_message(&mut self, message: String, cx: &mut Context<Self>) {
         if self.sending {
             return;
@@ -695,6 +890,48 @@ impl Desktop {
                     .when(!message.detail.is_empty(), |d| {
                         d.child(div().text_color(rgba(t.colors.muted)).child(message.detail))
                     })
+                    .when_some(message.summarize, |d, target| {
+                        let up_to = target.clone();
+                        d.child(
+                            div()
+                                .flex()
+                                .gap(px(t.spacing.medium))
+                                .text_size(px(t.typography.small))
+                                .text_color(rgba(if self.compacting {
+                                    t.colors.muted
+                                } else {
+                                    t.colors.accent
+                                }))
+                                .child(div().id("summarize-from").child("从这里总结").when(
+                                    !self.compacting,
+                                    |d| {
+                                        d.cursor_pointer().on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.compact(
+                                                    target.clone(),
+                                                    nd_wire::CompactScope::From,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    },
+                                ))
+                                .child(div().id("summarize-up-to").child("总结到这里").when(
+                                    !self.compacting,
+                                    |d| {
+                                        d.cursor_pointer().on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.compact(
+                                                    up_to.clone(),
+                                                    nd_wire::CompactScope::UpTo,
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    },
+                                )),
+                        )
+                    })
                     .when_some(message.resend, |d, target| {
                         d.child(
                             div()
@@ -718,6 +955,18 @@ impl Desktop {
             .flex_col()
             .gap(px(t.spacing.medium))
             .child(div().text_color(rgba(t.colors.muted)).child(view.header))
+            .when_some(view.degraded, |d, degraded| {
+                d.child(
+                    div()
+                        .id("degraded")
+                        .p(px(t.spacing.small))
+                        .rounded(px(t.radius))
+                        .border(px(t.border_width))
+                        .border_color(rgba(t.colors.accent))
+                        .text_color(rgba(t.colors.accent))
+                        .child(degraded),
+                )
+            })
             .children(items)
             .into_any_element()
     }
