@@ -2,6 +2,31 @@ use nd_claims::*;
 use std::sync::Arc;
 
 #[test]
+fn an_unavailable_optional_cli_list_does_not_block_registry_recovery_or_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
+    let claims = Exclusivity::open(store, RegistryConfig::new(dir.path().join("cli"))).unwrap();
+    let _interest = claims.want_list();
+    claims.observe(Observed::Recovered).unwrap();
+    claims.refresh().unwrap();
+    assert_eq!(claims.recovery().unwrap(), Recovery::Ready);
+    assert!(
+        claims.externals().is_err(),
+        "only the optional listing reports the command failure"
+    );
+    assert!(matches!(
+        claims
+            .peek(&Act::Open {
+                session: "s".into(),
+                bs: NewBs::Fresh(BackendKind::Codex),
+                via: "r".into(),
+            })
+            .unwrap(),
+        Admit::Go(_)
+    ));
+}
+
+#[test]
 fn a_verified_exit_before_up_releases_the_reserved_backend_session() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
@@ -474,10 +499,11 @@ fn scripted_cli_lists_are_unverified_without_registry_identity_and_interest_drop
         session: "s".into(),
         bs: BackendSessionId::claude(id),
     };
-    assert!(matches!(
-        claims.peek(&act).unwrap(),
-        Admit::Wait(Obstacle::ExternalUnverified(_))
-    ));
+    assert!(matches!(claims.peek(&act).unwrap(), Admit::Go(_)));
+    assert!(
+        !claims.externals().unwrap().is_empty(),
+        "the listing still shows unverified metadata"
+    );
     drop(interest);
     let external = ShortProcess::start();
     support::registry(

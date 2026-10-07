@@ -122,11 +122,14 @@ struct State {
     grants: BTreeMap<String, Grant>,
 }
 
+type CliListing = Option<std::result::Result<Vec<ExternalEntry>, String>>;
+
 pub struct Exclusivity {
     store: Arc<Store>,
     config: RegistryConfig,
     changes: tokio::sync::watch::Sender<u64>,
     commands: Arc<dyn CliCommands>,
+    listing: Arc<std::sync::Mutex<CliListing>>,
     interest: Arc<std::sync::atomic::AtomicUsize>,
     scan_lock: Arc<std::sync::Mutex<()>>,
     stop: Option<std::sync::mpsc::SyncSender<()>>,
@@ -173,9 +176,11 @@ impl Exclusivity {
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scan_lock = Arc::new(std::sync::Mutex::new(()));
         let (stop, receiver) = std::sync::mpsc::sync_channel(1);
+        let listing = Arc::new(std::sync::Mutex::new(None));
         let background = Self {
             changes: changes.clone(),
             commands: commands.clone(),
+            listing: listing.clone(),
             interest: interest.clone(),
             store: store.clone(),
             config: config.clone(),
@@ -253,6 +258,7 @@ impl Exclusivity {
         Ok(Self {
             changes,
             commands,
+            listing,
             interest,
             store,
             config,
@@ -713,13 +719,7 @@ impl Exclusivity {
         if self.recovery()? == Recovery::IdentitiesPending {
             return Ok(());
         }
-        let scanned = registry::scan(&self.config).and_then(|mut entries| {
-            if self.interest.load(std::sync::atomic::Ordering::Acquire) > 0 {
-                let bytes = self.commands.agents().map_err(error)?;
-                registry::merge_agents(&mut entries, &bytes)?;
-            }
-            Ok(entries)
-        });
+        let scanned = registry::scan(&self.config);
         let entries = match scanned {
             Ok(entries) => entries,
             Err(e) => {
@@ -731,6 +731,7 @@ impl Exclusivity {
                 return Err(e);
             }
         };
+        let mut listed = entries.clone();
         self.store.write(|tx| {
             let mut state = Self::in_tx(tx)?;
             state.scan_failed = false;
@@ -745,13 +746,42 @@ impl Exclusivity {
                 .collect();
             state.recovery = Recovery::Ready;
             self.commit(tx, &state)
-        })
+        })?;
+        // List metadata is optional presentation, never an input to admission.
+        let next = if self.interest.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            Some(self.commands.agents().and_then(|bytes| {
+                registry::merge_agents(&mut listed, &bytes).map_err(|e| e.to_string())?;
+                Ok(listed)
+            }))
+        } else {
+            None
+        };
+        let mut listing = self.listing.lock().unwrap_or_else(|e| e.into_inner());
+        if *listing != next {
+            *listing = next;
+            self.changes.send_modify(|revision| *revision += 1);
+        }
+        Ok(())
     }
     pub fn externals(&self) -> Result<Vec<ExternalEntry>> {
         let state = self.state()?;
-        Ok(state
-            .external
+        let entries = if self.interest.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            self.listing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_else(|| Ok(state.external.clone()))
+                .map_err(error)?
+        } else {
+            state.external.clone()
+        };
+        Ok(entries
             .into_iter()
+            .filter(|e| {
+                !e.identity
+                    .as_ref()
+                    .is_some_and(|id| state.own.values().any(|own| &own.identity == id))
+            })
             .filter(|e| {
                 !e.bs
                     .as_ref()
