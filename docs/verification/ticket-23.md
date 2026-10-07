@@ -1,6 +1,6 @@
 # #23 主题切换与主题文件验证
 
-日期：2026-10-06。状态：实现、默认测试、完整场景与 Clippy 验收完成；真机输入法和性能为 OWNER_PENDING。主题格式和使用方法见 [THEMES.md](../../crates/nd-desktop/THEMES.md)。
+日期：2026-10-06。状态：实现、最新 v1 默认测试、相关场景与 Clippy 验收完成；真机输入法和性能为 OWNER_PENDING。主题格式和使用方法见 [THEMES.md](../../crates/nd-desktop/THEMES.md)。
 
 ## 验收映射
 
@@ -30,24 +30,25 @@
 
 ## verification
 
-工作树 `ticket-23`，分支 `ticket/23`。实现提交 `74cc125`，集成提交 `8af1085` 合入 v1 `8e4e6ec`，`f6c38fa` 再合入最新 v1 `9f1a69d`。三个合并冲突位于桌面模块声明、scenarios 参数和 Python 场景计划，均保留主题与历史分页两边行为。
+工作树 `ticket-23`，分支 `ticket/23`。实现提交 `74cc125`，主题提示补强 `4be828a`。集成 `8af1085` 合入 #20，`f6c38fa` 合入 #21，`c683c45` 合入最终 v1 `e4f77e7`（#18）。模块、参数、隔离脚本和 README 冲突均保留双方行为；共享隔离器的可选主题参数兼容 #18 调用者。
 
-- `cargo test --workspace --locked`：193 passed，0 failed，1 ignored（既有显式真 CLI 现场项）。
-- `scripts/test-scenarios.sh`：121 passed，0 failed，1 ignored（既有手动真 OOM 项），RUST_TEST_THREADS=3；包含主题、设置面板以及 1/1000 轮历史的原生主题检查。
-- workspace/all-targets 的 Clippy（含 daemon/testkit/claude/desktop scenarios，`-D warnings`）、格式、Python 语法、diff 空白和文档链接检查均通过。
-- `native_smoke.py` 额外验证带目录监听器的窗口正常退出，状态写入线程可结束，守护进程仍存活；重连与实际 Wayland 帧通过。
-- `cargo build --release -p nd-desktop --bin nd-desktop --locked` 通过（`logs/release-merged21.log`）；release SHA-256 `768c6c2d278fa90fc7e5ddff5c86b79b37f79b5bf1fead672ad4043b3b2db735`。
-- 定向原生截图已查看：文件主题、替换后的字号与背景、错误提示、选择器、浅色、系统深色、流式聊天与草稿均能实际呈现。
+- 最终 v1 `e4f77e7`：`cargo test --workspace --locked`，203 passed，0 failed，1 ignored（既有显式真 CLI 现场项）；`logs/workspace-merged18.log`。
+- 同一基线：`scripts/test-scenarios.sh native`，10 passed，0 failed，RUST_TEST_THREADS=3；`logs/native-merged18.log`。包含本单主题/流式场景、面板 Esc、发送撤回、草稿、附件、设置、导航以及 #19 恢复等待。
+- 前一集成基线 `9f1a69d`：完整 `scripts/test-scenarios.sh`，121 passed，0 failed，1 ignored（既有手动真 OOM 项）；`logs/scenarios-merged21.log`。包括 1000 轮真实 CLI、所选历史页保持、悬停提示打开期间热换主题。
+- 最终 workspace/all-targets Clippy（含 daemon/testkit/claude/desktop scenarios，`-D warnings`）、格式、Python 语法、diff 空白和文档链接检查通过；`logs/clippy-latest.log`。
+- `native_smoke.py` 在 #21 基线上额外验证带目录监听器的窗口正常退出、状态写入线程结束、守护进程仍存活；`logs/smoke-final.log`。
+- 最终 release 构建通过（`logs/release-latest.log`）；SHA-256 `f05597f2e9bea327cfdf21f36efd70fbb6064919525c68af7aecb052a63f07ff`。scenarios 桌面 SHA-256 `ba2c1e0a2ac3fbeec8a6ea27c20b367ba1bddd99e0f61566f69f123ffa886411`。
+- 原生截图已查看：文件主题、字号、错误提示、选择器、明暗、悬停提示、流式草稿、会话设置与控制均实际呈现；清理记录确认临时根和测试单元已撤销。
 
 构建目录 `/mnt/wd_external/nd-build/target/ticket-23`；6 jobs；所有 Cargo build/test/clippy 运行于 MemoryMax=12G、MemorySwapMax=0 的独立 scope。场景使用临时 HOME/CLAUDE_CONFIG_DIR/XDG、bwrap 断网、独立 `nd-test-` 单元和限额 slice。原生窗口在私有 KWin/D-Bus 中；没有使用 owner 的桌面、配置、凭据、模型服务或正在运行的后端。
 
-证据根 `/mnt/wd_external/nd-build/tmp/ticket-23/`：`logs/` 为红绿、构建和检查日志（最终复验带 `-final`）；`tooltip-final/rounds-1/` 为悬停区域差分及打开期间热加载；`native-merged/` 为主题选择、真实系统通知、截图像素及清理证据；`settings-merged/` 为设置面板热切换；`smoke-final/` 为正常关闭与恢复；`chat-merged/` 为真实 CLI 流式换主题与草稿证据；`history-merged/rounds-{1,1000}/` 为导航锚点在换主题前后的证据。
+证据根 `/mnt/wd_external/nd-build/tmp/ticket-23/`。最终原生证据为 `native-latest/`、`chat-latest/`、`settings-latest/`、`controls-latest/` 和 `history-latest/rounds-1/`；先前 #21 基线的千轮证据为 `history-merged/rounds-1000/`；`tooltip-final/rounds-1/` 保留提示框差分，`smoke-final/` 保留正常关闭验证。各检查日志在上述 `logs/` 文件。
 
 红绿边界：01/03/04 的红灯是新增公共 API 的编译缺口；02 捕获了错误接受不支持版本的行为；05 是旧窗口没有加载文件主题；06 是测试驱动参数缺口，随后发现并修复合成点击坐标偏差；07 首轮为隔离环境缺 dconf，07b 才是产品缺系统通知监听的行为红灯。08 为新增缺失文件/目录恢复覆盖，第一次即通过，没有声称它揭示了新缺陷。
 
 完整复验曾捕获 #19 场景的测试连接竞态：`scenarios-subscribe-race.log` 中，一次性 peek 在注入崩溃期间订阅，被 WebSocket `ResetWithoutClosingHandshake` 打断后 unwrap。该场景的恢复等待改用产品 `ReplicaFeed`，要求新纪元中的原消息已落地，再建连接查持久收据；原 pid、恰好两次模型请求、不重发和故障实际触发断言保留。定向复验 `recovery-fixed.log` 通过。该修正位于测试驱动，生产后端未改动。
 
-另一次运行的 `scenarios-build-overlap.log` 在故障文件未消耗断言失败：并行运行的默认套件覆盖了 scenarios 守护进程二进制。这是测试编排错误；最终验证严格串行执行默认套件、重建 scenarios、完整场景，保留原断言。
+另一次运行的 `scenarios-build-overlap.log` 在故障文件未消耗断言失败：并行运行的默认套件覆盖了 scenarios 守护进程二进制。这是测试编排错误；后续验证严格串行执行默认套件、重建 scenarios、场景，保留原断言。
 
 ## 待验证项与退路
 

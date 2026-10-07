@@ -24,11 +24,13 @@ def inner():
     offsets = {}
 
     def start(name):
+        for path in ['/sandbox/controls.json', '/sandbox/escape.json']:
+            Path(path).unlink(missing_ok=True)
         stdout = (out / f'{name}.jsonl').open('w')
         stderr = (out / f'{name}.log').open('w')
         handles.extend([stdout, stderr])
         app = subprocess.Popen(['/nd-desktop', '--socket', '/sandbox/daemon/runtime/nd.sock',
-            '--state', '/sandbox/state/ui.json', '--scenario-theme-controls', '/sandbox/controls.json', '--quit-after', '60'], stdout=stdout, stderr=stderr,
+            '--state', '/sandbox/state/ui.json', '--scenario-theme-controls', '/sandbox/controls.json', '--scenario-controls', '/sandbox/escape.json', '--quit-after', '60'], stdout=stdout, stderr=stderr,
             env=dict(os.environ, WAYLAND_DEBUG='client'))
         apps.append(app)
         return app
@@ -125,6 +127,17 @@ def inner():
         wait(app, 'theme', lambda t: t['warning'] is None and t['theme']['colors']['background'] == '#123456ff')
         click(app, 'theme', 'theme-menu')
         screenshot('selector')
+        Path('/sandbox/escape.json').write_text(json.dumps({'id': 'close-theme-panel', 'action': 'escape'}))
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            events = [json.loads(line) for line in (out / 'theme.jsonl').read_text().splitlines()]
+            states = [e['native_controls'] for e in events if 'native_controls' in e]
+            if states and states[-1]['action'] == 'close-theme-panel' and states[-1]['panel'] is None:
+                break
+            time.sleep(.03)
+        else:
+            raise AssertionError('Esc did not close the theme panel')
+        click(app, 'theme', 'theme-menu')
         click(app, 'theme', 'theme-light')
         wait(app, 'theme', lambda t: t['selection']['kind'] == 'light' and t['theme']['mode'] == 'light')
         screenshot('selected-light')
@@ -171,7 +184,7 @@ def inner():
         assert daemon.poll() is None
         (out / 'result.json').write_text(json.dumps({'pass': True, 'checks': [
             'theme file loaded by real GPUI', 'atomic file replacement updates live appearance',
-            'invalid selected file falls back visibly', 'repair restores the selected file', 'native mouse selection and cold reopen persistence',
+            'invalid selected file falls back visibly', 'repair restores the selected file', 'native mouse selection and cold reopen persistence', 'Esc closes the theme panel',
             'real XDG portal light/dark signals drive system selection only',
             'missing file at cold startup is visible; directory delete and recreate recovers']}, ensure_ascii=False, indent=2))
     finally:
