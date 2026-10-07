@@ -633,6 +633,7 @@ impl Inner {
                         initial_control(&mut claude_run, setting_request(&setting)).await
                     {
                         self.settle_gone(&run, true).await;
+                        self.claude.channel().unregister(&run.0);
                         self.deliver_facts(
                             &issued.session,
                             &carrier,

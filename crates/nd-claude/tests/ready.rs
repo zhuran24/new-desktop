@@ -367,3 +367,35 @@ async fn a_resumed_backend_is_ready_when_both_mods_report_the_resumed_session() 
     drop(claude);
     fx.close();
 }
+
+#[tokio::test]
+async fn capabilities_require_initialize_declarations_and_failed_adoption_removes_its_binding() {
+    let fx = Fixture::start("claude-declared-caps").await;
+    let mut config = fx.config();
+    config.env.insert("DISABLE_COMPACT".into(), "1".into());
+    let claude = fx.claude(config);
+    let session = session_id();
+    let run = claude
+        .open("caps", fx.fresh(&session), InitOptions::default())
+        .await
+        .unwrap();
+    let caps = run.ready().caps.clone();
+    assert!(
+        caps.unsupported(nd_claude::Feature::CodexSubagent)
+            .is_some(),
+        "no hook agent was declared"
+    );
+    assert!(
+        caps.unsupported(nd_claude::Feature::Summarize).is_some(),
+        "compact was omitted by the real CLI"
+    );
+    assert!(caps.unsupported(nd_claude::Feature::BangMode).is_none());
+    assert!(claude.adopt("absent-run", &session, caps).await.is_err());
+    assert!(
+        claude.channel().binding("absent-run").is_none(),
+        "failed adopt must unregister"
+    );
+    drop(run);
+    drop(claude);
+    fx.close();
+}

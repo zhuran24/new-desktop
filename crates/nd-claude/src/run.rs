@@ -219,13 +219,39 @@ impl Claude {
         link.write(1, &frame.to_string()).await?;
         let (initialize, cursor) = await_response(&mut link, &id, self.config.init_timeout).await?;
         self.channel.settle(run);
+        let mut capabilities = caps(readiness, init.per_task_stop_affordance);
+        if capabilities.readiness == Readiness::Full {
+            let listed = |field: &str, name: &str| {
+                initialize[field]
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().any(|entry| entry["name"] == name))
+            };
+            if !listed("commands", "compact") {
+                capabilities.features.insert(
+                    Feature::Summarize,
+                    Availability::Unsupported {
+                        why: "initialize 回应未列出 compact".into(),
+                    },
+                );
+            }
+            if init.hook_agents.is_empty()
+                || !init.hook_agents.keys().all(|name| listed("agents", name))
+            {
+                capabilities.features.insert(
+                    Feature::CodexSubagent,
+                    Availability::Unsupported {
+                        why: "initialize 回应未确认所声明的钩子代理".into(),
+                    },
+                );
+            }
+        }
         Ok(ClaudeRun {
             ready: Ready {
                 run: run.to_owned(),
                 backend_session_id: session.to_owned(),
                 identity: launched.identity,
                 hellos: binding.mods,
-                caps: caps(readiness, init.per_task_stop_affordance),
+                caps: capabilities,
                 initialize,
             },
             link,
@@ -241,35 +267,42 @@ impl Claude {
     pub async fn adopt(&self, run: &str, session: &str, previous: Caps) -> Result<ClaudeRun> {
         self.channel.register(run, session);
         self.channel.settle(run);
-        let link = self.watchdogs.link(run).await?;
-        let binding = self
-            .channel
-            .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
-            .await
-            .ok_or("run unregistered while waiting for hellos")?;
-        let caps = match readiness(&binding, session, self.config.hello_timeout) {
-            Readiness::ChatOnly { why } if previous.readiness == Readiness::Full => caps(
-                Readiness::ChatOnly { why },
-                previous.interrupt_spares_background,
-            ),
-            _ => previous,
-        };
-        let cursor = link.hello.high;
-        let next_in = link.hello.written + 1;
-        Ok(ClaudeRun {
-            ready: Ready {
-                run: run.to_owned(),
-                backend_session_id: session.to_owned(),
-                identity: link.hello.identity.clone(),
-                hellos: binding.mods,
-                caps,
-                initialize: Value::Null,
-            },
-            link,
-            next_in,
-            cursor,
-            channel: self.channel.clone(),
-        })
+        let adopted = async {
+            let link = self.watchdogs.link(run).await?;
+            let binding = self
+                .channel
+                .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
+                .await
+                .ok_or("run unregistered while waiting for hellos")?;
+            let caps = match readiness(&binding, session, self.config.hello_timeout) {
+                Readiness::ChatOnly { why } if previous.readiness == Readiness::Full => caps(
+                    Readiness::ChatOnly { why },
+                    previous.interrupt_spares_background,
+                ),
+                _ => previous,
+            };
+            let cursor = link.hello.high;
+            let next_in = link.hello.written + 1;
+            Ok(ClaudeRun {
+                ready: Ready {
+                    run: run.to_owned(),
+                    backend_session_id: session.to_owned(),
+                    identity: link.hello.identity.clone(),
+                    hellos: binding.mods,
+                    caps,
+                    initialize: Value::Null,
+                },
+                link,
+                next_in,
+                cursor,
+                channel: self.channel.clone(),
+            })
+        }
+        .await;
+        if adopted.is_err() {
+            self.channel.unregister(run);
+        }
+        adopted
     }
 }
 
