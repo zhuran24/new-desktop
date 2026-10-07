@@ -602,6 +602,148 @@ async fn attached_draft_conflict_and_send_consumption_recover_at_every_commit_po
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_restores_once_at_every_commit_point() {
+    use sha2::{Digest, Sha256};
+    let original = b"original draft attachment";
+    let returned = b"returned message attachment";
+    let original_ref = json!({"blob":format!("{:x}",Sha256::digest(original)),"name":"original.txt","media_type":"text/plain","size":original.len()});
+    let returned_ref = json!({"blob":format!("{:x}",Sha256::digest(returned)),"name":"returned.txt","media_type":"text/plain","size":returned.len()});
+    let session = session_id_for("matrix-withdraw");
+    matrix(Scenario {
+        auto_title: false,
+        uploads: vec![original.to_vec(),returned.to_vec()],
+        name: "withdraw/queued",
+        idle_ms: 3_600_000,
+        script: vec![(ActKind::Send, Reply::Ok), (ActKind::Send, Reply::Hold)],
+        steps: vec![
+            Step {
+                command: create("matrix-withdraw", "ready"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: nd_wire::Command { id:"base-draft".into(),device:"test".into(),name:"session.draft.update".into(),args:json!({"session":session,"text":"existing","attachments":[original_ref]}),expect:json!({"draft_version":0}) },
+                until: |s|item(s,"draft").data["version"] == 1,
+            },
+            Step {
+                command: command(
+                    "queued",
+                    "session.send",
+                    json!({"session":session,"text":"restore once","intent":"after_turn","attachments":[returned_ref]}),
+                ),
+                until: |s| prompt(s, "restore once").is_some(),
+            },
+            Step {
+                command: command(
+                    "withdraw",
+                    "session.withdraw",
+                    json!({"session":session,"message":"queued"}),
+                ),
+                until: |s| {
+                    prompt(s, "restore once").is_some_and(|i| i.data["state"] == "withdrawn")
+                },
+            },
+        ],
+        check: |h, s| {
+            assert_eq!(item(s, "draft").data["text"], "existing\n\nrestore once");
+            assert_eq!(item(s,"draft").data["attachments"].as_array().unwrap().len(),2);
+            assert_eq!(item(s, "draft").data["version"], 2);
+            assert!(!h.adapter.applied().iter().any(|a| a == "send:restore once"));
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_is_accepted_during_a_wait_and_recovers_at_every_commit_point() {
+    let session = session_id_for("matrix-interrupt");
+    matrix(Scenario {
+        auto_title: false,
+        uploads: vec![],
+        name: "interrupt/queued",
+        idle_ms: 3_600_000,
+        script: vec![(ActKind::Send, Reply::Ok), (ActKind::Send, Reply::Hold)],
+        steps: vec![
+            Step {
+                command: create("matrix-interrupt", "ready"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "pending",
+                    "session.send",
+                    json!({"session":session,"text":"still queued"}),
+                ),
+                until: |s| prompt(s, "still queued").is_some(),
+            },
+            Step {
+                command: command("interrupt", "session.interrupt", json!({"session":session})),
+                until: |s| {
+                    s.items
+                        .iter()
+                        .any(|i| i.id == "control/interrupt" && i.data["state"] == "acknowledged")
+                },
+            },
+        ],
+        check: |h, s| {
+            assert_eq!(
+                h.adapter
+                    .applied()
+                    .iter()
+                    .filter(|a| a.starts_with("interrupt:"))
+                    .count(),
+                1
+            );
+            assert_ne!(
+                prompt(s, "still queued").unwrap().data["state"],
+                "withdrawn"
+            );
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_the_queue_restores_once_at_every_commit_point() {
+    let session = session_id_for("matrix-cancel");
+    matrix(Scenario {
+        auto_title: false,
+        uploads: vec![],
+        name: "interrupt/cancel-queue",
+        idle_ms: 3_600_000,
+        script: vec![(ActKind::Send, Reply::Ok), (ActKind::Send, Reply::Hold)],
+        steps: vec![
+            Step {
+                command: create("matrix-cancel", "ready"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "pending",
+                    "session.send",
+                    json!({"session":session,"text":"back to draft"}),
+                ),
+                until: |s| prompt(s, "back to draft").is_some(),
+            },
+            Step {
+                command: command(
+                    "interrupt",
+                    "session.interrupt",
+                    json!({"session":session,"queued":"cancel"}),
+                ),
+                until: |s| {
+                    prompt(s, "back to draft").is_some_and(|i| i.data["state"] == "withdrawn")
+                },
+            },
+        ],
+        check: |_, s| {
+            assert_eq!(item(s, "draft").data["text"], "back to draft");
+            assert_eq!(item(s, "draft").data["version"], 1);
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn settings_and_manual_title_recover_at_every_commit_point() {
     let session = session_id_for("matrix-settings");
     matrix(Scenario {

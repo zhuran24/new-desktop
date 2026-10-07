@@ -128,7 +128,7 @@ impl Executor {
             };
             Ok(state::load(tx, &id)?.map(|(_, core)| (write_gen, core)))
         })?;
-        let (write_gen, core, born) = match loaded {
+        let (write_gen, mut core, born) = match loaded {
             Some((write_gen, core)) => (write_gen, core, true),
             None => (0, Core::default(), false),
         };
@@ -138,6 +138,10 @@ impl Executor {
             projection.apply(&Shown::Draft {
                 draft: core.draft.clone(),
             });
+        }
+        // 恢复后的旧票全部交给 adopt 对账，不能把上次提交前的 handed=false 当作 Busy 重试。
+        for row in core.outbox.values_mut() {
+            row.handed = true;
         }
         let recovering = core
             .carriers
@@ -218,6 +222,7 @@ impl Executor {
             .chain(self.core.uncertain.values())
             .filter(|r| r.outcome.is_none() || matches!(r.outcome, Some(Outcome::Unknown { .. })))
             .map(|r| PendingTicket {
+                unknown: matches!(r.outcome, Some(Outcome::Unknown { .. })),
                 issued: r.issued.clone(),
                 act: r.act.clone(),
             })
@@ -267,6 +272,7 @@ impl Executor {
             return Flow::Continue;
         }
         if let Input::Tick = input
+            && !self.core.outbox.values().any(|r| !r.handed)
             && !self.idle_due()
         {
             return Flow::Continue;
@@ -302,6 +308,14 @@ impl Executor {
             let value = self.fold(tx, work, &mut fx, &mut live)?;
             if self.born {
                 self.settle_all(tx, &mut fx)?;
+                let retry: Vec<_> = self
+                    .core
+                    .outbox
+                    .iter()
+                    .filter(|(t, r)| !r.handed && !fx.hand.contains(t))
+                    .map(|(t, _)| t.clone())
+                    .collect();
+                fx.hand.extend(retry);
                 self.persist(tx, &mut fx)?;
             }
             if self.fault(Fault::BeforeCommit) {
@@ -364,7 +378,26 @@ impl Executor {
         self.shared.feed.lock().unwrap().publish(changed, true);
     }
 
-    fn after_commit(&mut self, fx: Effects, live: Vec<Live>) {
+    fn after_commit(&mut self, mut fx: Effects, live: Vec<Live>) {
+        fx.hand.sort_by_key(|ticket| {
+            self.core
+                .outbox
+                .get(ticket)
+                .map(|row| {
+                    if matches!(row.act, Act::Send { .. }) {
+                        let arrival = match &row.issuer {
+                            Issuer::Message { id, .. } => {
+                                self.core.messages.get(id).map_or(0, |m| m.arrival)
+                            }
+                            _ => 0,
+                        };
+                        (1, arrival)
+                    } else {
+                        (0, 0)
+                    }
+                })
+                .unwrap_or((0, 0))
+        });
         self.shared
             .adopted
             .store(self.recovering.is_empty(), Ordering::Release);
@@ -396,6 +429,10 @@ impl Executor {
                 .backends
                 .act(&row.kind, row.issued.clone(), row.act.clone());
             if let Admit::Rejected { reject } = admit {
+                if reject == nd_backend::Reject::Busy {
+                    row.handed = false;
+                    continue;
+                }
                 self.local.push_back(Input::Settled {
                     ticket,
                     outcome: Outcome::Rejected { reject },
@@ -425,7 +462,17 @@ impl Executor {
             Work::Command(command) => {
                 let keep = self.deps.config.receipt_keep_ms;
                 let reply = nd_ledger::execute(tx, &command, keep, |tx| {
-                    if self.recovering() {
+                    let control = matches!(
+                        command.name.as_str(),
+                        "session.interrupt" | "session.withdraw"
+                    );
+                    let recovering = if control {
+                        // 当前实现每个会话的控制来源先追平；不等待其他会话或独占登记的写入闸门。
+                        !self.recovering.is_empty()
+                    } else {
+                        self.recovering()
+                    };
+                    if recovering {
                         return Err(aborted("守护进程恢复中，命令未受理"));
                     }
                     self.command(tx, &command, fx)
@@ -500,6 +547,8 @@ impl Executor {
                     value: json!(result),
                 })
             }
+            "session.interrupt" if self.born => self.interrupt(tx, command, fx),
+            "session.withdraw" if self.born => self.withdraw(tx, command, fx),
             "session.rename" => {
                 if let Some(expected) = command.expect.get("title_revision")
                     && expected.as_u64() != Some(self.core.meta().title_revision)
@@ -727,6 +776,291 @@ impl Executor {
         })
     }
 
+    fn return_draft(&self, tx: &Tx<'_>, command: &Command) -> Result<state::DraftRestore, Receipt> {
+        let (version, text, attachments) = if let Some(draft) = command.args.get("draft") {
+            let (Some(version), Some(text)) = (draft["version"].as_u64(), draft["text"].as_str())
+            else {
+                return Err(rejected(
+                    "invalid",
+                    json!({"need":["draft.version","draft.text"]}),
+                ));
+            };
+            let context = Command {
+                args: draft.clone(),
+                ..command.clone()
+            };
+            let attachments = self
+                .attachments(tx, &context)
+                .map_err(|why| rejected("invalid_attachment", json!({"reason":why})))?;
+            (version, text.to_owned(), attachments)
+        } else {
+            (
+                self.core.draft.version,
+                self.core.draft.text.clone(),
+                self.core.draft.attachments.clone(),
+            )
+        };
+        Ok(state::DraftRestore {
+            version,
+            text,
+            attachments,
+            device: command.device.clone(),
+        })
+    }
+
+    fn pin_return(
+        &self,
+        tx: &mut Tx<'_>,
+        id: &str,
+        restore: &state::DraftRestore,
+        hold: bool,
+    ) -> nd_store::Result<()> {
+        let owner = format!("return/{}/{}", self.id, id);
+        for attachment in &restore.attachments {
+            if hold {
+                self.deps.blobs.hold(tx, &attachment.blob, &owner)?;
+            } else {
+                self.deps.blobs.release(tx, &attachment.blob, &owner)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn refill_draft(
+        &mut self,
+        tx: &mut Tx<'_>,
+        id: &str,
+        restore: &state::DraftRestore,
+        messages: &[Message],
+    ) -> nd_store::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut text = restore.text.clone();
+        let mut attachments = restore.attachments.clone();
+        for message in messages {
+            if !text.is_empty() && !message.text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&message.text);
+            for attachment in &message.attachments {
+                if !attachments.contains(attachment) {
+                    attachments.push(attachment.clone());
+                }
+            }
+        }
+        let returned_id = format!("return/{id}");
+        let owner = if restore.version == self.core.draft.version {
+            let owner = format!("draft/{}", self.id);
+            for a in &self.core.draft.attachments {
+                self.deps.blobs.release(tx, &a.blob, &owner)?;
+            }
+            owner
+        } else {
+            format!("draft-saved/{}/{}", self.id, returned_id)
+        };
+        for a in &attachments {
+            self.deps.blobs.hold(tx, &a.blob, &owner)?;
+        }
+        self.core.update_draft(
+            &returned_id,
+            &restore.device,
+            restore.version,
+            text,
+            attachments,
+        );
+        Ok(())
+    }
+
+    fn restore_withdrawn(
+        &mut self,
+        tx: &mut Tx<'_>,
+        fx: &mut Effects,
+        message: &Message,
+    ) -> nd_store::Result<()> {
+        if let Some(send) = &message.ticket {
+            if let Some(mut row) = self.core.uncertain.remove(send) {
+                row.outcome = None;
+                self.core.outbox.insert(send.clone(), row);
+            }
+            self.record_outcome(
+                tx,
+                fx,
+                send,
+                Outcome::Refused {
+                    refusal: Refusal::Withdrawn,
+                },
+            )?;
+        }
+        self.core.messages.remove(&message.id);
+        self.show_message(tx, fx, message, "withdrawn", None)
+    }
+
+    fn withdraw(
+        &mut self,
+        tx: &mut Tx<'_>,
+        command: &Command,
+        fx: &mut Effects,
+    ) -> nd_store::Result<Receipt> {
+        let Some(id) = command.args["message"].as_str() else {
+            return Ok(rejected("invalid", json!({"need":["message"]})));
+        };
+        let Some(message) = self.core.messages.get(id).cloned() else {
+            return Ok(rejected("not_withdrawable", json!({"message":id})));
+        };
+        if self
+            .core
+            .outbox
+            .values()
+            .any(|r| matches!(&r.issuer, Issuer::Withdrawal { message: m, .. } if m.id == id))
+        {
+            return Ok(rejected("withdrawing", json!({"message":id})));
+        }
+        let restore = match self.return_draft(tx, command) {
+            Ok(r) => r,
+            Err(receipt) => return Ok(receipt),
+        };
+        if let Some(send) = &message.ticket {
+            let Some(original) = self.core.outbox.get(send).cloned() else {
+                return Ok(rejected("not_withdrawable", json!({"message":id})));
+            };
+            self.pin_return(tx, &command.id, &restore, true)?;
+            let ticket = Ticket(format!("control:{}", command.id));
+            self.core.outbox.insert(
+                ticket.clone(),
+                OutRow {
+                    issued: Issued {
+                        ticket: ticket.clone(),
+                        session: self.id.clone(),
+                        write_gen: self.write_gen,
+                    },
+                    act: Act::Withdraw {
+                        to: original.act.carrier().clone(),
+                        send: send.clone(),
+                    },
+                    kind: original.kind,
+                    issuer: Issuer::Withdrawal {
+                        id: command.id.clone(),
+                        message: message.clone(),
+                        restore: restore.clone(),
+                    },
+                    display: None,
+                    outcome: None,
+                    handed: false,
+                },
+            );
+            fx.hand.insert(0, ticket);
+            self.show_message(tx, fx, &message, "withdrawing", None)?;
+        } else {
+            self.restore_withdrawn(tx, fx, &message)?;
+            self.refill_draft(tx, &command.id, &restore, &[message])?;
+        }
+        Ok(Receipt::Done {
+            value: json!({"withdrawal":command.id,"message":id}),
+        })
+    }
+
+    fn interrupt(
+        &mut self,
+        tx: &mut Tx<'_>,
+        command: &Command,
+        fx: &mut Effects,
+    ) -> nd_store::Result<Receipt> {
+        let queued = match command.args["queued"].as_str().unwrap_or("keep") {
+            "keep" => nd_backend::QueuedPolicy::Keep,
+            "cancel" => nd_backend::QueuedPolicy::Cancel,
+            _ => return Ok(rejected("invalid", json!({"queued":"keep or cancel"}))),
+        };
+        let carrier = self
+            .core
+            .current_carrier()
+            .or_else(|| self.core.carriers.values().find(|c| c.alive))
+            .cloned()
+            .filter(|c| c.alive);
+        let mut held = vec![];
+        let restore = if queued == nd_backend::QueuedPolicy::Cancel {
+            if carrier
+                .as_ref()
+                .is_some_and(|c| !c.interaction.cancel_queued)
+            {
+                return Ok(rejected(
+                    "unsupported",
+                    json!({"why":"后端未声明取消排队能力"}),
+                ));
+            }
+            let restore = match self.return_draft(tx, command) {
+                Ok(r) => r,
+                Err(receipt) => return Ok(receipt),
+            };
+            held = self
+                .core
+                .messages
+                .values()
+                .filter(|m| m.ticket.is_none())
+                .cloned()
+                .collect();
+            held.sort_by_key(|m| m.arrival);
+            for message in &held {
+                self.core.messages.remove(&message.id);
+                self.show_message(tx, fx, message, "withdrawing", None)?;
+            }
+            Some(restore)
+        } else {
+            None
+        };
+        let Some(carrier) = carrier else {
+            for message in &held {
+                self.restore_withdrawn(tx, fx, message)?;
+            }
+            if let Some(restore) = restore {
+                self.refill_draft(tx, &command.id, &restore, &held)?;
+            }
+            return Ok(Receipt::Done {
+                value: json!({"idle":true}),
+            });
+        };
+        if let Some(restore) = &restore {
+            self.pin_return(tx, &command.id, restore, true)?;
+        }
+        let ticket = Ticket(format!("control:{}", command.id));
+        self.core.outbox.insert(
+            ticket.clone(),
+            OutRow {
+                issued: Issued {
+                    ticket: ticket.clone(),
+                    session: self.id.clone(),
+                    write_gen: self.write_gen,
+                },
+                act: Act::Interrupt {
+                    to: carrier.id,
+                    queued,
+                },
+                kind: carrier.kind,
+                issuer: Issuer::Control {
+                    id: command.id.clone(),
+                    restore,
+                    held,
+                },
+                display: None,
+                outcome: None,
+                handed: false,
+            },
+        );
+        fx.hand.insert(0, ticket);
+        self.show(
+            tx,
+            fx,
+            Shown::Control {
+                id: command.id.clone(),
+                state: "pending".into(),
+                outcome: Value::Null,
+            },
+        )?;
+        Ok(Receipt::Done {
+            value: json!({"control":command.id}),
+        })
+    }
+
     fn resend(
         &mut self,
         tx: &mut Tx<'_>,
@@ -867,6 +1201,11 @@ impl Executor {
         }
         for fact in batch.facts {
             match fact.body {
+                FactBody::CanCancelQueued { available } => {
+                    if let Some(c) = self.core.carriers.get_mut(&batch.carrier) {
+                        c.interaction.cancel_queued = available;
+                    }
+                }
                 FactBody::TitleChanged { title } => {
                     if self.core.current.as_ref() == Some(&batch.carrier) {
                         let meta = self.core.meta.as_mut().unwrap();
@@ -878,18 +1217,44 @@ impl Executor {
                     self.recovering.remove(&batch.carrier);
                 }
                 FactBody::Clarified { ticket, outcome } => {
-                    if matches!(
-                        outcome,
-                        Outcome::Ok {
-                            done: Done::Landed { .. }
-                        } | Outcome::Refused {
-                            refusal: Refusal::Lost { .. }
-                        }
-                    ) && let Some(mut row) = self.core.uncertain.remove(&ticket)
-                    {
+                    let confirmed = self
+                        .core
+                        .uncertain
+                        .get(&ticket)
+                        .is_some_and(|row| match &row.act {
+                            Act::Send { .. } => matches!(
+                                &outcome,
+                                Outcome::Ok {
+                                    done: Done::Landed { .. }
+                                } | Outcome::Refused {
+                                    refusal: Refusal::Lost { .. }
+                                }
+                            ),
+                            Act::Withdraw { .. } => matches!(
+                                &outcome,
+                                Outcome::Ok {
+                                    done: Done::Withdrawn { .. }
+                                } | Outcome::Failed { .. }
+                                    | Outcome::Rejected { .. }
+                                    | Outcome::Refused {
+                                        refusal: Refusal::Lost { .. }
+                                    }
+                            ),
+                            Act::Interrupt { .. } => matches!(
+                                &outcome,
+                                Outcome::Ok {
+                                    done: Done::Interrupted { .. }
+                                } | Outcome::Failed { .. }
+                                    | Outcome::Rejected { .. }
+                                    | Outcome::Refused {
+                                        refusal: Refusal::Lost { .. }
+                                    }
+                            ),
+                            _ => false,
+                        });
+                    if confirmed && let Some(mut row) = self.core.uncertain.remove(&ticket) {
                         row.outcome = None;
                         self.core.outbox.insert(ticket.clone(), row);
-                        // 原操作若已收场，仅更新原消息证据，不能重新进入正向流程。
                         self.record_outcome(tx, fx, &ticket, outcome)?;
                     }
                 }
@@ -1036,6 +1401,7 @@ impl Executor {
                         Done::Opened {
                             run,
                             readiness,
+                            interaction,
                             adopt,
                             ..
                         },
@@ -1045,6 +1411,7 @@ impl Executor {
                     c.run = Some(run.clone());
                     c.alive = true;
                     c.readiness = Some(readiness.clone());
+                    c.interaction = interaction.clone();
                     c.adopt = adopt.clone();
                     c.checkpoint = None;
                     c.turn_running = false;
@@ -1139,6 +1506,9 @@ impl Executor {
                     done: Done::Landed { native },
                 } => ("landed", Some(native.clone()), None),
                 Outcome::Unknown { .. } => ("unknown", None, Some(outcome.reason())),
+                Outcome::Refused {
+                    refusal: Refusal::Withdrawn,
+                } => ("withdrawn", None, None),
                 other if !other.possibly_applied() => ("not_delivered", None, Some(other.reason())),
                 other => ("failed", None, Some(other.reason())),
             };
@@ -1161,7 +1531,7 @@ impl Executor {
             && !matches!(
                 outcome,
                 Outcome::Refused {
-                    refusal: Refusal::Withheld
+                    refusal: Refusal::Withheld | Refusal::Withdrawn
                 }
             )
         {
@@ -1174,6 +1544,123 @@ impl Executor {
         }
         self.core.outbox.remove(ticket);
         match row.issuer {
+            Issuer::Withdrawal {
+                id,
+                message,
+                restore,
+            } => {
+                if !matches!(outcome, Outcome::Unknown { .. }) {
+                    self.pin_return(tx, &id, &restore, false)?;
+                }
+                let state = match &outcome {
+                    Outcome::Ok {
+                        done: Done::Withdrawn { ok: true },
+                    } => {
+                        self.restore_withdrawn(tx, fx, &message)?;
+                        self.refill_draft(tx, &id, &restore, std::slice::from_ref(&message))?;
+                        "withdrawn"
+                    }
+                    Outcome::Ok {
+                        done: Done::Withdrawn { ok: false },
+                    } => {
+                        if self.core.messages.contains_key(&message.id) {
+                            self.show_message(
+                                tx,
+                                fx,
+                                &message,
+                                "written",
+                                Some("已开始处理，撤回失败".into()),
+                            )?;
+                        }
+                        "not_withdrawable"
+                    }
+                    Outcome::Unknown { .. } => {
+                        if self.core.messages.contains_key(&message.id) {
+                            self.show_message(tx, fx, &message, "unknown", Some(outcome.reason()))?;
+                        }
+                        "unknown"
+                    }
+                    _ => {
+                        if self.core.messages.contains_key(&message.id) {
+                            self.show_message(tx, fx, &message, "written", Some(outcome.reason()))?;
+                        }
+                        "failed"
+                    }
+                };
+                self.show(
+                    tx,
+                    fx,
+                    Shown::Control {
+                        id,
+                        state: state.into(),
+                        outcome: serde_json::to_value(outcome).map_err(aborted)?,
+                    },
+                )?;
+            }
+            Issuer::Control {
+                id,
+                restore,
+                mut held,
+            } => {
+                if let Outcome::Ok {
+                    done: Done::Interrupted { cancelled },
+                } = &outcome
+                {
+                    for send in cancelled {
+                        if let Some(message) = self
+                            .core
+                            .messages
+                            .values()
+                            .find(|m| m.ticket.as_ref() == Some(send))
+                        {
+                            held.push(message.clone());
+                        } else if let Some(row) = self.core.uncertain.get(send)
+                            && let (Act::Send { msg, .. }, Issuer::Message { id, arrival }) =
+                                (&row.act, &row.issuer)
+                        {
+                            held.push(Message {
+                                id: id.clone(),
+                                text: msg.text.clone(),
+                                attachments: msg.attachments.clone(),
+                                intent: msg.intent,
+                                ticket: Some(send.clone()),
+                                attempt: 0,
+                                waiting: None,
+                                arrival: *arrival,
+                            });
+                        }
+                    }
+                }
+                held.sort_by_key(|m| m.arrival);
+                for message in &held {
+                    self.restore_withdrawn(tx, fx, message)?;
+                }
+                if let Some(restore) = restore {
+                    self.refill_draft(tx, &id, &restore, &held)?;
+                    if !matches!(outcome, Outcome::Unknown { .. }) {
+                        self.pin_return(tx, &id, &restore, false)?;
+                    }
+                }
+                if let Some(row) = self.core.uncertain.get_mut(ticket)
+                    && let Issuer::Control { held, .. } = &mut row.issuer
+                {
+                    held.clear();
+                }
+                let state = match &outcome {
+                    Outcome::Ok { .. } => "acknowledged",
+                    Outcome::Unknown { .. } => "unknown",
+                    _ => "failed",
+                };
+                self.show(
+                    tx,
+                    fx,
+                    Shown::Control {
+                        id,
+                        state: state.into(),
+                        outcome: serde_json::to_value(outcome).map_err(aborted)?,
+                    },
+                )?;
+            }
             Issuer::Op { op, key } => {
                 let Some(mut record) = self.core.ops.remove(&op) else {
                     return Ok(());
@@ -1215,7 +1702,7 @@ impl Executor {
                 }
                 self.core.ops.insert(op, record);
             }
-            Issuer::Message { id } => {
+            Issuer::Message { id, .. } => {
                 if matches!(
                     outcome,
                     Outcome::Refused {
@@ -1603,6 +2090,7 @@ impl Executor {
                     run: None,
                     alive: false,
                     readiness: None,
+                    interaction: Default::default(),
                     adopt: Value::Null,
                     checkpoint: None,
                     drain: Drain::Unknown {
@@ -1975,7 +2463,10 @@ impl Executor {
                             },
                         },
                         kind: carrier.kind.clone(),
-                        issuer: Issuer::Message { id: m.id.clone() },
+                        issuer: Issuer::Message {
+                            id: m.id.clone(),
+                            arrival: m.arrival,
+                        },
                         display: Some(m.id.clone()),
                         outcome: None,
                         handed: false,
@@ -2138,6 +2629,7 @@ pub(crate) fn header(core: &Core) -> Value {
             "turn_running": c.turn_running,
             "drain": c.drain,
         })),
+        "interaction": carrier.map(|c| &c.interaction),
         "op": core.ops.values().next().map(|op| json!({"op": op.id, "kind": op.spec.kind(), "phase": op.phase.name()})),
     })
 }

@@ -19,6 +19,11 @@ pub enum Shown {
     Draft {
         draft: nd_wire::Draft,
     },
+    Control {
+        id: String,
+        state: String,
+        outcome: Value,
+    },
     Lineage {
         data: Value,
     },
@@ -87,6 +92,7 @@ impl Shown {
     pub fn id(&self) -> String {
         match self {
             Shown::Draft { .. } => "draft".into(),
+            Shown::Control { id, .. } => format!("control/{id}"),
             Shown::Lineage { .. } => "lineage".into(),
             Shown::Header { .. } => "header".into(),
             Shown::Prompt { id, .. } => format!("prompt/{id}"),
@@ -109,6 +115,21 @@ impl Shown {
                 serde_json::to_value(draft).expect("draft value"),
                 "草稿".to_owned(),
                 shorten(&draft.text),
+            ),
+            Shown::Control { id, state, outcome } => (
+                "control",
+                json!({"control": id, "state": state, "outcome": outcome}),
+                "操作结果".to_owned(),
+                match state.as_str() {
+                    "acknowledged" => "停止请求已送达",
+                    "pending" => "正在处理",
+                    "withdrawn" => "已撤回，内容已保存在草稿中",
+                    "not_withdrawable" => "消息已开始处理，无法撤回",
+                    "unknown" => "交付不明，请核对会话状态",
+                    "failed" => "操作失败",
+                    other => other,
+                }
+                .into(),
             ),
             Shown::Lineage { data } => (
                 "lineage",

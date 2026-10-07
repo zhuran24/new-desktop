@@ -16,8 +16,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario_draft = None::<serde_json::Value>;
     #[cfg(feature = "scenarios")]
     let mut scenario_history = None::<serde_json::Value>;
+    #[cfg(feature = "scenarios")]
+    let mut scenario_controls = None::<PathBuf>;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            #[cfg(feature = "scenarios")]
+            "--scenario-controls" => {
+                scenario_controls = Some(args.next().ok_or("missing controls")?.into())
+            }
             #[cfg(feature = "scenarios")]
             "--scenario-settings" => {
                 scenario_settings = Some(serde_json::from_str(
@@ -132,6 +138,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     #[cfg(feature = "scenarios")]
                     if let Some(plan) = scenario_history {
                         Desktop::scenario_history(plan, window, cx);
+                    }
+                    #[cfg(feature = "scenarios")]
+                    if let Some(path) = scenario_controls {
+                        Desktop::scenario_controls(path, window, cx);
                     }
                     desktop
                 })

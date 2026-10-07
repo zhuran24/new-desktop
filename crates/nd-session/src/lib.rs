@@ -362,17 +362,26 @@ impl Sessions {
     pub async fn execute(&self, command: &Command) -> Option<CommandReply> {
         let target = match command.name.as_str() {
             "session.create" => session_id_for(&command.id),
-            "session.resend"
-            | "session.send"
+            "session.send"
+            | "session.resend"
+            | "session.draft.update"
+            | "session.withdraw"
             | "session.configure"
             | "session.rename"
-            | "session.draft.update" => match command.args["session"].as_str() {
+            | "session.interrupt" => match command.args["session"].as_str() {
                 Some(id) => SessionId(id.to_owned()),
                 None => return Some(self.reject_without_session(command, "invalid")),
             },
             _ => return None,
         };
-        if !self.adopted() || self.deps.claims.recovery().ok() != Some(nd_claims::Recovery::Ready) {
+        let control = matches!(
+            command.name.as_str(),
+            "session.interrupt" | "session.withdraw"
+        );
+        if !control
+            && (!self.adopted()
+                || self.deps.claims.recovery().ok() != Some(nd_claims::Recovery::Ready))
+        {
             // 恢复闸门不遮住已有收据；新命令没有受理、没有收据，允许同 id 退避重试。
             return Some(
                 match nd_ledger::lookup(

@@ -106,12 +106,27 @@ pub enum Act {
         to: CarrierId,
         msg: Msg,
     },
+    /// 只停当前回合，保留排队输入和后台任务。
+    Interrupt {
+        to: CarrierId,
+        #[serde(default)]
+        queued: QueuedPolicy,
+    },
+    /// 撤回指定 Send 票；票派生的原生编号留在适配器内部。
+    Withdraw {
+        to: CarrierId,
+        send: Ticket,
+    },
 }
 impl Act {
     pub fn carrier(&self) -> &CarrierId {
         match self {
             Act::Open { carrier, .. } | Act::End { carrier, .. } => carrier,
-            Act::Send { to, .. } | Act::Configure { to, .. } | Act::Invoke { to, .. } => to,
+            Act::Send { to, .. }
+            | Act::Interrupt { to, .. }
+            | Act::Withdraw { to, .. }
+            | Act::Configure { to, .. }
+            | Act::Invoke { to, .. } => to,
         }
     }
     /// 恢复对账时证明没写出的票怎么办：要经独占登记放行的写类动作不补发（`Withhold`），
@@ -123,7 +138,11 @@ impl Act {
                 invocation: Invocation::GenerateTitle { .. },
                 ..
             } => IfUnsent::Withhold,
-            Act::End { .. } | Act::Configure { .. } | Act::Invoke { .. } => IfUnsent::Resend,
+            Act::End { .. }
+            | Act::Interrupt { .. }
+            | Act::Withdraw { .. }
+            | Act::Configure { .. }
+            | Act::Invoke { .. } => IfUnsent::Resend,
         }
     }
 }
@@ -200,6 +219,14 @@ pub enum Intent {
     Fold,
     AfterTurn,
     Interrupting,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedPolicy {
+    #[default]
+    Keep,
+    Cancel,
 }
 
 /// `act` 的同步结论：只校验、排队，不做 I/O。
@@ -279,6 +306,7 @@ impl Outcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum Refusal {
+    Withdrawn,
     /// 恢复对账证明没写出，按 `IfUnsent::Withhold` 没有补发：引擎重新放行后另发。
     Withheld,
     /// 写出了，但端口证实没生效。
@@ -293,6 +321,13 @@ pub enum Refusal {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "done", rename_all = "snake_case")]
 pub enum Done {
+    /// 控制请求的 ACK；不证明回合已结束。
+    Interrupted {
+        cancelled: Vec<Ticket>,
+    },
+    Withdrawn {
+        ok: bool,
+    },
     Titled {
         title: Option<String>,
     },
@@ -303,6 +338,8 @@ pub enum Done {
         bs: BackendSessionId,
         run: RunId,
         readiness: Readiness,
+        #[serde(default)]
+        interaction: InteractionCaps,
         /// 适配器在守护进程重启后接回这个进程要用的记录（Claude：拉起时的能力表），执行器原样保存。
         adopt: Value,
     },
@@ -313,6 +350,19 @@ pub enum Done {
     Landed {
         native: String,
     },
+}
+
+/// 中立的发送与停止能力；界面只消费这些值，不解读后端私有字段。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionCaps {
+    pub send_intents: Vec<Intent>,
+    pub withdraw: bool,
+    pub interrupt: bool,
+    #[serde(default)]
+    pub cancel_queued: bool,
+    pub interrupt_spares_background: bool,
+    pub immediate_preserves_mcp: bool,
+    pub rewind_menu: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +385,9 @@ pub struct Fact {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "fact", rename_all = "snake_case")]
 pub enum FactBody {
+    CanCancelQueued {
+        available: bool,
+    },
     TitleChanged {
         title: String,
     },
@@ -481,6 +534,8 @@ pub struct CarrierRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTicket {
+    /// 已经终结为 Unknown；只对账，不重新执行。
+    pub unknown: bool,
     pub issued: Issued,
     pub act: Act,
 }

@@ -65,7 +65,7 @@ impl Desktop {
             cx,
         );
     }
-    fn open_session_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_session_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         if self.settings_open {
             let title = self

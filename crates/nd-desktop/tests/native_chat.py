@@ -180,7 +180,7 @@ def inner():
             handle.close()
 
 
-def run(args):
+def run(args, script=None):
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='nd-test-chat-'))
@@ -205,7 +205,7 @@ def run(args):
                    '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib', '/lib64', '--proc', '/proc',
                    '--ro-bind', '/sys', '/sys', '--dev', '/dev', '--dev-bind', '/dev/dri', '/dev/dri', '--tmpfs', '/tmp',
                    '--bind', str(work), '/sandbox', '--bind', str(out), '/sandbox/out', '--ro-bind', str(socket.parent), str(socket.parent),
-                   '--ro-bind', str(Path(__file__).resolve()), '/scenario.py', '--ro-bind', str(Path(args.desktop).resolve()), '/nd-desktop', '--clearenv']
+                   '--ro-bind', str(Path(script or __file__).resolve()), '/scenario.py', '--ro-bind', str(Path(args.desktop).resolve()), '/nd-desktop', '--clearenv']
         for key, value in {'PATH': '/usr/bin', 'HOME': '/sandbox/home', 'CLAUDE_CONFIG_DIR': '/sandbox/claude',
                            'XDG_RUNTIME_DIR': '/sandbox/runtime', 'XDG_CONFIG_HOME': '/sandbox/config', 'XDG_DATA_HOME': '/sandbox/data',
                            'XDG_STATE_HOME': '/sandbox/state', 'XDG_CACHE_HOME': '/sandbox/cache', 'XDG_CURRENT_DESKTOP': 'KDE',

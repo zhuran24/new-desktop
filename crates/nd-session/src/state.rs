@@ -76,6 +76,8 @@ pub struct Carrier {
     pub run: Option<RunId>,
     pub alive: bool,
     pub readiness: Option<Readiness>,
+    #[serde(default)]
+    pub interaction: nd_backend::InteractionCaps,
     /// `Done::Opened.adopt`：适配器在守护进程重启后接回要用。
     pub adopt: Value,
     pub checkpoint: Option<Checkpoint>,
@@ -102,12 +104,42 @@ pub struct OutRow {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "by", rename_all = "snake_case")]
 pub enum Issuer {
-    Op { op: String, key: String },
-    Message { id: String },
+    Op {
+        op: String,
+        key: String,
+    },
+    Message {
+        id: String,
+        #[serde(default)]
+        arrival: u64,
+    },
+    Control {
+        id: String,
+        #[serde(default)]
+        restore: Option<DraftRestore>,
+        #[serde(default)]
+        held: Vec<Message>,
+    },
+    Withdrawal {
+        id: String,
+        message: Message,
+        #[serde(default)]
+        restore: DraftRestore,
+    },
+}
+
+/// 控制操作开始时看到的草稿基准；完成时版本已变化就走 #16 的另存稿。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftRestore {
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
+    pub version: u64,
+    pub text: String,
+    pub device: String,
 }
 
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     #[serde(default)]
     pub attachments: Vec<nd_wire::Attachment>,
