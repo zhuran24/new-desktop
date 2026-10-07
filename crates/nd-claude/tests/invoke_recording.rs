@@ -35,7 +35,11 @@ async fn bang_compact_and_fork_round_trips_are_recorded_and_replay_to_the_same_f
     let shell = Invocation::Shell {
         command: "echo RECORDED_BANG; export X=1".into(),
     };
-    assert!(run.send_as(ModName::Actions, "op-shell", invoke::action(&shell, None)));
+    assert!(run.send_as(
+        ModName::Actions,
+        "op-shell",
+        invoke::action(&shell, None).unwrap()
+    ));
     let asked = run
         .wait_frame(Duration::from_secs(30), |f| {
             f["type"] == "control_request" && f["request"]["subtype"] == "can_use_tool"
@@ -86,7 +90,7 @@ async fn bang_compact_and_fork_round_trips_are_recorded_and_replay_to_the_same_f
     assert!(run.send_as(
         ModName::Actions,
         "op-compact",
-        invoke::action(&compact, Some("NOT_IN_THE_CONVERSATION"))
+        invoke::action(&compact, Some("NOT_IN_THE_CONVERSATION")).unwrap()
     ));
     let result = run.result("op-compact", Duration::from_secs(30)).await;
     assert!(
@@ -107,7 +111,11 @@ async fn bang_compact_and_fork_round_trips_are_recorded_and_replay_to_the_same_f
     let fork = Invocation::ForkAgent {
         prompt: "RECORDED_FORK".into(),
     };
-    assert!(run.send_as(ModName::Actions, "op-fork", invoke::action(&fork, None)));
+    assert!(run.send_as(
+        ModName::Actions,
+        "op-fork",
+        invoke::action(&fork, None).unwrap()
+    ));
     let result = run.result("op-fork", Duration::from_secs(30)).await;
     assert!(
         matches!(

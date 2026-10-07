@@ -275,6 +275,20 @@ fn completed_creation_is_out_of_the_chat_and_partial_failure_stays_explained() {
 }
 
 #[test]
+fn escape_closes_panels_before_stopping_and_idle_double_escape_opens_rewind() {
+    use nd_view_model::{Escape, EscapeState};
+    let mut state = EscapeState::default();
+    assert_eq!(state.press(10, true, true, true), Escape::ClosePanel);
+    assert_eq!(state.press(20, false, true, true), Escape::Interrupt);
+    assert_eq!(state.press(30, false, false, true), Escape::None);
+    assert_eq!(state.press(200, false, false, true), Escape::RewindMenu);
+    assert_eq!(state.press(210, false, false, true), Escape::None);
+    assert_eq!(state.press(1000, false, false, true), Escape::None);
+    assert_eq!(state.press(1100, false, false, false), Escape::None);
+    assert_eq!(state.press(1200, false, false, true), Escape::None);
+}
+
+#[test]
 fn delivery_unknown_is_explained_and_only_confirmed_non_delivery_offers_resend() {
     let snapshot = Snapshot {
         stream: "session/s".into(),

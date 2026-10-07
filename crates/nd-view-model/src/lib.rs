@@ -7,8 +7,10 @@ mod chat;
 mod history;
 pub use history::*;
 mod theme;
+mod theme_files;
 pub use chat::*;
-pub use theme::{Colors, Shadow, Spacing, Theme, ThemeMode, Typography};
+pub use theme::{Colors, Shadow, Spacing, Theme, ThemeDocument, ThemeMode, Typography};
+pub use theme_files::{ResolvedTheme, ThemeCatalog, ThemeEntry, ThemeSelection};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ItemView {
@@ -41,3 +43,6 @@ pub fn project(snapshot: &nd_wire::Snapshot, state: &ViewState) -> View {
 
 mod diff;
 pub use diff::*;
+
+mod settings;
+pub use settings::*;

@@ -10,7 +10,7 @@
 |---|---|
 | `Sessions::new(store, blobs, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
 | `Sessions::recover()` | 守护进程启动时装载有活进程、进行中操作或未结票的会话，交端口 `adopt` 对账 |
-| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`、`session.resend`、`session.shell`、`session.subtask`、`session.compact`；不是会话命令时返回 None。后三者的回应等动作有结果（`nd_session::delivery(name)` 判断） |
+| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`、`session.resend`、`session.withdraw`、`session.interrupt`、`session.configure`、`session.rename`、`session.shell`、`session.subtask`、`session.compact`；不是会话命令时返回 None。后三者的回应等动作有结果（`nd_session::delivery(name)` 判断） |
 | `Sessions::subscribe(&SessionId, since)` | `session/<id>` 流：快照或同纪元续上的事件，外加 `WatchGuard`（持有期间算「有人在看」） |
 | `Sessions::listing()` | 侧栏列表与一次性的提示（`global` 流里 `sessions` 命名空间的条目） |
 | `session_id_for(command_id)` | 新建会话的 id 由建它的命令 id 派生：同一条命令重试落在同一个会话上 |
@@ -40,9 +40,17 @@
 
 取回另存稿是带当前编辑基准版本的普通 `session.draft.update`，另存原文继续保留，暂不提供删除入口。已保存的草稿可在界面关闭、守护进程崩溃后从快照恢复；尚未确认持久化的编辑只存在活着的界面中，界面须显示保存状态并保留待确认命令的 id。
 
-`state::Core::update_draft(id, device, base, text, attachments)` 是同 crate 内的回填接入点。#18 撤回、#22 总结、#35 回退处理完成事实时，可在同一执行器事务调用它；调用方须用原操作账或去重事实保证一次落定，并保存操作开始时的草稿版本，不能拿完成时的最新版冒充基准。并发编辑时回填文字另存。`From` 回填原文、`UpTo` 回填空串的具体规则由对应操作接入，不在本单模拟后端动作。回填须同时处理正文和附件，并随核心事务更新当前稿与另存稿的 Blobs 引用。
+`state::Core::update_draft(id, device, base, text, attachments)` 是同 crate 内的回填接入点。#18 撤回已使用该入口；#22 总结、#35 回退处理完成事实时在同一执行器事务调用它；调用方须用原操作账或去重事实保证一次落定，并保存操作开始时的草稿版本，不能拿完成时的最新版冒充基准。并发编辑时回填文字另存。`From` 回填原文、`UpTo` 回填空串的具体规则由对应操作接入，不在本单模拟后端动作。当前稿、另存稿和比较/清空条件均包含 #17 的附件；附件引用随核心事务更新 Blobs 引用。
 
 接口类型和四份 `protocol/draft*.schema.json` 均从 `nd-wire` Rust 类型生成。草稿存正文和附件引用；光标、选区和组词只留在界面。
+
+### 撤回与停止（#18）
+
+- `session.withdraw`：`args:{session,message,draft?:{version,text,attachments?}}`。可选 draft 是界面在操作开始时看到的草稿基准，不是无条件保存。`Done{withdrawal,message}` 只表示持久受理；`prompt.state=withdrawing/withdrawn` 与 `control/<命令 id>` 给最终结果。已不在发送台的消息回 `not_withdrawable`，重复在途撤回回 `withdrawing`。
+- `session.interrupt`：`args:{session,queued?:"keep"|"cancel",draft?:{version,text,attachments?}}`，默认 keep。没有活进程回 `Done{idle:true}`；否则 `Done{control}` 是持久受理。`control.state=acknowledged` 只表示停止请求被确认，回合结束仍看 turn/header。Cancel 未获后端能力声明时拒绝；取消成功的消息按发送台到达顺序合成一份回填。
+- 成功撤回将原 Send 票结为 `Refused::Withdrawn`，在同事务通过 `Core::update_draft` 回填。保存操作开始时的版本、正文、设备；并发编辑时以稳定 `return/<命令 id>` 另存，不能覆盖新稿。撤回 false 不改变原 Send；未知结果在确证前不回填，始终不自动重投。迟到的撤回错误不能覆盖已经确认的送达；迟到的成功证据可回填一次。确认取消的原 Unknown Send 结为 Withdrawn，迟到 Lost 不能重新赋予重发资格。
+- 只要求本会话的来源追平后受理控制，不等待其他会话完成恢复；未知控制仅对账，不能执行到后续回合。在途草稿附件引用保留至控制结果确证，正文分页保留未决提示和控制。
+- `header.interaction` 给三种发送意图、withdraw、interrupt、cancel_queued、interrupt_spares_background、immediate_preserves_mcp 和 rewind_menu。界面按这些中立能力呈现，不能解读 Claude 的私有字段。
 
 ### 会话流的条目（命名空间 `session`）
 
@@ -52,7 +60,7 @@
 |---|---|---|
 | `header` | `header` | `status`（`preparing` 准备中、`active`、`partial` 部分完成、`withdrawn` 已撤掉）、`note`、`irreversible`、`process{carrier,backend_session,run,alive,readiness,turn_running,drain,features}`、`degraded`、进行中的 `op`、`recovering`。`features` 是端口的能力表（`{id,label,available,why}`），界面按它显示或隐藏总结、`!`、`/subtask`；进程只能聊天时 `degraded{why,unavailable}` 写明原因和用不了的功能名 |
 | `draft` | `draft` | 当前草稿 `version,text,attachments,device` 和 `saved[]`；编辑控件使用此项，不作为已发对话显示 |
-| `prompt/<消息 id>` | `prompt` | `text`、`attachments`、`intent`、`state`：`held` 代持、`waiting` 等独占、`pending` 已签票、`written` 已写出、`landed` 回显了原编号、`failed`、`unknown` 交付不明、`not_delivered` 未送达、`resent` 已重发；`native` 是写出用的原生编号 |
+| `prompt/<消息 id>` | `prompt` | `text`、`attachments`、`intent`、`state`：`held` 代持、`waiting` 等独占、`pending` 已签票、`written` 已写出、`landed` 回显了原编号、`failed`、`unknown` 交付不明、`not_delivered` 已证实未送达、`resent` 已重发、`withdrawing` 撤回中、`withdrawn` 已撤回；`native` 是写出用的原生编号 |
 | `block/<API 消息 id>:<块序号>`、`block/result:<工具调用 id>` | `text`、`thinking`、`tool_use`、`tool_result`、`other` | `text`、`complete`；流式增量期间 `complete:false`、文字累积，完整块到了整体替换 |
 | `turn/<承载位>/<n>` | `turn` | 后端回合结束的诊断条目：`ok`、`subtype`、`error`；其中 `n` 是后端 result 的计数，导航使用下面的谱系轮索引 |
 | `lineage` | `lineage` | `current` 当前段、`rounds` 当前段从 1 起的轮索引、`topology`、`segments`、`carriers`、`edges`、`switches`、`origin`、`summarized`（已被总结、不再是 CLI 对话行的提示消息 id）。轮含 `id`、`n`、`messages`、`positions`、`complete`、`last_assistant` |
@@ -142,6 +150,11 @@
 - 独占登记的 `Write` 放行按原因记账，消息越多登记的状态越大（#12 的结构，见其说明）。
 - 装载过的会话执行器目前一直留着（每会话一个线程），还没有按需卸载。
 
+
+#18 在同一崩溃矩阵追加三行：`withdraw/queued`（撤回并仅回填一次）、`interrupt/queued`（等待中控制仍受理、保留队列）、`interrupt/cancel-queue`（停止并仅回填一次）。另有控制窄接缝测试：Busy 不是终结、未知撤回不回填、迟到的撤回错误不覆盖送达。真 CLI/界面恢复证据见 [#18 验证记录](../../docs/verification/ticket-18.md)。
+
+
+撤回保存文字与附件引用。操作在途用 `return/<会话>/<命令 id>` 保留基准草稿附件，完成事务再交给当前稿或 `draft-saved` owner，并释放在途引用；原提示的 message 引用仍保留。多条排队输入合回草稿时按到达顺序追加正文、去重相同附件；若合并后超过单条消息的附件上限，需在编辑器删减到限制内再发送，不能静默丢附件。
 ### 历史页与导航
 
 `get { res:"session/<id>/items", page:{limit:60} }` 读取最近一页；`session/<id>` 是兼容别名。
@@ -169,3 +182,31 @@
 `FactBody::Clarified` 只接受原 Unknown 票的确定送达或 Lost 结论，更新原消息，不修改命令收据、不重新运行已收场的操作。Unknown 票与签发者长期保留；不明不是无效票。
 
 `session.resend {session, message}` 只受理已有 `not_delivered` 消息。正文、意图和附件从原消息取，纯附件消息也可重发；本次命令 id 是新消息 id。旧消息变为 `resent`、新消息及附件引用进发送台、收据同事务；不同命令 id 不能重复消费同一个原消息的资格。当前草稿始终保留，`expect.draft_version` 不参与重发。矩阵行 `confirmed_loss_and_user_resend_are_atomic_at_every_commit_point` 覆盖三个故障位置的全部提交点。
+
+
+恢复控制以本会话来源追平为准：来源未 Recovered 时 interrupt/withdraw 也回无收据 unavailable；来源已追平即使其他会话或独占登记仍在恢复，也允许这两类控制。普通发送/草稿/重发继续使用全局写入闸门。PendingTicket.unknown 区分对账与执行：Unknown 控制不能重放；连续流水证实未写出时只澄清 Lost。迟到控制回应可经 Clarified 更新原结果，回填及引用只结算一次，未知期间保留基准附件引用。成功撤回不产生 session.resend 资格。
+## 会话设置和标题
+
+公共命令均由 `Sessions::execute` 路由，经同一收据账本、会话事务和后端发件箱：
+
+```json
+{"id":"model-change-1","device":"desktop","name":"session.configure","args":{"session":"s-…","setting":{"model":"opus"}},"expect":{"settings_revision":0}}
+{"id":"rename-1","device":"desktop","name":"session.rename","args":{"session":"s-…","title":"新的标题"},"expect":{"title_revision":0}}
+```
+
+`LiveSetting` 一次一项：model、effort、permission_mode 或 ultracode。两条命令返回 Accepted，进展与终态在会话 op 条目中；同 id 同内容重试仍回原收据。修订号不匹配回 conflict；旧命令未带对应修订号时保留兼容入口，新界面必须带当前会话头的值。
+
+Configure 等当前回合结束后应用，期间新消息代持；进程已回收则先续接。只有后端控制接受且回读成功才更新已应用值。权限和模型由元数据保留，effort 意图进入中立 Profile，ultracode 通过 OpenSpec.live_settings 按 CLI 规则恢复。当前模型不支持 effort 时仍保留用户选择，供续接后切回支持的模型。
+
+会话头增加 `title/title_source/title_revision/settings_revision/settings/caps/pending_setting`。settings 只提供运行时 applied、模型目录和权限模式目录；不将 get_settings 的全部配置源广播给界面。caps 经过后端端口约束，Codex 的 ultracode 永远为 false。侧栏的 title 与会话头同一事务更新。
+
+自动标题默认启用，可设 `[sessions] auto_title = false`。第一条至少 10 个字符的非斜杠人类提示完成后尝试一次；失败或 CLI 返回空标题保留首条摘要。自动标题操作不占结构槽位，不阻塞后续对话；手动标题优先。标题可能额外发一次当前模型请求。自定义标题走原生 rename，AI 标题用生成接口的返回值；没有直接写记录文件。
+
+新增崩溃矩阵行均在 `tests/matrix.rs`：
+
+| 操作、场景 | 断言 |
+|---|---|
+| configure-and-title/success | 改模型与手动标题在每个提交点恢复；原生步骤不重复生效 |
+| configure-and-title/refused | 后端拒绝时保留旧模型、旧标题，操作收场 |
+| title/generate | 自动生成与落定在每个提交点恢复，不重复生成 |
+| title/fallback | 不支持生成时保留首条摘要，不自动再次请求 |

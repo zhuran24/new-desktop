@@ -61,6 +61,7 @@ DISABLE_TELEMETRY = "1"
 DISABLE_ERROR_REPORTING = "1"
 
 [sessions]
+auto_title = false
 idle_reclaim_ms = 3600000
 tick_ms = 50
 "#;

@@ -50,15 +50,17 @@ struct Step {
 struct Scenario {
     name: &'static str,
     uploads: Vec<Vec<u8>>,
+    auto_title: bool,
     script: Vec<(ActKind, Reply)>,
     idle_ms: u64,
     steps: Vec<Step>,
     check: fn(&Harness, &Snapshot),
 }
 
-fn config_for(idle_ms: u64, faults: Option<Arc<dyn Faults>>) -> EngineConfig {
+fn config_for(idle_ms: u64, auto_title: bool, faults: Option<Arc<dyn Faults>>) -> EngineConfig {
     EngineConfig {
         idle_reclaim: Duration::from_millis(idle_ms),
+        auto_title,
         faults,
         ..config()
     }
@@ -76,6 +78,7 @@ async fn run(scenario: &Scenario, crash: Option<(Fault, usize)>) -> (Harness, Sn
     });
     let mut h = Harness::new(config_for(
         scenario.idle_ms,
+        scenario.auto_title,
         fault.clone().map(|f| f as Arc<dyn Faults>),
     ))
     .await;
@@ -125,7 +128,9 @@ async fn run(scenario: &Scenario, crash: Option<(Fault, usize)>) -> (Harness, Sn
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         if fired() && !restarted {
-            h = h.restart(config_for(scenario.idle_ms, None)).await;
+            h = h
+                .restart(config_for(scenario.idle_ms, scenario.auto_title, None))
+                .await;
             restarted = true;
             // 界面按同一命令 id 重发：已提交的回原收据，没提交的这次才受理。
             continue;
@@ -248,6 +253,7 @@ async fn draft_conflict_and_send_consumption_recover_at_every_commit_point() {
     };
     matrix(Scenario {
         name: "send/draft-conflict-consume-retry",
+        auto_title: false,
         uploads: vec![],
         script: vec![],
         idle_ms: 3_600_000,
@@ -297,6 +303,7 @@ async fn draft_conflict_and_send_consumption_recover_at_every_commit_point() {
 async fn create_reaches_active_or_is_compensated_at_every_commit_point() {
     matrix(Scenario {
         name: "create/ok",
+        auto_title: false,
         uploads: vec![],
         script: vec![],
         idle_ms: 3_600_000,
@@ -316,6 +323,7 @@ async fn create_reaches_active_or_is_compensated_at_every_commit_point() {
 async fn a_create_that_cannot_start_is_withdrawn_at_every_commit_point() {
     matrix(Scenario {
         name: "create/open-fails",
+        auto_title: false,
         uploads: vec![],
         script: vec![(ActKind::Open, Reply::Fail("工作目录不存在".into()))],
         idle_ms: 3_600_000,
@@ -332,6 +340,7 @@ async fn a_create_that_cannot_start_is_withdrawn_at_every_commit_point() {
 async fn a_create_whose_first_message_is_unknown_is_partial_at_every_commit_point() {
     matrix(Scenario {
         name: "create/partial",
+        auto_title: false,
         uploads: vec![],
         script: vec![(ActKind::Send, Reply::Unknown("进程退出，没等到回显".into()))],
         idle_ms: 3_600_000,
@@ -351,6 +360,7 @@ async fn idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_eve
     let session = session_id_for("matrix-idle");
     matrix(Scenario {
         name: "reclaim+launch",
+        auto_title: false,
         uploads: vec![],
         script: vec![],
         idle_ms: 60,
@@ -391,6 +401,7 @@ async fn confirmed_loss_and_user_resend_are_atomic_at_every_commit_point() {
     let session = session_id_for("matrix-resend");
     matrix(Scenario {
         name: "send/lost-and-user-resend",
+        auto_title: false,
         uploads: vec![bytes.to_vec()],
         script: vec![
             (ActKind::Send, Reply::Ok),
@@ -467,6 +478,7 @@ async fn attachment_create_and_send_recover_at_every_commit_point() {
     first.args["attachments"] = attachments.clone();
     matrix(Scenario {
         name: "create-and-send/attachments",
+        auto_title: false,
         uploads: vec![bytes.to_vec()],
         script: vec![], idle_ms:3_600_000,
         steps: vec![
@@ -499,6 +511,7 @@ async fn attachment_creation_compensation_releases_unused_uploads_at_every_commi
         json!([{"blob":blob,"name":"材料.txt","media_type":"text/plain","size":bytes.len()}]);
     matrix(Scenario {
         name: "create/attachments-open-fails",
+        auto_title: false,
         uploads: vec![bytes.to_vec()],
         script: vec![(ActKind::Open, Reply::Fail("没有工作目录".into()))],
         idle_ms: 3_600_000,
@@ -536,6 +549,7 @@ async fn attached_draft_conflict_and_send_consumption_recover_at_every_commit_po
     };
     matrix(Scenario {
         name: "send/attached-draft-conflict-consume-retry",
+        auto_title: false,
         uploads: vec![bytes.to_vec()],
         script: vec![],
         idle_ms: 3_600_000,
@@ -587,6 +601,284 @@ async fn attached_draft_conflict_and_send_consumption_recover_at_every_commit_po
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_restores_once_at_every_commit_point() {
+    use sha2::{Digest, Sha256};
+    let original = b"original draft attachment";
+    let returned = b"returned message attachment";
+    let original_ref = json!({"blob":format!("{:x}",Sha256::digest(original)),"name":"original.txt","media_type":"text/plain","size":original.len()});
+    let returned_ref = json!({"blob":format!("{:x}",Sha256::digest(returned)),"name":"returned.txt","media_type":"text/plain","size":returned.len()});
+    let session = session_id_for("matrix-withdraw");
+    matrix(Scenario {
+        auto_title: false,
+        uploads: vec![original.to_vec(),returned.to_vec()],
+        name: "withdraw/queued",
+        idle_ms: 3_600_000,
+        script: vec![(ActKind::Send, Reply::Ok), (ActKind::Send, Reply::Hold)],
+        steps: vec![
+            Step {
+                command: create("matrix-withdraw", "ready"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: nd_wire::Command { id:"base-draft".into(),device:"test".into(),name:"session.draft.update".into(),args:json!({"session":session,"text":"existing","attachments":[original_ref]}),expect:json!({"draft_version":0}) },
+                until: |s|item(s,"draft").data["version"] == 1,
+            },
+            Step {
+                command: command(
+                    "queued",
+                    "session.send",
+                    json!({"session":session,"text":"restore once","intent":"after_turn","attachments":[returned_ref]}),
+                ),
+                until: |s| prompt(s, "restore once").is_some(),
+            },
+            Step {
+                command: command(
+                    "withdraw",
+                    "session.withdraw",
+                    json!({"session":session,"message":"queued"}),
+                ),
+                until: |s| {
+                    prompt(s, "restore once").is_some_and(|i| i.data["state"] == "withdrawn")
+                },
+            },
+        ],
+        check: |h, s| {
+            assert_eq!(item(s, "draft").data["text"], "existing\n\nrestore once");
+            assert_eq!(item(s,"draft").data["attachments"].as_array().unwrap().len(),2);
+            assert_eq!(item(s, "draft").data["version"], 2);
+            assert!(!h.adapter.applied().iter().any(|a| a == "send:restore once"));
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_is_accepted_during_a_wait_and_recovers_at_every_commit_point() {
+    let session = session_id_for("matrix-interrupt");
+    matrix(Scenario {
+        auto_title: false,
+        uploads: vec![],
+        name: "interrupt/queued",
+        idle_ms: 3_600_000,
+        script: vec![(ActKind::Send, Reply::Ok), (ActKind::Send, Reply::Hold)],
+        steps: vec![
+            Step {
+                command: create("matrix-interrupt", "ready"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "pending",
+                    "session.send",
+                    json!({"session":session,"text":"still queued"}),
+                ),
+                until: |s| prompt(s, "still queued").is_some(),
+            },
+            Step {
+                command: command("interrupt", "session.interrupt", json!({"session":session})),
+                until: |s| {
+                    s.items
+                        .iter()
+                        .any(|i| i.id == "control/interrupt" && i.data["state"] == "acknowledged")
+                },
+            },
+        ],
+        check: |h, s| {
+            assert_eq!(
+                h.adapter
+                    .applied()
+                    .iter()
+                    .filter(|a| a.starts_with("interrupt:"))
+                    .count(),
+                1
+            );
+            assert_ne!(
+                prompt(s, "still queued").unwrap().data["state"],
+                "withdrawn"
+            );
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_the_queue_restores_once_at_every_commit_point() {
+    let session = session_id_for("matrix-cancel");
+    matrix(Scenario {
+        auto_title: false,
+        uploads: vec![],
+        name: "interrupt/cancel-queue",
+        idle_ms: 3_600_000,
+        script: vec![(ActKind::Send, Reply::Ok), (ActKind::Send, Reply::Hold)],
+        steps: vec![
+            Step {
+                command: create("matrix-cancel", "ready"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "pending",
+                    "session.send",
+                    json!({"session":session,"text":"back to draft"}),
+                ),
+                until: |s| prompt(s, "back to draft").is_some(),
+            },
+            Step {
+                command: command(
+                    "interrupt",
+                    "session.interrupt",
+                    json!({"session":session,"queued":"cancel"}),
+                ),
+                until: |s| {
+                    prompt(s, "back to draft").is_some_and(|i| i.data["state"] == "withdrawn")
+                },
+            },
+        ],
+        check: |_, s| {
+            assert_eq!(item(s, "draft").data["text"], "back to draft");
+            assert_eq!(item(s, "draft").data["version"], 1);
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_and_manual_title_recover_at_every_commit_point() {
+    let session = session_id_for("matrix-settings");
+    matrix(Scenario {
+        name: "configure-and-title/success",
+        auto_title: false,
+        uploads: vec![],
+        script: vec![],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-settings", "hello"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "configure",
+                    "session.configure",
+                    json!({"session":session,"setting":{"model":"opus"}}),
+                ),
+                until: |s| header(s)["model"] == "opus" && header(s)["op"].is_null(),
+            },
+            Step {
+                command: command(
+                    "rename",
+                    "session.rename",
+                    json!({"session":session,"title":"矩阵标题"}),
+                ),
+                until: |s| header(s)["title"] == "矩阵标题" && header(s)["op"].is_null(),
+            },
+        ],
+        check: |_, s| {
+            assert_eq!(header(s)["model"], "opus");
+            assert_eq!(header(s)["title"], "矩阵标题");
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_and_title_failures_keep_previous_values_at_every_commit_point() {
+    let session = session_id_for("matrix-settings-failure");
+    matrix(Scenario {
+        name: "configure-and-title/refused",
+        auto_title: false,
+        uploads: vec![],
+        script: vec![
+            (ActKind::Configure, Reply::Fail("CLI 拒绝".into())),
+            (ActKind::Title, Reply::Fail("标题不可用".into())),
+        ],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-settings-failure", "hello"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "configure",
+                    "session.configure",
+                    json!({"session":session,"setting":{"model":"opus"}}),
+                ),
+                until: |s| {
+                    s.items.iter().any(|i| {
+                        i.kind == "op"
+                            && i.data["kind"] == "configure"
+                            && i.data["phase"] == "compensated"
+                    })
+                },
+            },
+            Step {
+                command: command(
+                    "rename",
+                    "session.rename",
+                    json!({"session":session,"title":"不应落定"}),
+                ),
+                until: |s| {
+                    s.items.iter().any(|i| {
+                        i.kind == "op"
+                            && i.data["kind"] == "title"
+                            && i.data["phase"] == "compensated"
+                    })
+                },
+            },
+        ],
+        check: |_, s| {
+            assert_eq!(header(s)["model"], "claude-haiku-4-5");
+            assert_eq!(header(s)["title"], "hello");
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_automatic_title_recovers_or_keeps_summary_at_every_commit_point() {
+    for fail in [false, true] {
+        matrix(Scenario {
+            name: if fail {
+                "title/fallback"
+            } else {
+                "title/generate"
+            },
+            auto_title: true,
+            uploads: vec![],
+            script: if fail {
+                vec![(ActKind::Title, Reply::Fail("当前版本不支持生成标题".into()))]
+            } else {
+                vec![]
+            },
+            idle_ms: 3_600_000,
+            steps: vec![Step {
+                command: create("matrix-title", "为当前会话自动生成可识别的标题"),
+                until: |s| {
+                    header(s)["status"] == "active"
+                        && header(s)["op"].is_null()
+                        && s.items
+                            .iter()
+                            .any(|i| i.kind == "op" && i.data["kind"] == "title")
+                },
+            }],
+            check: if fail {
+                |_, s| {
+                    assert_eq!(header(s)["title_source"], "summary");
+                    assert_eq!(header(s)["title"], "为当前会话自动生成可识别的标题");
+                }
+            } else {
+                |_, s| {
+                    assert_eq!(header(s)["title_source"], "ai");
+                    assert_eq!(header(s)["title"], "生成的标题");
+                }
+            },
+        })
+        .await;
+    }
+}
+
 fn invoke_state(s: &Snapshot, id: &str) -> Option<String> {
     s.items
         .iter()
@@ -605,6 +897,7 @@ fn receipt(h: &Harness, id: &str) -> nd_wire::Receipt {
 async fn summarize_from_here_backfills_the_draft_once_at_every_commit_point() {
     let session = session_id_for("matrix-sum-create");
     matrix(Scenario {
+        auto_title: false,
         name: "compact/from-ok",
         uploads: vec![],
         script: vec![],
@@ -669,6 +962,7 @@ async fn summarize_from_here_backfills_the_draft_once_at_every_commit_point() {
 async fn a_bang_whose_result_is_lost_is_unknown_and_never_rerun_at_every_commit_point() {
     let session = session_id_for("matrix-bang-create");
     matrix(Scenario {
+        auto_title: false,
         name: "shell/unknown",
         uploads: vec![],
         script: vec![(ActKind::Invoke, Reply::Unknown("mod 重载".into()))],
@@ -702,6 +996,7 @@ async fn a_bang_whose_result_is_lost_is_unknown_and_never_rerun_at_every_commit_
 async fn a_subtask_dispatches_one_fork_subagent_at_every_commit_point() {
     let session = session_id_for("matrix-fork-create");
     matrix(Scenario {
+        auto_title: false,
         name: "subtask/ok",
         uploads: vec![],
         script: vec![],

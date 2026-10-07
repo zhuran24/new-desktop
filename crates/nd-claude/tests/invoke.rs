@@ -73,7 +73,8 @@ fn the_compaction_hook_sees_text_blocks_joined_without_a_separator() {
         scope: CompactScope::UpTo,
         anchor,
     };
-    let nd_mod_proto::Action::Compact { spec } = invoke::action(&what, Some("TWO_ATWO_B")) else {
+    let nd_mod_proto::Action::Compact { spec } = invoke::action(&what, Some("TWO_ATWO_B")).unwrap()
+    else {
         panic!("compact action");
     };
     // 参数里只有散列和次序，原文不进 `/compact` 的命令行。

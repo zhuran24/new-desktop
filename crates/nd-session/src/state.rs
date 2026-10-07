@@ -46,7 +46,24 @@ pub struct Meta {
     pub cwd: PathBuf,
     pub kind: BackendKind,
     pub model: Option<String>,
+    /// 已确认接受的 effort 意图；模型暂不支持时仍保留，供续接和以后换模型。
+    #[serde(default)]
+    pub effort: Option<String>,
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub settings: Value,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub title_source: Option<String>,
+    #[serde(default)]
+    pub title_seed: Option<String>,
+    #[serde(default)]
+    pub title_attempted: bool,
+    #[serde(default)]
+    pub settings_revision: u64,
+    #[serde(default)]
+    pub title_revision: u64,
     /// 撤掉或部分完成的原因。
     pub note: Option<String>,
     /// 部分完成时已经做过（或可能做过）的不可逆步骤。
@@ -62,6 +79,8 @@ pub struct Carrier {
     pub run: Option<RunId>,
     pub alive: bool,
     pub readiness: Option<Readiness>,
+    #[serde(default)]
+    pub interaction: nd_backend::InteractionCaps,
     /// `Done::Opened.adopt`：适配器在守护进程重启后接回要用。
     pub adopt: Value,
     pub checkpoint: Option<Checkpoint>,
@@ -111,15 +130,40 @@ pub enum Issuer {
     },
     Message {
         id: String,
+        #[serde(default)]
+        arrival: u64,
     },
     /// 经后端进程做的一件事（总结、`!`、派 fork 型子代理）；`id` 是起它的命令 id。
     Invoke {
         id: String,
     },
+    Control {
+        id: String,
+        #[serde(default)]
+        restore: Option<DraftRestore>,
+        #[serde(default)]
+        held: Vec<Message>,
+    },
+    Withdrawal {
+        id: String,
+        message: Message,
+        #[serde(default)]
+        restore: DraftRestore,
+    },
+}
+
+/// 控制操作开始时看到的草稿基准；完成时版本已变化就走 #16 的另存稿。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftRestore {
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
+    pub version: u64,
+    pub text: String,
+    pub device: String,
 }
 
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     #[serde(default)]
     pub attachments: Vec<nd_wire::Attachment>,
@@ -164,6 +208,9 @@ impl Invoke {
             nd_backend::Invocation::Compact { .. } => "compact",
             nd_backend::Invocation::Shell { .. } => "shell",
             nd_backend::Invocation::ForkAgent { .. } => "subtask",
+            nd_backend::Invocation::Title { .. } | nd_backend::Invocation::GenerateTitle { .. } => {
+                "title"
+            }
         }
     }
     /// 端口能力表里对应的那一项。
@@ -172,6 +219,9 @@ impl Invoke {
             nd_backend::Invocation::Compact { .. } => "summarize",
             nd_backend::Invocation::Shell { .. } => "bang_mode",
             nd_backend::Invocation::ForkAgent { .. } => "fork_subagent",
+            nd_backend::Invocation::Title { .. } | nd_backend::Invocation::GenerateTitle { .. } => {
+                "title"
+            }
         }
     }
 }

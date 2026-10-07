@@ -50,6 +50,7 @@ pub trait Faults: Send + Sync {
 
 #[derive(Clone)]
 pub struct EngineConfig {
+    pub auto_title: bool,
     pub receipt_keep_ms: u64,
     /// 当前进程闲置多久回收；规格默认 15 分钟，测试用配置缩短。
     pub idle_reclaim: Duration,
@@ -62,6 +63,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            auto_title: true,
             receipt_keep_ms: 7 * 24 * 3600 * 1000,
             idle_reclaim: Duration::from_secs(15 * 60),
             tick: Duration::from_secs(1),
@@ -169,11 +171,16 @@ fn list_item(core: &state::Core) -> Item {
             "cwd": meta.cwd,
             "backend": format!("{:?}", meta.kind).to_lowercase(),
             "model": meta.model,
+            "title":meta.title,
             "note": meta.note,
             "process_alive": alive,
         }),
         fallback: Fallback {
-            title: meta.cwd.display().to_string(),
+            title: meta
+                .title
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| meta.cwd.display().to_string()),
             text: if label.is_empty() {
                 meta.status.as_str().into()
             } else {
@@ -361,8 +368,12 @@ impl Sessions {
         let target = match command.name.as_str() {
             "session.create" => session_id_for(&command.id),
             "session.send"
-            | "session.draft.update"
             | "session.resend"
+            | "session.draft.update"
+            | "session.withdraw"
+            | "session.configure"
+            | "session.rename"
+            | "session.interrupt"
             | "session.shell"
             | "session.compact"
             | "session.subtask" => match command.args["session"].as_str() {
@@ -371,7 +382,14 @@ impl Sessions {
             },
             _ => return None,
         };
-        if !self.adopted() || self.deps.claims.recovery().ok() != Some(nd_claims::Recovery::Ready) {
+        let control = matches!(
+            command.name.as_str(),
+            "session.interrupt" | "session.withdraw"
+        );
+        if !control
+            && (!self.adopted()
+                || self.deps.claims.recovery().ok() != Some(nd_claims::Recovery::Ready))
+        {
             // 恢复闸门不遮住已有收据；新命令没有受理、没有收据，允许同 id 退避重试。
             return Some(
                 match nd_ledger::lookup(

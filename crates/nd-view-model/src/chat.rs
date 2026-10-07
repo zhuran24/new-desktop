@@ -27,8 +27,9 @@ pub fn sidebar(snapshot: &Snapshot, state: &ViewState) -> Vec<SessionRow> {
                 selected: session.is_some() && session == state.selected_session,
                 id: item.id.clone(),
                 session,
-                title: item.data["cwd"]
+                title: item.data["title"]
                     .as_str()
+                    .or_else(|| item.data["cwd"].as_str())
                     .unwrap_or(&item.fallback.title)
                     .into(),
                 model: item.data["model"].as_str().unwrap_or_default().into(),
@@ -58,6 +59,7 @@ pub struct MessageView {
     pub text: String,
     pub status: String,
     pub markdown: bool,
+    pub withdraw: Option<String>,
     pub detail: String,
     pub resend: Option<String>,
     /// 这条提示还在对话里、能从它总结：值是消息 id（`session.compact` 的 `message`）。
@@ -286,6 +288,7 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                         text,
                         status,
                         markdown: false,
+                        withdraw: None,
                         detail,
                         resend: None,
                         summarize: None,
@@ -327,6 +330,14 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                     }
                     .into(),
                     markdown: i.kind == "text",
+                    withdraw: (header.is_some_and(|h| h.data["interaction"]["withdraw"] == true)
+                        && i.kind == "prompt"
+                        && matches!(
+                            i.data["state"].as_str(),
+                            Some("held" | "waiting" | "pending" | "written" | "queued")
+                        ))
+                    .then(|| i.data["message"].as_str().map(str::to_owned))
+                    .flatten(),
                     detail: i.data["reason"].as_str().unwrap_or_default().into(),
                     resend: (i.kind == "prompt" && i.data["state"] == "not_delivered")
                         .then(|| i.data["message"].as_str().map(str::to_owned))
@@ -344,6 +355,9 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                             Some("waiting") => "等待可写",
                             Some("pending") => "等待写出",
                             Some("written") => "已写出",
+                            Some("queued") => "排队中",
+                            Some("withdrawing") => "撤回中",
+                            Some("withdrawn") => "已撤回",
                             Some("landed") => "已送达",
                             Some("failed") => "发送失败",
                             Some("unknown") => "交付不明",
@@ -549,5 +563,49 @@ impl Draft {
             self.revision += 1;
         }
         true
+    }
+}
+
+/// 输入法已经由 Composer 消费后，按面板、活动回合、空闲双 Esc 的顺序分派。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Escape {
+    None,
+    ClosePanel,
+    Interrupt,
+    RewindMenu,
+}
+#[derive(Clone, Debug, Default)]
+pub struct EscapeState {
+    idle_at: Option<u64>,
+}
+impl EscapeState {
+    pub fn press(
+        &mut self,
+        now_ms: u64,
+        panel_open: bool,
+        running: bool,
+        can_rewind: bool,
+    ) -> Escape {
+        if panel_open {
+            self.idle_at = None;
+            return Escape::ClosePanel;
+        }
+        if running {
+            self.idle_at = None;
+            return Escape::Interrupt;
+        }
+        if !can_rewind {
+            self.idle_at = None;
+            return Escape::None;
+        }
+        if self
+            .idle_at
+            .take()
+            .is_some_and(|t| now_ms.saturating_sub(t) <= 500)
+        {
+            return Escape::RewindMenu;
+        }
+        self.idle_at = Some(now_ms);
+        Escape::None
     }
 }

@@ -135,8 +135,7 @@ impl Desktop {
                     this.send_text(text.clone(), window, cx)
                 }
                 ComposerEvent::Action(ComposerAction::Escape) => {
-                    this.warning = Some("当前界面暂不支持停止回合".into());
-                    cx.notify();
+                    this.escape_pressed(cx);
                 }
                 _ => {}
             },
@@ -231,6 +230,8 @@ impl Desktop {
         self.composer.update(cx, |c, _| c.cancel_pending_paste());
         self.queued_send = None;
         self.scroll = ScrollHandle::new();
+        self.escape = Default::default();
+        self.send_intent = "fold".into();
         self.creating = true;
         self.session_feed = None;
         self.session_snapshot = None;
@@ -254,6 +255,8 @@ impl Desktop {
         self.composer.update(cx, |c, _| c.cancel_pending_paste());
         self.queued_send = None;
         self.scroll = ScrollHandle::new();
+        self.escape = Default::default();
+        self.send_intent = "fold".into();
         self.session_feed = None; // 丢掉接收任务即关闭订阅，不结束后端。
         self.session_snapshot = None;
         self.history.clear();
@@ -357,6 +360,15 @@ impl Desktop {
         cx.notify();
     }
     pub(crate) fn send_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_text_intent(text, self.send_intent.clone(), window, cx);
+    }
+    pub(crate) fn send_text_intent(
+        &mut self,
+        text: String,
+        intent: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.sending
             || !self
                 .composer
@@ -389,7 +401,7 @@ impl Desktop {
         if let Some(session) = key.clone()
             && !draft.is_saved()
         {
-            self.queued_send = Some((session.clone(), text, revision));
+            self.queued_send = Some((session.clone(), text, revision, intent));
             self.persist_draft(session, window, cx);
             self.refresh_send(cx);
             cx.notify();
@@ -413,7 +425,7 @@ impl Desktop {
             args: if self.creating {
                 json!({"cwd":self.directory.read(cx).value().to_string(), "model":self.model, "text":text,"attachments":attachments})
             } else {
-                json!({"session":key, "text":text,"attachments":attachments})
+                json!({"session":key,"text":text,"intent":intent,"attachments":attachments})
             },
         };
         self.sending = true;
@@ -887,6 +899,19 @@ impl Desktop {
                             .child(format!("{} {}", message.title, message.status)),
                     )
                     .child(body)
+                    .when(message.withdraw.is_some(), |d| {
+                        let id = message.withdraw.clone().unwrap();
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("withdraw/{id}")))
+                                .text_color(rgba(t.colors.accent))
+                                .cursor_pointer()
+                                .child("撤回到输入框")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.withdraw_message(id.clone(), window, cx)
+                                })),
+                        )
+                    })
                     .when(!message.detail.is_empty(), |d| {
                         d.child(div().text_color(rgba(t.colors.muted)).child(message.detail))
                     })
@@ -955,6 +980,7 @@ impl Desktop {
             .flex_col()
             .gap(px(t.spacing.medium))
             .child(div().text_color(rgba(t.colors.muted)).child(view.header))
+            .child(self.session_settings_view(cx))
             .when_some(view.degraded, |d, degraded| {
                 d.child(
                     div()

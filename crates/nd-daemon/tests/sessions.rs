@@ -10,6 +10,992 @@ use std::{path::Path, time::Duration};
 
 const MODEL: &str = "claude-haiku-4-5";
 
+#[tokio::test]
+async fn an_uncertain_unwritten_interrupt_is_clarified_without_executing_it() {
+    let fx = Fixture::start("nd18-unknown-control", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("unknown-control", "/sandbox/project", "first")
+        .await;
+    fx.wait(&session, "active", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("not interrupted"));
+    fx.send("held", &session, "active").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    std::fs::write(
+        fx.scenario.root().join("runtime/delivery-fault.json"),
+        r#"{"contains":"interrupt","action":"unknown_without_write"}"#,
+    )
+    .unwrap();
+    fx.command(
+        "uncertain-esc",
+        "session.interrupt",
+        json!({"session":session}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let s = fx.peek(&session).await;
+            if s.items
+                .iter()
+                .any(|i| i.id == "control/uncertain-esc" && i.data["state"] == "unknown")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("control unknown fault must be observed");
+    fx.scenario.restart_daemon().unwrap();
+    let clarified = fx
+        .wait(&session, "known unwritten control", |s| {
+            s.items
+                .iter()
+                .any(|i| i.id == "control/uncertain-esc" && i.data["state"] == "failed")
+        })
+        .await;
+    assert_eq!(
+        header(&clarified)["process"]["turn_running"],
+        true,
+        "Unknown controls are reconciled, not re-executed"
+    );
+    gate.release();
+    fx.wait(&session, "original reply", |s| {
+        texts(s).contains(&"not interrupted".into())
+    })
+    .await;
+    assert_eq!(endpoint.count(&fx.main()), 2);
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_recovered_source_accepts_escape_while_another_session_is_still_recovering() {
+    let fx = Fixture::start("nd18-control-recovery", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready a"));
+    let a = fx.create("source-a", "/sandbox/project", "first").await;
+    fx.wait(&a, "active a", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    endpoint.enqueue(fx.main(), ModelReply::text("ready b"));
+    let b = fx.create("source-b", "/sandbox/project", "second").await;
+    let before = fx
+        .wait(&b, "active b", |s| {
+            has_header(s, |h| h["status"] == "active")
+        })
+        .await;
+    let blocked_pid = cli_pid(&fx, &before).await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("must not finish"));
+    fx.send("active-a", &a, "hold a").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 3, Duration::from_secs(30))
+        .await
+        .unwrap();
+    signal(blocked_pid, rustix::process::Signal::STOP);
+    fx.scenario.restart_daemon().unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        fx.command("esc-a", "session.interrupt", json!({"session":a})),
+    )
+    .await;
+    let still_recovering = header(&fx.peek(&a).await)["recovering"] == true;
+    signal(blocked_pid, rustix::process::Signal::CONT);
+    assert!(
+        matches!(
+            result,
+            Ok(CommandReply::Receipt {
+                receipt: Receipt::Done { .. }
+            })
+        ),
+        "Esc must use source readiness, not the global write gate: {result:?}"
+    );
+    assert!(
+        still_recovering,
+        "the unrelated paused source must still hold the global gate"
+    );
+    fx.wait(&a, "interrupted a", |s| {
+        has_header(s, |h| h["process"]["turn_running"] == false)
+    })
+    .await;
+    drop(gate);
+    fx.close();
+}
+
+#[tokio::test]
+async fn a_concurrent_draft_edit_saves_the_withdrawal_as_an_alternative() {
+    let fx = Fixture::start("nd18-draft-race", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    let blobs = fx.ui().await;
+    let png = include_bytes!("fixtures/pixel.png");
+    let image = blobs.put_blob(png).await.unwrap();
+    let file = blobs.put_blob(b"withdrawn attachment").await.unwrap();
+    let image_ref =
+        json!({"blob":image,"name":"before.png","media_type":"image/png","size":png.len()});
+    let file_ref = json!({"blob":file,"name":"returned.txt","media_type":"text/plain","size":20});
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("race-create", "/sandbox/project", "warm up")
+        .await;
+    fx.wait(&session, "created", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("finish original"));
+    fx.send("active", &session, "hold").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.command(
+        "queued",
+        "session.send",
+        json!({"session":session,"text":"returned text","intent":"after_turn","attachments":[file_ref.clone()]}),
+    )
+    .await;
+    fx.wait(&session, "written", |s| {
+        prompt(s, "returned text").is_some_and(|i| i.data["state"] == "written")
+    })
+    .await;
+    let mut ui = fx.ui().await;
+    let mut before = edit_draft("draft-before", "a", &session, 0, "existing draft");
+    before.args["attachments"] = json!([image_ref.clone()]);
+    ui.command(&before).await.unwrap();
+    std::fs::write(
+        fx.scenario.root().join("runtime/backend-fault.json"),
+        r#"{"contains":"cancel_async_message"}"#,
+    )
+    .unwrap();
+    fx.command(
+        "withdraw",
+        "session.withdraw",
+        json!({"session":session,"message":"queued"}),
+    )
+    .await;
+    let pending = fx
+        .wait(&session, "withdrawing", |s| {
+            prompt(s, "returned text").is_some_and(|i| i.data["state"] == "withdrawing")
+        })
+        .await;
+    ui.command(&edit_draft("draft-new", "b", &session, 1, "newer edit"))
+        .await
+        .unwrap();
+    let config = fx.scenario.root().join("config.toml");
+    let mut config_text = std::fs::read_to_string(&config).unwrap();
+    config_text.push_str("\n[storage]\nblob_grace_seconds=0\ngc_interval_seconds=1\n");
+    std::fs::write(config, config_text).unwrap();
+    let orphan = blobs
+        .put_blob(b"unreferenced collection witness")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while blobs.get_blob(&orphan).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        blobs.get_blob(&image).await.unwrap(),
+        png,
+        "in-flight return must retain the replaced draft's image"
+    );
+    signal(cli_pid(&fx, &pending).await, rustix::process::Signal::CONT);
+    let done = fx
+        .wait(&session, "withdrawn", |s| {
+            prompt(s, "returned text").is_some_and(|i| i.data["state"] == "withdrawn")
+        })
+        .await;
+    assert_eq!(draft(&done)["text"], "newer edit");
+    assert_eq!(
+        draft(&done)["saved"][0]["text"],
+        "existing draft\n\nreturned text"
+    );
+    fx.command(
+        "withdraw",
+        "session.withdraw",
+        json!({"session":session,"message":"queued"}),
+    )
+    .await;
+    assert_eq!(
+        draft(&fx.peek(&session).await)["saved"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        draft(&done)["saved"][0]["attachments"],
+        json!([image_ref, file_ref])
+    );
+    fx.scenario.restart_daemon().unwrap();
+    assert_eq!(fx.ui().await.get_blob(&image).await.unwrap(), png);
+    assert_eq!(
+        fx.ui().await.get_blob(&file).await.unwrap(),
+        b"withdrawn attachment"
+    );
+    gate.release();
+    fx.close();
+}
+
+#[tokio::test]
+async fn withdrawal_survives_daemon_restart_before_the_cli_reply() {
+    let fx = Fixture::start("nd18-recover-withdraw", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("recover-withdraw", "/sandbox/project", "warm up")
+        .await;
+    fx.wait(&session, "created", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("finish original"));
+    fx.send("active", &session, "keep running").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.command(
+        "queued",
+        "session.send",
+        json!({"session":session,"text":"restore after restart","intent":"after_turn"}),
+    )
+    .await;
+    fx.wait(&session, "written", |s| {
+        prompt(s, "restore after restart").is_some_and(|i| i.data["state"] == "written")
+    })
+    .await;
+    std::fs::write(
+        fx.scenario.root().join("runtime/backend-fault.json"),
+        r#"{"contains":"cancel_async_message"}"#,
+    )
+    .unwrap();
+    fx.command(
+        "withdraw",
+        "session.withdraw",
+        json!({"session":session,"message":"queued"}),
+    )
+    .await;
+    let pending = fx
+        .wait(&session, "withdrawing", |s| {
+            prompt(s, "restore after restart").is_some_and(|i| i.data["state"] == "withdrawing")
+        })
+        .await;
+    let pid = cli_pid(&fx, &pending).await;
+    fx.scenario.kill_daemon().unwrap();
+    signal(pid, rustix::process::Signal::CONT);
+    let restored = fx
+        .wait(&session, "restored", |s| {
+            prompt(s, "restore after restart").is_some_and(|i| i.data["state"] == "withdrawn")
+        })
+        .await;
+    assert_eq!(
+        restored
+            .items
+            .iter()
+            .find(|i| i.kind == "draft")
+            .unwrap()
+            .data["text"],
+        "restore after restart"
+    );
+    assert_eq!(cli_pid(&fx, &restored).await, pid);
+    gate.release();
+    fx.wait(&session, "finished", |s| {
+        texts(s).contains(&"finish original".into())
+    })
+    .await;
+    assert_eq!(endpoint.count(&fx.main()), 2);
+    fx.close();
+}
+
+#[tokio::test]
+async fn withdrawing_a_started_message_never_restores_or_resends_it() {
+    let fx = Fixture::start("nd18-too-late", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("too-late", "/sandbox/project", "warm up").await;
+    fx.wait(&session, "created", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("completed normally"));
+    fx.send("started", &session, "already processing").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.command(
+        "withdraw-started",
+        "session.withdraw",
+        json!({"session":session,"message":"started"}),
+    )
+    .await;
+    let declined = fx
+        .wait(&session, "withdrawal declined", |s| {
+            s.items.iter().any(|i| {
+                i.id == "control/withdraw-started" && i.data["state"] == "not_withdrawable"
+            })
+        })
+        .await;
+    assert_eq!(
+        declined
+            .items
+            .iter()
+            .find(|i| i.kind == "draft")
+            .unwrap()
+            .data["text"],
+        ""
+    );
+    gate.release();
+    fx.wait(&session, "normal result", |s| {
+        texts(s).contains(&"completed normally".into())
+            && prompt(s, "already processing").is_some_and(|i| i.data["state"] == "landed")
+    })
+    .await;
+    assert_eq!(endpoint.count(&fx.main()), 2);
+    fx.close();
+}
+
+#[tokio::test]
+async fn explicit_stop_and_cancel_queue_restores_each_queued_message_once() {
+    let fx = Fixture::start("nd18-cancel-queue", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("cancel-create", "/sandbox/project", "warm up")
+        .await;
+    fx.wait(&session, "created", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("must not finish"));
+    fx.send("active", &session, "hold turn").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    for (id, text) in [("queued-a", "first queued"), ("queued-b", "second queued")] {
+        fx.command(
+            id,
+            "session.send",
+            json!({"session":session,"text":text,"intent":"after_turn"}),
+        )
+        .await;
+        fx.wait(&session, "queued", |s| {
+            prompt(s, text).is_some_and(|i| i.data["state"] == "written")
+        })
+        .await;
+    }
+    fx.command(
+        "cancel-queue",
+        "session.interrupt",
+        json!({"session":session,"queued":"cancel"}),
+    )
+    .await;
+    let snapshot = fx
+        .wait(&session, "interrupt acknowledgement", |s| {
+            s.items
+                .iter()
+                .any(|i| i.id == "control/cancel-queue" && i.data["state"] == "acknowledged")
+        })
+        .await;
+    assert_eq!(
+        snapshot
+            .items
+            .iter()
+            .find(|i| i.kind == "draft")
+            .unwrap()
+            .data["text"],
+        "first queued\n\nsecond queued"
+    );
+    for text in ["first queued", "second queued"] {
+        assert_eq!(prompt(&snapshot, text).unwrap().data["state"], "withdrawn");
+    }
+    assert_eq!(endpoint.count(&fx.main()), 2);
+    drop(gate);
+    fx.close();
+}
+
+#[tokio::test]
+async fn auto_background_keeps_an_explicit_foreground_agent_completable() {
+    let fx = Fixture::start("nd18-auto-agent", 3_600_000).await;
+    std::fs::write(
+        fx.scenario.root().join("claude/settings.json"),
+        r#"{"permissions":{"allow":["Agent"]}}"#,
+    )
+    .unwrap();
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(),ModelReply::tool("toolu_foreground_agent","Agent",json!({"subagent_type":"general-purpose","description":"foreground timeout probe","prompt":"return AUTO_AGENT_DONE","run_in_background":false})));
+    let gate = endpoint.enqueue_any_agent_held(MODEL, ModelReply::text("AUTO_AGENT_DONE"));
+    endpoint.enqueue(fx.main(), ModelReply::text("agent now in background"));
+    endpoint.enqueue(fx.main(), ModelReply::text("agent result received"));
+    let start = tokio::time::Instant::now();
+    let session = fx
+        .create(
+            "auto-agent-create",
+            "/sandbox/project",
+            "start a foreground agent",
+        )
+        .await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(145))
+        .await
+        .unwrap();
+    fx.wait(&session, "automatically backgrounded", |s| {
+        texts(s).contains(&"agent now in background".into())
+            && has_header(s, |h| h["process"]["drain"]["drain"] == "busy")
+    })
+    .await;
+    gate.release();
+    fx.wait(&session, "agent completion", |s| {
+        texts(s).contains(&"agent result received".into())
+    })
+    .await;
+    assert!(
+        endpoint
+            .requests()
+            .iter()
+            .filter(|r| r.route.agent.is_none())
+            .any(|r| request_text(&r.body).contains("AUTO_AGENT_DONE"))
+    );
+    eprintln!(
+        "explicit foreground agent backgrounding and completion: {:?}",
+        start.elapsed()
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn e2b_send_now_moves_foreground_mcp_to_background_and_delivers_its_result() {
+    let fx = Fixture::start("nd18-e2b", 3_600_000).await;
+    std::fs::write(
+        fx.scenario.root().join("project/fifo_mcp.py"),
+        include_str!("fixtures/fifo_mcp.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        fx.scenario.root().join("project/.mcp.json"),
+        r#"{"mcpServers":{"fifo":{"command":"python3","args":["/sandbox/project/fifo_mcp.py"]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fx.scenario.root().join("claude/settings.json"),
+        r#"{"enableAllProjectMcpServers":true,"permissions":{"allow":["mcp__fifo__wait"]}}"#,
+    )
+    .unwrap();
+    let mut fifo = fx.scenario.fifo("mcp").unwrap();
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("e2b-create", "/sandbox/project", "warm up MCP")
+        .await;
+    fx.wait(&session, "created", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    endpoint.enqueue(
+        fx.main(),
+        ModelReply::tool("toolu_mcp", "mcp__fifo__wait", json!({})),
+    );
+    fx.send("mcp-call", &session, "call foreground MCP").await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !fx.scenario.root().join("project/mcp-started").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real MCP must be executing before send-now");
+    endpoint.enqueue(fx.main(), ModelReply::text("immediate done"));
+    fx.command(
+        "mcp-now",
+        "session.send",
+        json!({"session":session,"text":"send immediately","intent":"interrupting"}),
+    )
+    .await;
+    let immediate = fx
+        .wait(&session, "immediate result", |s| {
+            texts(s).contains(&"immediate done".into())
+        })
+        .await;
+    assert!(
+        immediate.items.iter().any(|i| i.kind == "tool_result"
+            && i.data["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("moved to the background"))),
+        "E2b did not background: {immediate:?}"
+    );
+    assert_eq!(header(&immediate)["process"]["drain"]["drain"], "busy");
+    endpoint.enqueue(fx.main(), ModelReply::text("MCP result received"));
+    fifo.release("finish").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !fx.scenario.root().join("project/mcp-finished").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let completed = fx
+        .wait(&session, "MCP result delivered", |s| {
+            texts(s).contains(&"MCP result received".into())
+                && has_header(s, |h| h["process"]["drain"]["drain"] == "drained")
+        })
+        .await;
+    assert!(
+        endpoint
+            .requests()
+            .iter()
+            .any(|r| request_text(&r.body).contains("MCP_FINISHED"))
+    );
+    assert!(!fx.scenario.root().join("project/mcp-cancelled").exists());
+    assert_eq!(
+        header(&completed)["process"]["run"],
+        header(&immediate)["process"]["run"]
+    );
+    assert_eq!(
+        header(&completed)["interaction"]["immediate_preserves_mcp"],
+        true
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn native_controls_send_withdraw_reopen_and_dispatch_escape() {
+    let fx = Fixture::start("nd18-native", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("native-controls", "/sandbox/project", "warm up")
+        .await;
+    fx.wait(&session, "created", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    let old = endpoint.enqueue_held(fx.main(), ModelReply::text("old must not finish"));
+    let next = endpoint.enqueue_held(fx.main(), ModelReply::text("new must not finish"));
+    fx.send("native-active", &session, "keep running").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let output = std::env::var_os("ND18_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-controls"));
+    // 输出目录可供复验复用；上一轮的协调文件不能充当本轮的时序证据。
+    std::fs::create_dir_all(&output).unwrap();
+    for marker in [
+        "arm-withdraw",
+        "armed",
+        "ui-killed",
+        "resumed",
+        "wait-now",
+        "now-started",
+        "result.json",
+    ] {
+        match std::fs::remove_file(output.join(marker)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove stale native marker {marker}: {error}"),
+        }
+    }
+    let mut child = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_controls.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"))
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--output")
+        .arg(&output)
+        .arg("--session")
+        .arg(&session)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    async fn wait_file(child: &mut tokio::process::Child, path: &Path) {
+        tokio::time::timeout(Duration::from_secs(40), async {
+            while !path.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "native driver exited before {}",
+                    path.display()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    wait_file(&mut child, &output.join("arm-withdraw")).await;
+    std::fs::write(
+        fx.scenario.root().join("runtime/backend-fault.json"),
+        r#"{"contains":"cancel_async_message"}"#,
+    )
+    .unwrap();
+    std::fs::write(output.join("armed"), "").unwrap();
+    wait_file(&mut child, &output.join("ui-killed")).await;
+    let queued = fx.peek(&session).await;
+    assert_eq!(
+        prompt(&queued, "ui later").unwrap().data["state"],
+        "withdrawing"
+    );
+    let pid = cli_pid(&fx, &queued).await;
+    signal(pid, rustix::process::Signal::CONT);
+    std::fs::write(output.join("resumed"), "").unwrap();
+    wait_file(&mut child, &output.join("wait-now")).await;
+    endpoint
+        .wait_for_requests(&fx.main(), 3, Duration::from_secs(20))
+        .await
+        .unwrap();
+    std::fs::write(output.join("now-started"), "").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(40), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(endpoint.count(&fx.main()), 3);
+    let snapshot = fx.peek(&session).await;
+    assert!(prompt(&snapshot, "ui fold").is_some_and(|i| i.data["state"] == "withdrawn"));
+    assert!(prompt(&snapshot, "ui later").is_some_and(|i| i.data["state"] == "withdrawn"));
+    assert!(!request_text(&endpoint.requests()[2].body).contains("ui later"));
+    drop((old, next));
+    fx.close();
+}
+
+#[tokio::test]
+async fn escape_preserves_background_bash_agent_and_workflow_until_their_results_arrive() {
+    for kind in ["bash", "agent", "workflow"] {
+        let fx = Fixture::start(&format!("nd18-esc-{kind}"), 3_600_000).await;
+        std::fs::write(
+            fx.scenario.root().join("claude/settings.json"),
+            r#"{"permissions":{"allow":["Bash","Agent","Workflow"]}}"#,
+        )
+        .unwrap();
+        let endpoint = fx.scenario.endpoint();
+        let mut fifo = fx.scenario.fifo("background").unwrap();
+        let tool = match kind {
+            "bash" => ModelReply::tool(
+                "toolu_background",
+                "Bash",
+                json!({"command":format!("head -n 1 {}",fifo.sandbox_path().display()),"run_in_background":true,"description":"background FIFO"}),
+            ),
+            "agent" => ModelReply::tool(
+                "toolu_background",
+                "Agent",
+                json!({"prompt":"return BACKGROUND_RESULT","subagent_type":"general-purpose","description":"background agent","run_in_background":true}),
+            ),
+            "workflow" => ModelReply::tool(
+                "toolu_background",
+                "Workflow",
+                json!({"script":"export const meta = { name: 'nd-background', description: 'offline background agent' };\nconst result = await agent('return BACKGROUND_RESULT', { label: 'background' });\nreturn { result };"}),
+            ),
+            _ => unreachable!(),
+        };
+        endpoint.enqueue(fx.main(), tool);
+        let agent_gate =
+            endpoint.enqueue_any_agent_held(MODEL, ModelReply::text("BACKGROUND_RESULT"));
+        let turn_gate =
+            endpoint.enqueue_held(fx.main(), ModelReply::text("never finish foreground"));
+        for _ in 0..5 {
+            endpoint.enqueue(fx.main(), ModelReply::text("received background result"));
+        }
+        let session = fx
+            .create(
+                "background-create",
+                "/sandbox/project",
+                "start background work",
+            )
+            .await;
+        endpoint
+            .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+            .await
+            .unwrap();
+        if kind != "bash" {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !endpoint.requests().iter().any(|r| r.route.agent.is_some()) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        fx.wait(&session, "background running", |s| {
+            has_header(s, |h| h["process"]["drain"]["drain"] == "busy")
+        })
+        .await;
+        fx.command(
+            "background-esc",
+            "session.interrupt",
+            json!({"session":session}),
+        )
+        .await;
+        let stopped = fx
+            .wait(&session, "foreground ended", |s| {
+                has_header(s, |h| h["process"]["turn_running"] == false)
+                    && s.items.iter().any(|i| i.kind == "turn")
+            })
+            .await;
+        assert_eq!(
+            header(&stopped)["process"]["drain"]["drain"],
+            "busy",
+            "{kind}: background was stopped"
+        );
+        drop(turn_gate);
+        if kind == "bash" {
+            fifo.release("BACKGROUND_RESULT").unwrap();
+        }
+        agent_gate.release();
+        fx.wait(&session, "background result delivered", |s| {
+            texts(s).contains(&"received background result".into())
+        })
+        .await;
+        let delivered = endpoint
+            .requests()
+            .iter()
+            .filter(|r| r.route.agent.is_none())
+            .map(|r| request_text(&r.body))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            delivered.contains("task-notification") && delivered.contains("completed"),
+            "{kind}: {delivered}"
+        );
+        if kind != "bash" {
+            assert!(
+                delivered.contains("BACKGROUND_RESULT"),
+                "{kind}: {delivered}"
+            );
+        }
+        fx.wait(&session, "background drained", |s| {
+            has_header(s, |h| h["process"]["drain"]["drain"] == "drained")
+        })
+        .await;
+        fx.close();
+    }
+}
+
+#[tokio::test]
+async fn send_intents_land_at_the_requested_turn_boundary() {
+    for intent in ["fold", "after_turn", "interrupting"] {
+        let fx = Fixture::start(&format!("nd18-{intent}").replace('_', "-"), 3_600_000).await;
+        std::fs::write(
+            fx.scenario.root().join("claude/settings.json"),
+            r#"{"permissions":{"allow":["Bash"]}}"#,
+        )
+        .unwrap();
+        let endpoint = fx.scenario.endpoint();
+        endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+        let session = fx
+            .create("intent-create", "/sandbox/project", "warm up")
+            .await;
+        fx.wait(&session, "created", |s| {
+            has_header(s, |h| h["status"] == "active") && texts(s).contains(&"ready".into())
+        })
+        .await;
+        let mut fifo = fx.scenario.fifo("boundary").unwrap();
+        endpoint.enqueue(fx.main(), ModelReply::tool("toolu_boundary", "Bash", json!({"command":format!("printf started > /sandbox/project/started; head -n 1 {}", fifo.sandbox_path().display()), "description":"turn boundary"})));
+        endpoint.enqueue(fx.main(), ModelReply::text("continuation"));
+        if intent == "after_turn" {
+            endpoint.enqueue(fx.main(), ModelReply::text("later turn"));
+        }
+        fx.send("active", &session, "active turn").await;
+        endpoint
+            .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !fx.scenario.root().join("project/started").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fx.command(
+            "followup",
+            "session.send",
+            json!({"session":session,"text":"FOLLOWUP_MARKER","intent":intent}),
+        )
+        .await;
+        if intent == "interrupting" {
+            // 新输入必须在前台 Bash 仍阻塞时抵达，不等待 FIFO 放行。
+            endpoint
+                .wait_for_requests(&fx.main(), 3, Duration::from_secs(30))
+                .await
+                .unwrap();
+        } else {
+            fx.wait(&session, "written followup", |s| {
+                prompt(s, "FOLLOWUP_MARKER").is_some_and(|p| p.data["state"] == "written")
+            })
+            .await;
+            fifo.release("continue").unwrap();
+        }
+        let expected = if intent == "after_turn" {
+            "later turn"
+        } else {
+            "continuation"
+        };
+        let snapshot = fx
+            .wait(&session, "intended turn completed", |s| {
+                texts(s).contains(&expected.into())
+                    && prompt(s, "FOLLOWUP_MARKER").is_some_and(|p| p.data["state"] == "landed")
+                    && has_header(s, |h| h["process"]["turn_running"] == false)
+            })
+            .await;
+        let requests = endpoint.requests();
+        assert_eq!(requests.len(), if intent == "after_turn" { 4 } else { 3 });
+        assert_eq!(
+            request_text(&requests[2].body).contains("FOLLOWUP_MARKER"),
+            intent != "after_turn"
+        );
+        if intent == "after_turn" {
+            assert!(request_text(&requests[3].body).contains("FOLLOWUP_MARKER"));
+        }
+        let rounds = snapshot
+            .items
+            .iter()
+            .find(|i| i.kind == "lineage")
+            .unwrap()
+            .data["rounds"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            rounds.len(),
+            if intent == "fold" { 2 } else { 3 },
+            "{intent}: {rounds:?}"
+        );
+        fx.close();
+    }
+}
+
+#[tokio::test]
+async fn withdrawn_queued_text_returns_to_a_durable_draft_after_ui_disappears() {
+    let fx = Fixture::start("nd18-withdraw", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("withdraw-create", "/sandbox/project", "warm up")
+        .await;
+    fx.wait(&session, "created", |s| {
+        has_header(s, |h| h["status"] == "active") && texts(s).contains(&"ready".into())
+    })
+    .await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("first done"));
+    fx.send("first", &session, "first prompt").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.command(
+        "queued",
+        "session.send",
+        json!({"session":session,"text":"return this text","intent":"after_turn"}),
+    )
+    .await;
+    fx.wait(&session, "queued input written", |s| {
+        prompt(s, "return this text").is_some_and(|p| p.data["state"] == "written")
+    })
+    .await;
+    let mut ui = fx.ui().await;
+    let command = Command {
+        id: "withdraw".into(),
+        device: "test".into(),
+        name: "session.withdraw".into(),
+        args: json!({"session":session,"message":"queued"}),
+        expect: json!({}),
+    };
+    let receipt = ui.command(&command).await.unwrap();
+    assert!(
+        matches!(
+            receipt,
+            CommandReply::Receipt {
+                receipt: Receipt::Done { .. }
+            }
+        ),
+        "{receipt:?}"
+    );
+    drop(ui); // 界面在撤回结果到达之前消失，冷副本必须恢复同一个持久稿。
+    let snapshot = fx
+        .wait(&session, "withdrawn and restored", |s| {
+            prompt(s, "return this text").is_some_and(|p| p.data["state"] == "withdrawn")
+        })
+        .await;
+    let draft = snapshot.items.iter().find(|i| i.kind == "draft").unwrap();
+    assert_eq!(draft.data["text"], "return this text");
+    assert_eq!(fx.ui().await.command(&command).await.unwrap(), receipt);
+    fx.command("withdraw-again", "session.withdraw", command.args.clone())
+        .await;
+    let again = fx.peek(&session).await;
+    assert_eq!(
+        again.items.iter().find(|i| i.kind == "draft").unwrap().data,
+        draft.data
+    );
+    gate.release();
+    fx.wait(&session, "first turn completes", |s| {
+        texts(s).contains(&"first done".to_string())
+    })
+    .await;
+    assert_eq!(
+        endpoint.count(&fx.main()),
+        2,
+        "withdrawn text must never reach the model"
+    );
+    fx.close();
+}
+
+#[tokio::test]
+async fn escape_ends_the_turn_without_ending_the_backend() {
+    let fx = Fixture::start("nd18-escape", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("must not finish"));
+    let session = fx
+        .create("esc-create", "/sandbox/project", "hold this turn")
+        .await;
+    endpoint
+        .wait_for_requests(&fx.main(), 1, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let before = fx
+        .wait(&session, "running", |s| {
+            has_header(s, |h| h["process"]["turn_running"] == true)
+        })
+        .await;
+    let reply = fx
+        .command("esc", "session.interrupt", json!({"session":session}))
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Done { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    let after = fx
+        .wait(&session, "turn ended", |s| {
+            has_header(s, |h| h["process"]["turn_running"] == false)
+                && s.items.iter().any(|i| i.kind == "turn")
+        })
+        .await;
+    assert_eq!(
+        header(&before)["process"]["run"],
+        header(&after)["process"]["run"]
+    );
+    assert_eq!(header(&after)["process"]["alive"], true);
+    assert!(!texts(&after).iter().any(|s| s == "must not finish"));
+    drop(gate);
+    fx.close();
+}
+
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
@@ -33,6 +1019,10 @@ impl Fixture {
     /// 守护进程配 Claude 后端：钉住的 CLI（看守沙盒里叫 /cli）、仓库里的两个 mod、
     /// 场景自己的 CLAUDE_CONFIG_DIR；后端环境从白名单构造，只有离线端点和假 key。
     async fn start(name: &str, idle_reclaim_ms: u64) -> Self {
+        Self::with_env(name, idle_reclaim_ms, "").await
+    }
+    async fn with_env(name: &str, idle_reclaim_ms: u64, extra_env: &str) -> Self {
+        let auto_title = name.starts_with("nd21-title-ai");
         let poll_timeout_ms = if name == "nd20-thousand" { 20 } else { 5000 };
         let config = format!(
             r#"
@@ -62,8 +1052,10 @@ ANTHROPIC_BASE_URL = "http://127.0.0.1:8765"
 ANTHROPIC_API_KEY = "offline-fixture"
 DISABLE_TELEMETRY = "1"
 DISABLE_ERROR_REPORTING = "1"
+{extra_env}
 
 [sessions]
+auto_title = {auto_title}
 idle_reclaim_ms = {idle_reclaim_ms}
 tick_ms = 50
 "#
@@ -110,8 +1102,14 @@ tick_ms = 50
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}: {:#?}",
-                snapshot.items
+                "timed out waiting for {what}: {:#?}; requests={:?}",
+                snapshot.items,
+                self.scenario
+                    .endpoint()
+                    .requests()
+                    .iter()
+                    .map(|r| (&r.route, &r.body["max_tokens"]))
+                    .collect::<Vec<_>>()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -682,16 +1680,57 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
 
 #[tokio::test]
 async fn native_chat_window_creates_and_recovers_during_streaming_markdown() {
-    let fx = Fixture::start("nd14-window", 3_600_000).await;
+    native_chat(false).await;
+}
+
+#[tokio::test]
+async fn native_theme_change_preserves_streaming_chat_and_draft() {
+    native_chat(true).await;
+}
+
+#[tokio::test]
+async fn native_theme_files_selection_and_system_appearance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = std::env::var_os("ND_NATIVE_THEME_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary.path().join("themes"));
+    let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_themes.py"))
+        .arg("--bin-dir")
+        .arg(Path::new(&desktop).parent().unwrap())
+        .arg("--output")
+        .arg(output)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+async fn native_chat(themes: bool) {
+    let fx = Fixture::start(
+        if themes { "nd23-window" } else { "nd14-window" },
+        3_600_000,
+    )
+    .await;
     let answer = "# 中文回答\n\n一段 **Markdown**。\n\n```rust\nfn main() { println!(\"你好\"); }\n```\n\n结束。";
     fx.scenario.endpoint().enqueue(
         Route::new(None, "claude-haiku-4-5-20251001"),
         ModelReply::streaming_text(answer, 1, 100),
     );
     let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
-    let output = std::env::var_os("ND_NATIVE_OUTPUT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| fx.scenario.root().join("native-chat"));
+    let output = std::env::var_os(if themes {
+        "ND_NATIVE_THEME_CHAT_OUTPUT"
+    } else {
+        "ND_NATIVE_OUTPUT"
+    })
+    .map(std::path::PathBuf::from)
+    .unwrap_or_else(|| fx.scenario.root().join("native-chat"));
     let result = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
         .arg("--desktop")
@@ -700,6 +1739,7 @@ async fn native_chat_window_creates_and_recovers_during_streaming_markdown() {
         .arg(fx.socket())
         .arg("--output")
         .arg(&output)
+        .args(if themes { vec!["--themes"] } else { vec![] })
         .output()
         .await
         .unwrap();
@@ -1768,14 +2808,29 @@ async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_inp
             ));
             fx.scenario.restart_daemon().unwrap();
         }
-        let mut ui = fx.ui().await;
+        // 写出后的故障可晚于 command 收据；一次性 peek 会撞上旧连接关闭。
+        // 和产品界面共用重连副本，必须等到新纪元里的真实投递确认。
+        let mut feed =
+            nd_ui_core::ReplicaFeed::start(fx.socket(), format!("session/{session}")).unwrap();
         signal(pid, rustix::process::Signal::CONT);
-        let done = fx
-            .wait(&session, "original delivery clarified", |s| {
-                texts(s) == ["第一轮", "已收到"]
-                    && prompt(s, "写后窗口").is_some_and(|i| i.data["state"] == "landed")
-            })
-            .await;
+        let done = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let update = feed
+                    .recv()
+                    .await
+                    .expect("replica feed closed before recovery");
+                if let nd_ui_core::FeedUpdate::Snapshot(snapshot) = update
+                    && snapshot.epoch != first.epoch
+                    && texts(&snapshot) == ["第一轮", "已收到"]
+                    && prompt(&snapshot, "写后窗口").is_some_and(|i| i.data["state"] == "landed")
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("new daemon epoch must clarify original delivery");
+        let mut ui = fx.ui().await;
         assert_eq!(cli_pid(&fx, &done).await, pid);
         assert_eq!(fx.scenario.endpoint().requests().len(), 2);
         assert!(matches!(
@@ -1789,6 +2844,7 @@ async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_inp
                 .exists(),
             "fault really fired"
         );
+        feed.close().await;
         fx.close();
     }
 }
@@ -2516,6 +3572,351 @@ async fn draft_attachments_survive_conflicts_restart_and_transfer_to_the_sent_me
 }
 
 #[tokio::test]
+async fn settings_model_changes_the_next_turn_and_survives_restart() {
+    let fx = Fixture::start("nd21-model", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| {
+        header(s)["status"] == "active" && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("first"));
+    fx.send("busy", &session, "more").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.wait(&session, "running", |s| {
+        header(s)["process"]["turn_running"] == true
+    })
+    .await;
+    let reply = fx
+        .command(
+            "model",
+            "session.configure",
+            json!({"session":session,"setting":{"model":"claude-sonnet-4-6"}}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Accepted { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    let next = Route::new(None, "claude-sonnet-4-6");
+    endpoint.enqueue(next.clone(), ModelReply::text("valid")); // CLI validates a custom model with max_tokens=1.
+    endpoint.enqueue(next.clone(), ModelReply::text("second"));
+    fx.send("next", &session, "continue").await;
+    assert_eq!(endpoint.requests().len(), 2);
+    gate.release();
+    endpoint
+        .wait_for_requests(&next, 2, Duration::from_secs(30))
+        .await
+        .unwrap_or_else(|e| panic!("{e}: requests={:?}", endpoint.requests()));
+    assert_eq!(endpoint.requests()[2].body["max_tokens"], 1);
+    assert!(request_text(&endpoint.requests()[3].body).contains("continue"));
+    let snapshot = fx
+        .wait(&session, "second turn", |s| {
+            texts(s).iter().any(|t| t == "second")
+        })
+        .await;
+    assert_eq!(header(&snapshot)["model"], "claude-sonnet-4-6");
+    fx.scenario.kill_daemon().unwrap();
+    let after = fx
+        .wait(&session, "reopened", |s| {
+            header(s)["model"] == "claude-sonnet-4-6"
+        })
+        .await;
+    assert_eq!(
+        header(&after)["settings"]["applied"]["model"],
+        "claude-sonnet-4-6"
+    );
+}
+
+#[tokio::test]
+async fn settings_effort_and_ultracode_follow_cli_availability_and_preserve_effort() {
+    let fx = Fixture::start("nd21-flags", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| {
+        header(s)["status"] == "active" && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    for (id, setting, key, expected) in [
+        (
+            "opus",
+            json!({"model":"opus"}),
+            "model",
+            json!("claude-opus-5-5"),
+        ),
+        ("effort", json!({"effort":"high"}), "effort", json!("high")),
+        ("on", json!({"ultracode":true}), "ultracode", json!(true)),
+        ("off", json!({"ultracode":false}), "ultracode", json!(false)),
+    ] {
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":setting}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{id}: {reply:?}"
+        );
+        let s = fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+        assert_eq!(
+            header(&s)["settings"]["applied"][key],
+            expected,
+            "{id}: {}",
+            header(&s)
+        );
+        if id == "on" || id == "off" {
+            assert_eq!(header(&s)["settings"]["applied"]["effort"], "high");
+            assert_eq!(header(&s)["caps"]["ultracode"], true);
+            assert_eq!(
+                header(&s)["settings"]["applied"]["ultracodeRequested"],
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn settings_are_read_on_open_and_permissions_and_effort_survive_reclaim() {
+    let fx = Fixture::start("nd21-resume-settings", 900).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    let first = fx
+        .wait(&session, "active", |s| {
+            header(s)["status"] == "active" && header(s)["op"].is_null()
+        })
+        .await;
+    assert_eq!(header(&first)["caps"]["model"], true);
+    assert_eq!(header(&first)["caps"]["ultracode"], false);
+    let denied = fx
+        .command(
+            "ultra-denied",
+            "session.configure",
+            json!({"session":session,"setting":{"ultracode":true}}),
+        )
+        .await;
+    assert!(matches!(
+        denied,
+        CommandReply::Receipt {
+            receipt: Receipt::Rejected { .. }
+        }
+    ));
+    // Keep a watcher while editing; reclaim only after the watcher closes.
+    let mut watcher = fx.ui().await;
+    watcher
+        .subscribe(&format!("session/{session}"))
+        .await
+        .unwrap();
+    for (id, setting) in [
+        ("mode", json!({"permission_mode":"acceptEdits"})),
+        ("opus", json!({"model":"opus"})),
+        ("effort", json!({"effort":"high"})),
+    ] {
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":setting}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+    }
+    watcher.close().await.unwrap();
+    fx.wait(&session, "reclaimed", |s| {
+        header(s)["process"]["alive"] == false && header(s)["op"].is_null()
+    })
+    .await;
+    let opus = Route::new(None, "claude-opus-5-5");
+    fx.scenario
+        .endpoint()
+        .enqueue(opus.clone(), ModelReply::text("resumed"));
+    fx.send("resume", &session, "continue").await;
+    fx.scenario
+        .endpoint()
+        .wait_for_requests(&opus, 1, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let snapshot = fx
+        .wait(&session, "resumed", |s| {
+            texts(s).iter().any(|s| s == "resumed")
+        })
+        .await;
+    assert_eq!(header(&snapshot)["permission_mode"], "acceptEdits");
+    assert_eq!(header(&snapshot)["settings"]["applied"]["effort"], "high");
+    assert_eq!(
+        fx.scenario.endpoint().requests().last().unwrap().body["output_config"]["effort"],
+        "high"
+    );
+}
+
+#[tokio::test]
+async fn settings_manual_title_updates_sidebar_and_survives_resume() {
+    let fx = Fixture::start("nd21-rename", 900).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| {
+        header(s)["status"] == "active" && header(s)["op"].is_null()
+    })
+    .await;
+    let reply = fx
+        .command(
+            "rename",
+            "session.rename",
+            json!({"session":session,"title":"新的中文标题 🦀"}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Accepted { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    fx.wait(&session, "renamed", |s| {
+        header(s)["title"] == "新的中文标题 🦀" && header(s)["op"].is_null()
+    })
+    .await;
+    let global = fx.ui().await.subscribe("global").await.unwrap();
+    assert!(
+        global
+            .items
+            .iter()
+            .any(|i| i.data["title"] == "新的中文标题 🦀")
+    );
+    fx.scenario.kill_daemon().unwrap();
+    fx.wait(&session, "reclaimed", |s| {
+        header(s)["process"]["alive"] == false && header(s)["op"].is_null()
+    })
+    .await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("resumed"));
+    fx.send("resume", &session, "continue").await;
+    let after = fx
+        .wait(&session, "resumed", |s| {
+            texts(s).iter().any(|s| s == "resumed")
+        })
+        .await;
+    assert_eq!(header(&after)["title"], "新的中文标题 🦀");
+    assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+    let native = fx.transcript(
+        header(&after)["process"]["backend_session"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(
+        native
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|row| row["type"] == "custom-title" && row["customTitle"] == "新的中文标题 🦀")
+    );
+}
+
+#[tokio::test]
+async fn settings_ai_title_is_generated_once_and_return_value_updates_the_sidebar() {
+    let fx = Fixture::start("nd21-title-ai", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text(r#"{"title":"会话设置实现"}"#));
+    let session = fx
+        .create("create", "/sandbox/project", "请实现会话设置与标题管理功能")
+        .await;
+    let s = fx
+        .wait(&session, "AI title", |s| header(s)["title_source"] == "ai")
+        .await;
+    assert_eq!(header(&s)["title"], "会话设置实现");
+    fx.scenario.kill_daemon().unwrap();
+    assert_eq!(header(&fx.peek(&session).await)["title"], "会话设置实现");
+    assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+    let text = fx.transcript(header(&s)["process"]["backend_session"].as_str().unwrap());
+    assert!(text.contains("ai-title") && text.contains("会话设置实现"));
+}
+
+#[tokio::test]
+async fn settings_inflight_ai_title_survives_restart_and_never_overwrites_manual_title() {
+    let fx = Fixture::start("nd21-title-ai-restart", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text(r#"{"title":"晚到的自动标题"}"#));
+    let session = fx
+        .create("create", "/sandbox/project", "为会话设置增加持久化和标题")
+        .await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.scenario.kill_daemon().unwrap();
+    fx.peek(&session).await;
+    let reply = fx
+        .command(
+            "rename",
+            "session.rename",
+            json!({"session":session,"title":"我的标题"}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Accepted { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    fx.wait(&session, "manual title", |s| {
+        header(s)["title"] == "我的标题"
+    })
+    .await;
+    gate.release();
+    let after = fx
+        .wait(&session, "all title operations complete", |s| {
+            header(s)["op"].is_null()
+        })
+        .await;
+    assert_eq!(header(&after)["title"], "我的标题");
+    assert_eq!(
+        endpoint.requests().len(),
+        2,
+        "recovery must not repeat AI generation"
+    );
+}
+
+#[tokio::test]
 async fn history_pages_are_read_only_ordered_and_resume_after_restart() {
     let fx = Fixture::start("nd20-history", 3_600_000).await;
     fx.scenario
@@ -2727,6 +4128,7 @@ async fn native_history(fx: &Fixture, session: &str, round: &str, text: &str, ro
         .arg("--session")
         .arg(session)
         .arg("--history")
+        .arg("--themes")
         .arg("--round")
         .arg(round)
         .arg("--text")
@@ -2742,4 +4144,290 @@ async fn native_history(fx: &Fixture, session: &str, round: &str, text: &str, ro
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+#[tokio::test]
+async fn settings_native_window_changes_model_effort_and_title_through_nd_wire() {
+    let fx = Fixture::start("nd21-native", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    let output = std::env::var("ND_NATIVE_SETTINGS_OUTPUT")
+        .unwrap_or_else(|_| "/mnt/wd_external/nd-build/tmp/ticket-21-native".into());
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
+        .args([
+            "--desktop",
+            &std::env::var("ND_TEST_DESKTOP").unwrap(),
+            "--socket",
+            fx.socket().to_str().unwrap(),
+            "--output",
+            &output,
+            "--session",
+            &session,
+            "--settings",
+            "--themes",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+}
+
+#[tokio::test]
+async fn settings_stale_clients_conflict_and_cli_rejection_preserves_applied_values() {
+    let fx = Fixture::start("nd21-setting-conflict", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    let make = |id: &str, revision: u64, setting: Value| Command {
+        id: id.into(),
+        device: "settings-ui".into(),
+        name: "session.configure".into(),
+        args: json!({"session":session,"setting":setting}),
+        expect: json!({"settings_revision":revision}),
+    };
+    let mut ui = fx.ui().await;
+    let first = make("mode", 0, json!({"permission_mode":"acceptEdits"}));
+    let receipt = ui.command(&first).await.unwrap();
+    fx.wait(&session, "mode", |s| header(s)["op"].is_null())
+        .await;
+    let stale = ui
+        .command(&make("stale", 0, json!({"permission_mode":"plan"})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(stale,CommandReply::Receipt {receipt:Receipt::Rejected {ref code,..}} if code == "conflict"),
+        "{stale:?}"
+    );
+    assert_eq!(ui.command(&first).await.unwrap(), receipt);
+    let invalid = make("invalid-mode", 1, json!({"permission_mode":"not-a-mode"}));
+    assert!(matches!(
+        ui.command(&invalid).await.unwrap(),
+        CommandReply::Receipt {
+            receipt: Receipt::Accepted { .. }
+        }
+    ));
+    let after = fx
+        .wait(&session, "rejected", |s| header(s)["op"].is_null())
+        .await;
+    assert_eq!(header(&after)["permission_mode"], "acceptEdits");
+    assert!(
+        after
+            .items
+            .iter()
+            .any(|i| i.kind == "op" && i.data["phase"] == "compensated")
+    );
+}
+
+#[tokio::test]
+async fn settings_lost_title_process_settles_without_blocking_the_session() {
+    let fx = Fixture::start("nd21-title-ai-exit", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let _gate = endpoint.enqueue_held(fx.main(), ModelReply::text(r#"{"title":"不会返回"}"#));
+    let session = fx
+        .create("create", "/sandbox/project", "后端退出时保留可用的首条摘要")
+        .await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let s = fx.peek(&session).await;
+    signal(cli_pid(&fx, &s).await, rustix::process::Signal::KILL);
+    let after = fx
+        .wait(&session, "title settled after exit", |s| {
+            header(s)["process"]["alive"] == false && header(s)["op"].is_null()
+        })
+        .await;
+    assert_eq!(header(&after)["title_source"], "summary");
+    assert!(
+        after
+            .items
+            .iter()
+            .any(|i| i.kind == "op" && i.data["phase"] == "partial")
+    );
+}
+
+#[tokio::test]
+async fn settings_effort_changes_clear_ultracode_and_support_max() {
+    let fx = Fixture::start("nd21-effort-rules", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    for (id, setting) in [
+        ("opus", json!({"model":"opus"})),
+        ("high", json!({"effort":"high"})),
+        ("ultra", json!({"ultracode":true})),
+        ("medium", json!({"effort":"medium"})),
+        ("max", json!({"effort":"max"})),
+    ] {
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":setting}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        let after = fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+        eprintln!(
+            "effort-rules {id}: {}",
+            header(&after)["settings"]["applied"]
+        );
+        if id == "medium" {
+            assert_eq!(header(&after)["settings"]["applied"]["effort"], "medium");
+            assert_eq!(header(&after)["settings"]["applied"]["ultracode"], false);
+        }
+        if id == "max" {
+            assert_eq!(header(&after)["settings"]["applied"]["effort"], "max");
+        }
+    }
+    let opus = Route::new(None, "claude-opus-5-5");
+    fx.scenario
+        .endpoint()
+        .enqueue(opus.clone(), ModelReply::text("maximum"));
+    fx.send("max-turn", &session, "continue").await;
+    fx.wait(&session, "max turn", |s| {
+        texts(s).iter().any(|s| s == "maximum") && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    assert_eq!(
+        fx.scenario.endpoint().requests().last().unwrap().body["output_config"]["effort"],
+        "max"
+    );
+    for (id, setting) in [
+        ("on-again", json!({"ultracode":true})),
+        ("haiku", json!({"model":"haiku"})),
+    ] {
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":setting}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+    }
+    let after = fx.peek(&session).await;
+    assert_eq!(header(&after)["caps"]["ultracode"], false);
+    assert_eq!(header(&after)["settings"]["applied"]["ultracode"], false);
+    if let Ok(path) = std::env::var("ND_RECORD_SETTINGS") {
+        let run = header(&after)["process"]["run"].as_str().unwrap();
+        let text = std::fs::read_to_string(
+            fx.scenario
+                .root()
+                .join("recordings")
+                .join(format!("{run}.jsonl")),
+        )
+        .unwrap();
+        let records: Vec<&str> = text
+            .lines()
+            .filter(|line| {
+                let r: Value = serde_json::from_str(line).unwrap();
+                let f: Value = serde_json::from_str(r["event"]["line"].as_str().unwrap_or("{}"))
+                    .unwrap_or_default();
+                matches!(
+                    f["type"].as_str(),
+                    Some("control_request" | "control_response")
+                )
+            })
+            .collect();
+        std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{}\n", records.join("\n"))).unwrap();
+    }
+    signal(cli_pid(&fx, &after).await, rustix::process::Signal::KILL);
+    fx.wait(&session, "haiku process gone", |s| {
+        header(s)["process"]["alive"] == false
+    })
+    .await;
+    let haiku = Route::new(None, "claude-haiku-4-5-20251001");
+    fx.scenario
+        .endpoint()
+        .enqueue(haiku, ModelReply::text("restored"));
+    fx.send("restore-effort", &session, "continue").await;
+    fx.wait(&session, "restored", |s| {
+        texts(s).iter().any(|s| s == "restored") && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let reply = fx
+        .command(
+            "opus-restored",
+            "session.configure",
+            json!({"session":session,"setting":{"model":"opus"}}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Accepted { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    let restored = fx
+        .wait(&session, "effort restored", |s| header(s)["op"].is_null())
+        .await;
+    assert_eq!(header(&restored)["settings"]["applied"]["effort"], "max");
+}
+
+#[tokio::test]
+async fn settings_title_waits_for_eligible_prompt_and_keeps_summary_on_empty_generation() {
+    let fx = Fixture::start("nd21-title-ai-fallback", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| {
+        header(s)["status"] == "active" && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    assert_eq!(endpoint.requests().len(), 1);
+    endpoint.enqueue(fx.main(), ModelReply::text("second"));
+    endpoint.enqueue(fx.main(), ModelReply::text("{}"));
+    fx.send("eligible", &session, "这是第一条足够长的正常人类提示")
+        .await;
+    let after = fx
+        .wait(&session, "title fallback", |s| {
+            header(s)["op"].is_null()
+                && s.items
+                    .iter()
+                    .any(|i| i.kind == "op" && i.data["kind"] == "title")
+        })
+        .await;
+    assert_eq!(header(&after)["title"], "hello");
+    assert_eq!(header(&after)["title_source"], "summary");
+    assert_eq!(endpoint.requests().len(), 3);
 }

@@ -4277,6 +4277,7 @@ dependencies = [
  "nd-ui-core",
  "nd-view-model",
  "nd-wire",
+ "notify",
  "serde_json",
  "tokio",
  "url",

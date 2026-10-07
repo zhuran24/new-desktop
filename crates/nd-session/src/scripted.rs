@@ -18,6 +18,7 @@ use std::{
 /// 一张票的脚本：成功、明确失败、交付不明，或扣住等测试放行。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
+    Busy,
     Ok,
     Fail(String),
     Unknown(String),
@@ -30,6 +31,11 @@ pub enum ActKind {
     Open,
     End,
     Send,
+    Interrupt,
+    Withdraw,
+    Configure,
+    Title,
+    /// 总结、`!`、派 fork 型子代理。
     Invoke,
 }
 fn kind_of(act: &Act) -> ActKind {
@@ -37,6 +43,14 @@ fn kind_of(act: &Act) -> ActKind {
         Act::Open { .. } => ActKind::Open,
         Act::End { .. } => ActKind::End,
         Act::Send { .. } => ActKind::Send,
+        Act::Interrupt { .. } => ActKind::Interrupt,
+        Act::Withdraw { .. } => ActKind::Withdraw,
+        Act::Configure { .. } => ActKind::Configure,
+        Act::Invoke {
+            invocation:
+                nd_backend::Invocation::Title { .. } | nd_backend::Invocation::GenerateTitle { .. },
+            ..
+        } => ActKind::Title,
         Act::Invoke { .. } => ActKind::Invoke,
     }
 }
@@ -49,6 +63,8 @@ fn invoke_step(what: &nd_backend::Invocation) -> String {
         }
         nd_backend::Invocation::Shell { command } => format!("invoke:shell:{command}"),
         nd_backend::Invocation::ForkAgent { prompt } => format!("invoke:fork:{prompt}"),
+        nd_backend::Invocation::Title { title } => format!("title:{title}"),
+        nd_backend::Invocation::GenerateTitle { .. } => "generate-title".into(),
     }
 }
 
@@ -249,6 +265,7 @@ impl ScriptedAdapter {
             )
         };
         let facts = match (&act, reply) {
+            (_, Reply::Busy) => unreachable!("Busy is an admission, never a terminal result"),
             (_, Reply::Hold) => {
                 self.inner.lock().unwrap().held.push((issued, act));
                 return;
@@ -271,6 +288,19 @@ impl ScriptedAdapter {
                             bs: spec.origin.backend_session().clone(),
                             run: run.clone(),
                             readiness: Readiness::Full,
+                            interaction: nd_backend::InteractionCaps {
+                                send_intents: vec![
+                                    nd_backend::Intent::Fold,
+                                    nd_backend::Intent::AfterTurn,
+                                    nd_backend::Intent::Interrupting,
+                                ],
+                                withdraw: true,
+                                interrupt: true,
+                                cancel_queued: true,
+                                interrupt_spares_background: true,
+                                immediate_preserves_mcp: false,
+                                rewind_menu: true,
+                            },
                             adopt: json!({"scripted": true}),
                             features: vec![],
                         },
@@ -327,9 +357,99 @@ impl ScriptedAdapter {
                     .push(format!("send?:{}", msg.text));
                 vec![done(Outcome::Unknown { evidence: why })]
             }
-            (Act::Invoke { what, .. }, Reply::Ok) => {
-                self.inner.lock().unwrap().applied.push(invoke_step(what));
-                let result = match what {
+            (Act::Withdraw { send, .. }, Reply::Ok) => {
+                let mut inner = self.inner.lock().unwrap();
+                let before = inner.held.len();
+                inner.held.retain(|(issued, _)| &issued.ticket != send);
+                let ok = before != inner.held.len();
+                inner.applied.push(format!("withdraw:{ticket}"));
+                vec![done(Outcome::Ok {
+                    done: Done::Withdrawn { ok },
+                })]
+            }
+            (Act::Interrupt { queued, .. }, Reply::Ok) => {
+                let mut inner = self.inner.lock().unwrap();
+                inner.applied.push(format!("interrupt:{ticket}"));
+                let cancelled = if *queued == nd_backend::QueuedPolicy::Cancel {
+                    let ids = inner
+                        .held
+                        .iter()
+                        .filter(|(_, a)| matches!(a,Act::Send { to,.. } if to == &carrier))
+                        .map(|(i, _)| i.ticket.clone())
+                        .collect::<Vec<_>>();
+                    inner.held.retain(|(i, _)| !ids.contains(&i.ticket));
+                    ids
+                } else {
+                    vec![]
+                };
+                vec![done(Outcome::Ok {
+                    done: Done::Interrupted { cancelled },
+                })]
+            }
+            (Act::Configure { setting, .. }, Reply::Ok) => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push(format!("configure:{setting:?}"));
+                let applied = serde_json::to_value(setting).unwrap();
+                vec![done(Outcome::Ok {
+                    done: Done::Configured {
+                        settings: json!({"applied":applied}),
+                    },
+                })]
+            }
+            (
+                Act::Invoke {
+                    invocation: nd_backend::Invocation::Title { title },
+                    ..
+                },
+                Reply::Ok,
+            ) => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push(format!("title:{title}"));
+                vec![
+                    fact(
+                        &format!("title:{ticket}"),
+                        FactBody::TitleChanged {
+                            title: title.clone(),
+                        },
+                    ),
+                    done(Outcome::Ok {
+                        done: Done::Titled {
+                            title: Some(title.clone()),
+                        },
+                    }),
+                ]
+            }
+            (
+                Act::Invoke {
+                    invocation: nd_backend::Invocation::GenerateTitle { .. },
+                    ..
+                },
+                Reply::Ok,
+            ) => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push("generate-title".into());
+                vec![done(Outcome::Ok {
+                    done: Done::Titled {
+                        title: Some("生成的标题".into()),
+                    },
+                })]
+            }
+            (Act::Invoke { invocation, .. }, Reply::Ok) => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push(invoke_step(invocation));
+                let result = match invocation {
                     nd_backend::Invocation::Compact { .. } => nd_backend::Invoked::Compacted,
                     nd_backend::Invocation::Shell { command } => nd_backend::Invoked::Shell {
                         exit: Some(0),
@@ -340,6 +460,10 @@ impl ScriptedAdapter {
                     nd_backend::Invocation::ForkAgent { .. } => nd_backend::Invoked::Forked {
                         agent: format!("agent-{}", nd_backend::native_uuid(&ticket)),
                     },
+                    nd_backend::Invocation::Title { .. }
+                    | nd_backend::Invocation::GenerateTitle { .. } => {
+                        unreachable!("标题动作在前面的分支")
+                    }
                 };
                 vec![
                     fact(
@@ -354,13 +478,19 @@ impl ScriptedAdapter {
                     }),
                 ]
             }
-            (Act::Invoke { what, .. }, Reply::Unknown(why)) => {
+            (Act::Invoke { invocation, .. }, Reply::Unknown(why))
+                if !matches!(
+                    invocation,
+                    nd_backend::Invocation::Title { .. }
+                        | nd_backend::Invocation::GenerateTitle { .. }
+                ) =>
+            {
                 // 交给了后端、结论丢了：可能已生效。
                 self.inner
                     .lock()
                     .unwrap()
                     .applied
-                    .push(format!("{}?", invoke_step(what)));
+                    .push(format!("{}?", invoke_step(invocation)));
                 vec![done(Outcome::Unknown { evidence: why })]
             }
             (Act::End { .. }, Reply::Ok) => {
@@ -488,12 +618,18 @@ impl BackendAdapter for ScriptedAdapter {
                     may_be_unknown: true,
                 };
             }
-            inner.received.push((issued.ticket.clone(), act.clone()));
-            inner
+            let reply = inner
                 .script
                 .get_mut(&kind_of(&act))
                 .and_then(VecDeque::pop_front)
-                .unwrap_or(Reply::Ok)
+                .unwrap_or(Reply::Ok);
+            if reply == Reply::Busy {
+                return Admit::Rejected {
+                    reject: nd_backend::Reject::Busy,
+                };
+            }
+            inner.received.push((issued.ticket.clone(), act.clone()));
+            reply
         };
         self.perform(issued, act, reply);
         Admit::Accepted {

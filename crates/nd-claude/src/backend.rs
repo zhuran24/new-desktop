@@ -24,8 +24,11 @@ use nd_watchdog_proto::{Event, Finish};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -50,38 +53,68 @@ impl Default for ClaudeBackendConfig {
     }
 }
 
+struct NormalPermit(Arc<AtomicUsize>);
+impl Drop for NormalPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 enum Cmd {
     Send {
         ticket: Ticket,
         msg: Msg,
+        _permit: NormalPermit,
     },
     End {
         ticket: Ticket,
         how: EndHow,
     },
+    Control {
+        ticket: Ticket,
+        act: Act,
+    },
+    Ack(u64),
+    Title {
+        ticket: Ticket,
+        invocation: nd_backend::Invocation,
+        write: bool,
+    },
+    Configure {
+        ticket: Ticket,
+        setting: nd_wire::LiveSetting,
+    },
+    /// 总结、`!`、派 fork 型子代理：经动作 mod 做（改标题、生成标题走 `Title`）。
     Invoke {
         ticket: Ticket,
-        what: Invocation,
+        invocation: Invocation,
     },
     /// 动作 mod 对一条 Invoke 的结论（或查不到）。
     Concluded {
         op_id: String,
         result: Option<CommandResult>,
     },
-    Ack(u64),
 }
 
 /// 交给动作 mod、还没有结论的一件事。随检查点保存，守护进程重启后按操作 id 查。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingInvoke {
     ticket: Ticket,
-    what: Invocation,
+    invocation: Invocation,
     /// `!` 命令还没用掉的自动批准（命令原文）；批准过一次就清掉。
     approval: Option<String>,
 }
 
 /// 等动作 mod 结论的上限：Bash 最长 10 分钟，压缩要等会话空闲。
 const INVOKE_WAIT: Duration = Duration::from_secs(3600);
+
+/// 改标题、生成标题走控制请求（`Cmd::Title`）；其余 Invoke 经动作 mod。
+fn titles(invocation: &Invocation) -> bool {
+    matches!(
+        invocation,
+        Invocation::Title { .. } | Invocation::GenerateTitle { .. }
+    )
+}
 
 fn features(caps: &Caps) -> Vec<nd_backend::Feature> {
     caps.table()
@@ -177,6 +210,7 @@ async fn recheck(channel: ModChannel, run: String, op_id: String, me: mpsc::Unbo
 struct Slot {
     session: SessionId,
     tx: mpsc::UnboundedSender<Cmd>,
+    normal_queued: Arc<AtomicUsize>,
 }
 
 struct Inner {
@@ -379,7 +413,9 @@ impl Inner {
                     through = record.end_seq;
                     if let Event::In { line, in_seq } = record.event
                         && let Ok(frame) = serde_json::from_str::<Value>(&line)
-                        && let Some(uuid) = frame["uuid"].as_str()
+                        && let Some(uuid) = frame["uuid"]
+                            .as_str()
+                            .or_else(|| frame["request_id"].as_str())
                         && wanted.contains(uuid)
                     {
                         found.insert(uuid.to_owned(), in_seq);
@@ -400,6 +436,7 @@ impl Inner {
             Slot {
                 session: session.clone(),
                 tx,
+                normal_queued: Arc::new(AtomicUsize::new(0)),
             },
         );
         rx
@@ -415,13 +452,13 @@ impl Inner {
     ) {
         let rx = self.reserve(&session, &carrier);
         self.spawn_actor(
+            HashMap::new(),
             session,
             carrier,
             run,
             convo,
             pending,
             HashMap::new(),
-            Default::default(),
             None,
             rx,
         );
@@ -430,13 +467,43 @@ impl Inner {
     #[allow(clippy::too_many_arguments)]
     fn spawn_actor(
         self: &Arc<Self>,
+        settings_controls: HashMap<String, Ticket>,
         session: SessionId,
         carrier: CarrierId,
         run: ClaudeRun,
         convo: Conversation,
         pending: HashMap<String, Ticket>,
         writes: HashMap<String, u64>,
-        invokes: std::collections::BTreeMap<String, PendingInvoke>,
+        recover_through: Option<u64>,
+        rx: mpsc::UnboundedReceiver<Cmd>,
+    ) {
+        self.spawn_actor_with_controls(
+            HashMap::new(),
+            settings_controls,
+            BTreeMap::new(),
+            session,
+            carrier,
+            run,
+            convo,
+            pending,
+            writes,
+            recover_through,
+            rx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_actor_with_controls(
+        self: &Arc<Self>,
+        controls: HashMap<String, (Ticket, Act)>,
+        settings_controls: HashMap<String, Ticket>,
+        invokes: BTreeMap<String, PendingInvoke>,
+        session: SessionId,
+        carrier: CarrierId,
+        run: ClaudeRun,
+        convo: Conversation,
+        pending: HashMap<String, Ticket>,
+        writes: HashMap<String, u64>,
         recover_through: Option<u64>,
         rx: mpsc::UnboundedReceiver<Cmd>,
     ) {
@@ -456,10 +523,13 @@ impl Inner {
             run,
             convo,
             pending,
+            controls,
+            queued: VecDeque::new(),
             writes,
+            ending: None,
+            settings_controls,
             invokes,
             me,
-            ending: None,
             recover_through,
             rx,
         };
@@ -483,7 +553,34 @@ impl Inner {
             permission_mode: spec.profile.permission_mode.clone(),
         };
         match self.claude.open(&run.0, open, InitOptions::default()).await {
-            Ok(claude_run) => {
+            Ok(mut claude_run) => {
+                let mut restore = Vec::new();
+                if let Some(effort) = spec.profile.effort {
+                    restore.push(nd_wire::LiveSetting::Effort(effort));
+                }
+                restore.extend(spec.live_settings);
+                for setting in restore {
+                    if let Err(error) =
+                        initial_control(&mut claude_run, setting_request(&setting)).await
+                    {
+                        self.settle_gone(&run, true).await;
+                        self.deliver_facts(
+                            &issued.session,
+                            &carrier,
+                            vec![done(&issued.ticket, Outcome::failed(error))],
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                let mut settings =
+                    initial_control(&mut claude_run, json!({"subtype":"get_settings"}))
+                        .await
+                        .map(settings_with_caps)
+                        .unwrap_or_else(|why| json!({"caps":{},"error":why}));
+                settings["models"] = claude_run.ready().initialize["models"].clone();
+                settings["permission_mode"] =
+                    claude_run.ready().initialize["current_permission_mode"].clone();
                 let ready = claude_run.ready().clone();
                 self.observe(Observed::Up {
                     run: run.0.clone(),
@@ -494,9 +591,12 @@ impl Inner {
                 .await;
                 // 自己的进程写进 CLI 注册表的那一条按身份认作自有，不当外部写入者。
                 self.refresh().await;
-                let readiness = readiness_of(&ready.caps);
-                let table = features(&ready.caps);
-                let adopt = serde_json::to_value(&ready.caps).unwrap_or(Value::Null);
+                let readiness = match &ready.caps.readiness {
+                    ClaudeReadiness::Full => Readiness::Full,
+                    ClaudeReadiness::ChatOnly { why } => Readiness::ChatOnly { why: why.clone() },
+                };
+                let mut adopt = serde_json::to_value(&ready.caps).unwrap_or(Value::Null);
+                adopt["settings"] = settings;
                 self.start_actor(
                     issued.session.clone(),
                     carrier.clone(),
@@ -516,8 +616,39 @@ impl Inner {
                                     bs,
                                     run: run.clone(),
                                     readiness,
+                                    interaction: nd_backend::InteractionCaps {
+                                        send_intents: vec![
+                                            Intent::Fold,
+                                            Intent::AfterTurn,
+                                            Intent::Interrupting,
+                                        ],
+                                        withdraw: true,
+                                        interrupt: true,
+                                        cancel_queued: false,
+                                        interrupt_spares_background: ready
+                                            .caps
+                                            .interrupt_spares_background,
+                                        immediate_preserves_mcp: ![
+                                            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+                                            "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND",
+                                        ]
+                                        .iter()
+                                        .any(|k| {
+                                            self.claude
+                                                .config()
+                                                .env
+                                                .get(*k)
+                                                .is_some_and(|v| matches!(v.as_str(), "1" | "true"))
+                                        }) && self
+                                            .claude
+                                            .config()
+                                            .env
+                                            .get("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS")
+                                            .is_none_or(|v| v != "0"),
+                                        rewind_menu: true,
+                                    },
                                     adopt,
-                                    features: table,
+                                    features: features(&ready.caps),
                                 },
                             },
                         ),
@@ -588,7 +719,10 @@ impl Inner {
                 Act::End { .. } => Outcome::Ok {
                     done: Done::Ended { code: None },
                 },
-                Act::Send { .. } | Act::Invoke { .. } => Outcome::Refused {
+                Act::Interrupt { .. } | Act::Withdraw { .. } => {
+                    Outcome::failed("控制目标进程不在了")
+                }
+                Act::Send { .. } | Act::Configure { .. } | Act::Invoke { .. } => Outcome::Refused {
                     refusal: Refusal::Withheld,
                 },
             };
@@ -619,39 +753,24 @@ impl Inner {
         let Some(run) = record.run.clone() else {
             return;
         };
+        let uncertain_controls: HashSet<Ticket> = pending
+            .iter()
+            .filter(|p| p.unknown && matches!(p.act, Act::Interrupt { .. } | Act::Withdraw { .. }))
+            .map(|p| p.issued.ticket.clone())
+            .collect();
         let sends: HashMap<String, Ticket> = pending
             .iter()
             .filter(|p| matches!(p.act, Act::Send { .. }))
             .map(|p| (native_uuid(&p.issued.ticket), p.issued.ticket.clone()))
             .collect();
-        // 交给动作 mod 的事：检查点里记着的（含没用掉的自动批准）加上引擎交来的未结票。
-        let saved: std::collections::BTreeMap<String, PendingInvoke> = record
-            .checkpoint
-            .as_ref()
-            .and_then(|c| serde_json::from_value(c.0["invokes"].clone()).ok())
-            .unwrap_or_default();
-        let invokes: std::collections::BTreeMap<String, PendingInvoke> = pending
+        let controls: HashMap<String, (Ticket, Act)> = pending
             .iter()
-            .filter_map(|p| match &p.act {
-                Act::Invoke { what, .. } => {
-                    let op_id = native_uuid(&p.issued.ticket);
-                    let approval = match saved.get(&op_id) {
-                        Some(known) => known.approval.clone(),
-                        None => match what {
-                            Invocation::Shell { command } => Some(command.clone()),
-                            _ => None,
-                        },
-                    };
-                    Some((
-                        op_id,
-                        PendingInvoke {
-                            ticket: p.issued.ticket.clone(),
-                            what: what.clone(),
-                            approval,
-                        },
-                    ))
-                }
-                _ => None,
+            .filter(|p| matches!(p.act, Act::Interrupt { .. } | Act::Withdraw { .. }))
+            .map(|p| {
+                (
+                    native_uuid(&p.issued.ticket),
+                    (p.issued.ticket.clone(), p.act.clone()),
+                )
             })
             .collect();
         let mut written: HashMap<String, u64> = record
@@ -669,9 +788,55 @@ impl Inner {
             .as_ref()
             .is_none_or(|c| c.0["writes"].is_object());
         let (scanned, through, complete) = self
-            .written(&run, &sends.keys().cloned().collect(), cursor)
+            .written(
+                &run,
+                &sends.keys().chain(controls.keys()).cloned().collect(),
+                cursor,
+            )
             .await;
         written.extend(scanned);
+        let control_prefix = record
+            .checkpoint
+            .as_ref()
+            .is_none_or(|c| c.0["controls"].is_object());
+        if let Some(c) = &record.checkpoint
+            && !c.0["writes"].is_object()
+            && let Some(previous) = c.0["controls"].as_object()
+        {
+            for id in previous.keys() {
+                written.entry(id.clone()).or_insert(0);
+            }
+        }
+        // 交给动作 mod 的事：检查点里记着的（含没用掉的自动批准）加上引擎交来的未结票。
+        let saved: BTreeMap<String, PendingInvoke> = record
+            .checkpoint
+            .as_ref()
+            .and_then(|c| serde_json::from_value(c.0["invokes"].clone()).ok())
+            .unwrap_or_default();
+        let invokes: BTreeMap<String, PendingInvoke> = pending
+            .iter()
+            .filter_map(|p| match &p.act {
+                Act::Invoke { invocation, .. } if !titles(invocation) => {
+                    let op_id = native_uuid(&p.issued.ticket);
+                    let approval = match saved.get(&op_id) {
+                        Some(known) => known.approval.clone(),
+                        None => match invocation {
+                            Invocation::Shell { command } => Some(command.clone()),
+                            _ => None,
+                        },
+                    };
+                    Some((
+                        op_id,
+                        PendingInvoke {
+                            ticket: p.issued.ticket.clone(),
+                            invocation: invocation.clone(),
+                            approval,
+                        },
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
         let found = self.inspect(&run).await;
         let caps: Option<Caps> = serde_json::from_value(record.adopt.clone()).ok();
         let bs = record.bs.as_ref().map(|b| b.id.clone()).unwrap_or_default();
@@ -693,6 +858,14 @@ impl Inner {
                     },
                 ));
             }
+            for (ticket, _) in controls.values() {
+                facts.push(done(
+                    ticket,
+                    Outcome::Unknown {
+                        evidence: "控制来源已退出或无法接回，缺少确定的执行结论".into(),
+                    },
+                ));
+            }
             for pending in invokes.values() {
                 facts.push(done(
                     &pending.ticket,
@@ -702,6 +875,14 @@ impl Inner {
                 ));
             }
             for p in &pending {
+                if matches!(&p.act, Act::Configure { .. })
+                    || matches!(&p.act, Act::Invoke { invocation, .. } if titles(invocation))
+                {
+                    facts.push(done(
+                        &p.issued.ticket,
+                        Outcome::failed("设置时后端进程退出"),
+                    ));
+                }
                 if let Act::End { .. } = p.act {
                     facts.push(done(
                         &p.issued.ticket,
@@ -716,13 +897,9 @@ impl Inner {
             queued.close();
             while let Ok(cmd) = queued.try_recv() {
                 match cmd {
-                    Cmd::Send { ticket, .. } => facts.push(done(
-                        &ticket,
-                        Outcome::Refused {
-                            refusal: Refusal::Withheld,
-                        },
-                    )),
-                    Cmd::Invoke { ticket, .. } => facts.push(done(
+                    Cmd::Send { ticket, .. }
+                    | Cmd::Configure { ticket, .. }
+                    | Cmd::Title { ticket, .. } => facts.push(done(
                         &ticket,
                         Outcome::Refused {
                             refusal: Refusal::Withheld,
@@ -732,6 +909,15 @@ impl Inner {
                         &ticket,
                         Outcome::Ok {
                             done: Done::Ended { code: None },
+                        },
+                    )),
+                    Cmd::Control { ticket, .. } => {
+                        facts.push(done(&ticket, Outcome::failed("控制目标进程不在了")))
+                    }
+                    Cmd::Invoke { ticket, .. } => facts.push(done(
+                        &ticket,
+                        Outcome::Refused {
+                            refusal: Refusal::Withheld,
                         },
                     )),
                     Cmd::Ack(_) | Cmd::Concluded { .. } => {}
@@ -800,21 +986,80 @@ impl Inner {
                 waiting.insert(uuid, ticket);
             }
         }
-        if !facts.is_empty() {
-            self.deliver_facts(session, &record.carrier, facts).await;
+        let recovered_controls = controls
+            .iter()
+            .filter(|(id, _)| written.contains_key(*id))
+            .map(|(id, value)| (id.clone(), value.clone()))
+            .collect();
+        let unsent_controls: Vec<_> = controls
+            .into_iter()
+            .filter(|(id, _)| !written.contains_key(id))
+            .map(|(_, value)| value)
+            .collect();
+        let mut restored_controls = HashMap::new();
+        for p in &pending {
+            if let Act::Invoke { invocation, .. } = &p.act
+                && titles(invocation)
+            {
+                let id = format!("title:{}", p.issued.ticket);
+                let (seen, _, complete) = self.written(&run, &HashSet::from([id.clone()]), 0).await;
+                let was_written = seen.contains_key(&id)
+                    || record.checkpoint.as_ref().is_some_and(|c| {
+                        !c.0["settings_controls"][&id].is_null() || !c.0["controls"][&id].is_null()
+                    });
+                if was_written {
+                    restored_controls.insert(id, p.issued.ticket.clone());
+                } else if !complete {
+                    facts.push(done(
+                        &p.issued.ticket,
+                        Outcome::Unknown {
+                            evidence: "标题流水不完整，不能重发生成请求".into(),
+                        },
+                    ));
+                } else if let Some(slot) = self.carriers.lock().unwrap().get(&record.carrier) {
+                    let _ = slot.tx.send(Cmd::Title {
+                        ticket: p.issued.ticket.clone(),
+                        invocation: invocation.clone(),
+                        write: true,
+                    });
+                }
+            }
+            if let Act::Configure { setting, .. } = &p.act
+                && let Some(slot) = self.carriers.lock().unwrap().get(&record.carrier)
+            {
+                let _ = slot.tx.send(Cmd::Configure {
+                    ticket: p.issued.ticket.clone(),
+                    setting: setting.clone(),
+                });
+            }
+            if let Act::End { how, .. } = &p.act {
+                // 结束可以重发。
+                let slot = self.carriers.lock().unwrap();
+                if let Some(slot) = slot.get(&record.carrier) {
+                    let _ = slot.tx.send(Cmd::End {
+                        ticket: p.issued.ticket.clone(),
+                        how: *how,
+                    });
+                }
+            }
         }
         let rechecks: Vec<String> = invokes.keys().cloned().collect();
-        self.spawn_actor(
+        self.spawn_actor_with_controls(
+            recovered_controls,
+            restored_controls,
+            invokes,
             session.clone(),
             record.carrier.clone(),
             claude_run,
             convo,
             waiting,
             written,
-            invokes,
             Some(recover_through),
             queued,
         );
+        if !facts.is_empty() {
+            self.deliver_facts(session, &record.carrier, facts).await;
+        }
         let me = self
             .carriers
             .lock()
@@ -831,16 +1076,41 @@ impl Inner {
                 ));
             }
         }
-        for p in &pending {
-            if let Act::End { how, .. } = &p.act {
-                // 结束可以重发。
-                let slot = self.carriers.lock().unwrap();
-                if let Some(slot) = slot.get(&record.carrier) {
-                    let _ = slot.tx.send(Cmd::End {
-                        ticket: p.issued.ticket.clone(),
-                        how: *how,
-                    });
+        for (ticket, act) in unsent_controls {
+            if uncertain_controls.contains(&ticket) {
+                if control_prefix && complete && through >= recover_through {
+                    self.deliver_facts(
+                        session,
+                        &record.carrier,
+                        vec![clarified(
+                            &ticket,
+                            Outcome::Refused {
+                                refusal: Refusal::Lost {
+                                    evidence: "连续流水和检查点证明控制请求未写出".into(),
+                                },
+                            },
+                        )],
+                    )
+                    .await;
                 }
+                continue;
+            }
+            if control_prefix && complete && through >= recover_through {
+                if let Some(slot) = self.carriers.lock().unwrap().get(&record.carrier) {
+                    let _ = slot.tx.send(Cmd::Control { ticket, act });
+                }
+            } else {
+                self.deliver_facts(
+                    session,
+                    &record.carrier,
+                    vec![done(
+                        &ticket,
+                        Outcome::Unknown {
+                            evidence: "控制请求的检查点或流水不完整，不能证明未写出".into(),
+                        },
+                    )],
+                )
+                .await;
             }
         }
     }
@@ -856,17 +1126,39 @@ struct Actor {
     convo: Conversation,
     /// 写出了、还没见到回显的 user 行：uuid → 票。
     pending: HashMap<String, Ticket>,
+    controls: HashMap<String, (Ticket, Act)>,
+    queued: VecDeque<Cmd>,
     writes: HashMap<String, u64>,
+    ending: Option<Ticket>,
+    settings_controls: HashMap<String, Ticket>,
     /// 交给动作 mod、还没有结论的事：操作 id → 票。
-    invokes: std::collections::BTreeMap<String, PendingInvoke>,
+    invokes: BTreeMap<String, PendingInvoke>,
     /// 自己的命令队列（等动作 mod 结论的任务从这里交回来）。
     me: mpsc::UnboundedSender<Cmd>,
-    ending: Option<Ticket>,
     recover_through: Option<u64>,
     rx: mpsc::UnboundedReceiver<Cmd>,
 }
 
 impl Actor {
+    async fn write_control(&mut self, frame: &Value) -> Result<(), String> {
+        let seq = self.run.next_input();
+        match self.run.write(frame).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if !self.relink().await {
+                    return Err(error.to_string());
+                }
+                if self.run.next_input() > seq {
+                    return Ok(());
+                }
+                self.run
+                    .write(frame)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
     async fn run(mut self) {
         if let Some(through) = self.recover_through.take() {
             while self.run.cursor() < through {
@@ -885,16 +1177,52 @@ impl Actor {
                 )
                 .await;
         }
+        let mut poll = tokio::time::interval(self.inner.config.poll);
         loop {
-            tokio::select! {
-                cmd = self.rx.recv() => match cmd {
-                    Some(cmd) => self.command(cmd).await,
-                    None => return,
-                },
-                _ = tokio::time::sleep(self.inner.config.poll) => {
-                    if self.poll().await {
-                        return;
-                    }
+            if self.queued.is_empty() {
+                tokio::select! {
+                    biased;
+                    _ = poll.tick() => { if self.poll().await { return; } },
+                    cmd = self.rx.recv() => match cmd { Some(cmd) => self.queued.push_back(cmd), None => return },
+                }
+            }
+            while let Ok(cmd) = self.rx.try_recv() {
+                self.queued.push_back(cmd);
+            }
+            if !self.queued.is_empty() {
+                let control = self
+                    .queued
+                    .iter()
+                    .position(|cmd| !matches!(cmd, Cmd::Send { .. } | Cmd::Invoke { .. }))
+                    .unwrap_or(0);
+                // 撤回依赖对应输入已经写出；取消整队依赖此前输入。普通 Esc 无此依赖，优先写。
+                let prerequisite = match &self.queued[control] {
+                    Cmd::Control {
+                        act: Act::Withdraw { send, .. },
+                        ..
+                    } => self
+                        .queued
+                        .iter()
+                        .position(|cmd| matches!(cmd,Cmd::Send { ticket, .. } if ticket == send)),
+                    Cmd::Control {
+                        act:
+                            Act::Interrupt {
+                                queued: nd_backend::QueuedPolicy::Cancel,
+                                ..
+                            },
+                        ..
+                    } => self
+                        .queued
+                        .iter()
+                        .take(control)
+                        .position(|cmd| matches!(cmd, Cmd::Send { .. })),
+                    _ => None,
+                };
+                let cmd = self.queued.remove(prerequisite.unwrap_or(control)).unwrap();
+                self.command(cmd).await;
+                // 长输入队列也持续读回应，不能让事实或控制结果饿死。
+                if self.poll().await {
+                    return;
                 }
             }
         }
@@ -912,23 +1240,41 @@ impl Actor {
 
     async fn command(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Send { ticket, msg } => {
+            Cmd::Send { ticket, msg, .. } => {
                 let uuid = native_uuid(&ticket);
                 let priority = match msg.intent {
                     Intent::Fold => "next",
                     Intent::AfterTurn => "later",
                     Intent::Interrupting => "now",
                 };
-                let content = match self.encode(&msg).await {
-                    Ok(content) => content,
-                    Err(error) => {
+                let blobs = self.inner.blobs.clone();
+                let message = msg.clone();
+                let content = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
+                    use base64::Engine;
+                    let mut content = vec![];
+                    if !message.text.is_empty() { content.push(json!({"type":"text","text":message.text})); }
+                    for attachment in &message.attachments {
+                        let bytes = blobs.get(&attachment.blob).map_err(|e| e.to_string())?;
+                        if attachment.media_type == "text/plain" {
+                            let text = String::from_utf8(bytes).map_err(|_| format!("{} 不是 UTF-8 文本", attachment.name))?;
+                            content.push(json!({"type":"text","text":format!("附件 {}：\n{}", serde_json::to_string(&attachment.name).unwrap(), text)}));
+                        } else {
+                            let kind = if attachment.media_type == "application/pdf" { "document" } else { "image" };
+                            content.push(json!({"type":kind,"source":{"type":"base64","media_type":attachment.media_type,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}}));
+                        }
+                    }
+                    Ok(content)
+                }).await;
+                let content = match content {
+                    Ok(Ok(content)) => content,
+                    error => {
                         self.inner
                             .deliver_facts(
                                 &self.session,
                                 &self.carrier,
                                 vec![done(
                                     &ticket,
-                                    Outcome::failed(format!("读取附件失败：{error}")),
+                                    Outcome::failed(format!("读取附件失败：{error:?}")),
                                 )],
                             )
                             .await;
@@ -1034,6 +1380,147 @@ impl Actor {
                     }
                 }
             }
+            Cmd::Control { ticket, act } => {
+                let id = native_uuid(&ticket);
+                let request = match &act {
+                    Act::Interrupt { queued, .. } => {
+                        if *queued == nd_backend::QueuedPolicy::Cancel {
+                            if !self.convo.can_cancel_queued() {
+                                self.inner
+                                    .deliver_facts(
+                                        &self.session,
+                                        &self.carrier,
+                                        vec![done(
+                                            &ticket,
+                                            Outcome::Rejected {
+                                                reject: Reject::Unsupported {
+                                                    why: "后端未声明取消排队能力".into(),
+                                                },
+                                            },
+                                        )],
+                                    )
+                                    .await;
+                                return;
+                            }
+                            json!({"subtype":"interrupt","cancel_queued":true})
+                        } else {
+                            json!({"subtype":"interrupt"})
+                        }
+                    }
+                    Act::Withdraw { send, .. } => {
+                        json!({"subtype":"cancel_async_message", "message_uuid":native_uuid(send)})
+                    }
+                    _ => unreachable!(),
+                };
+                let frame = json!({"type":"control_request", "request_id":id, "request":request});
+                #[cfg(feature = "scenarios")]
+                self.stop_fault(request["subtype"].as_str().unwrap_or_default());
+                self.controls.insert(id.clone(), (ticket.clone(), act));
+                #[cfg(feature = "scenarios")]
+                if self
+                    .delivery_fault(request["subtype"].as_str().unwrap_or_default(), false)
+                    .is_some()
+                {
+                    self.inner
+                        .deliver_facts(
+                            &self.session,
+                            &self.carrier,
+                            vec![done(
+                                &ticket,
+                                Outcome::Unknown {
+                                    evidence: "场景故障：控制请求传输未确认".into(),
+                                },
+                            )],
+                        )
+                        .await;
+                    return;
+                }
+                // 看守按实际输入序号去重；不把连接失败当作请求未送达。
+                let seq = self.run.next_input();
+                if let Err(error) = self.run.write(&frame).await {
+                    let recovered = self.relink().await
+                        && (self.run.next_input() > seq || self.run.write(&frame).await.is_ok());
+                    if !recovered {
+                        // 保留请求配对，迟到回应仍可澄清原 Unknown；writes 才是写出证据。
+                        self.inner
+                            .deliver_facts(
+                                &self.session,
+                                &self.carrier,
+                                vec![done(
+                                    &ticket,
+                                    Outcome::Unknown {
+                                        evidence: error.to_string(),
+                                    },
+                                )],
+                            )
+                            .await;
+                    }
+                }
+            }
+            Cmd::Title {
+                ticket,
+                invocation,
+                write,
+            } => {
+                let id = format!("title:{ticket}");
+                self.settings_controls.insert(id.clone(), ticket.clone());
+                let request = match invocation {
+                    nd_backend::Invocation::Title { title } => {
+                        json!({"subtype":"rename_session","title":title,"source":"host"})
+                    }
+                    nd_backend::Invocation::GenerateTitle { description } => {
+                        json!({"subtype":"generate_session_title","description":description,"persist":true})
+                    }
+                    // 其余 Invoke 经动作 mod（`Cmd::Invoke`），不会排进这里。
+                    _ => return,
+                };
+                if write
+                    && let Err(error) = self
+                        .write_control(
+                            &json!({"type":"control_request","request_id":id,"request":request}),
+                        )
+                        .await
+                {
+                    self.settings_controls.remove(&id);
+                    self.inner
+                        .deliver_facts(
+                            &self.session,
+                            &self.carrier,
+                            vec![done(
+                                &ticket,
+                                Outcome::Unknown {
+                                    evidence: error.to_string(),
+                                },
+                            )],
+                        )
+                        .await;
+                }
+            }
+            Cmd::Configure { ticket, setting } => {
+                let request = setting_request(&setting);
+                let id = format!("configure:{ticket}");
+                self.settings_controls.insert(id.clone(), ticket.clone());
+                if let Err(error) = self
+                    .write_control(
+                        &json!({"type":"control_request","request_id":id,"request":request}),
+                    )
+                    .await
+                {
+                    self.settings_controls.remove(&id);
+                    self.inner
+                        .deliver_facts(
+                            &self.session,
+                            &self.carrier,
+                            vec![done(
+                                &ticket,
+                                Outcome::Unknown {
+                                    evidence: error.to_string(),
+                                },
+                            )],
+                        )
+                        .await;
+                }
+            }
             Cmd::End { ticket, how } => {
                 self.ending = Some(ticket);
                 let result = match how {
@@ -1052,12 +1539,12 @@ impl Actor {
                     let _ = self.run.finish(Finish::Kill).await;
                 }
             }
-            Cmd::Invoke { ticket, what } => self.invoke(ticket, what).await,
+            Cmd::Invoke { ticket, invocation } => self.invoke(ticket, invocation).await,
             Cmd::Concluded { op_id, result } => {
                 let Some(pending) = self.invokes.remove(&op_id) else {
                     return;
                 };
-                let outcome = invoke::outcome(&pending.what, result.as_ref());
+                let outcome = invoke::outcome(&pending.invocation, result.as_ref());
                 let through = self.run.cursor();
                 self.deliver_checkpointed(vec![done(&pending.ticket, outcome)], through)
                     .await;
@@ -1069,7 +1556,6 @@ impl Actor {
             }
         }
     }
-
     async fn encode(&self, msg: &Msg) -> Result<Vec<Value>, String> {
         let blobs = self.inner.blobs.clone();
         let message = msg.clone();
@@ -1083,6 +1569,8 @@ impl Actor {
             "seq": through,
             "convo": self.convo,
             "writes": self.writes,
+            "controls": self.controls,
+            "settings_controls": self.settings_controls,
             "invokes": self.invokes,
         }))
     }
@@ -1103,11 +1591,12 @@ impl Actor {
     }
 
     /// 总结、`!`、派 fork 型子代理：经动作 mod 做，按票派生的操作 id 等结论。
-    async fn invoke(&mut self, ticket: Ticket, what: Invocation) {
-        let feature = match &what {
+    async fn invoke(&mut self, ticket: Ticket, invocation: Invocation) {
+        let feature = match &invocation {
             Invocation::Compact { .. } => Feature::Summarize,
             Invocation::Shell { .. } => Feature::BangMode,
             Invocation::ForkAgent { .. } => Feature::ForkSubagent,
+            Invocation::Title { .. } | Invocation::GenerateTitle { .. } => return,
         };
         let reject = |why: String| {
             done(
@@ -1123,7 +1612,7 @@ impl Actor {
                 .await;
             return;
         }
-        let row = match &what {
+        let row = match &invocation {
             Invocation::Compact { anchor, .. } => {
                 let msg = Msg {
                     attachments: anchor.attachments.clone(),
@@ -1150,8 +1639,10 @@ impl Actor {
             _ => None,
         };
         let op_id = native_uuid(&ticket);
-        let action = invoke::action(&what, row.as_deref());
-        let approval = match &what {
+        let Some(action) = invoke::action(&invocation, row.as_deref()) else {
+            return;
+        };
+        let approval = match &invocation {
             Invocation::Shell { command } => Some(command.clone()),
             _ => None,
         };
@@ -1159,7 +1650,7 @@ impl Actor {
             op_id.clone(),
             PendingInvoke {
                 ticket: ticket.clone(),
-                what,
+                invocation,
                 approval,
             },
         );
@@ -1307,16 +1798,22 @@ impl Actor {
         let mut live = vec![];
         let mut exited = forced_exit;
         for record in &records {
+            let had_cancel = self.convo.can_cancel_queued();
             if let Event::In { in_seq, line } = &record.event
                 && let Ok(frame) = serde_json::from_str::<Value>(line)
-                && let Some(uuid) = frame["uuid"].as_str()
-                && self.pending.contains_key(uuid)
+                && let Some(uuid) = frame["uuid"]
+                    .as_str()
+                    .or_else(|| frame["request_id"].as_str())
+                && (self.pending.contains_key(uuid) || self.controls.contains_key(uuid))
             {
                 self.writes.insert(uuid.to_owned(), *in_seq);
             }
             for (n, convo) in self.convo.apply(record).into_iter().enumerate() {
                 let key = format!("{}:{}:{n}", self.run_id, record.seq);
                 match convo {
+                    Convo::TitleChanged { title } => {
+                        facts.push(fact(key, FactBody::TitleChanged { title }))
+                    }
                     Convo::Written { uuid } => {
                         if let Some(ticket) = self.pending.get(&uuid) {
                             facts.push(fact(
@@ -1352,7 +1849,111 @@ impl Actor {
                             facts.push(clarified(&ticket, outcome));
                         }
                     }
-                    Convo::Lifecycle { .. } | Convo::Reply { .. } => {}
+                    Convo::Reply {
+                        request_id,
+                        ok,
+                        body,
+                    } => {
+                        if let Some((ticket, act)) = self.controls.remove(&request_id) {
+                            self.writes.remove(&request_id);
+                            let outcome = if !ok {
+                                Outcome::failed(body.to_string())
+                            } else {
+                                match act {
+                                    Act::Interrupt { queued, .. } => {
+                                        if queued == nd_backend::QueuedPolicy::Cancel
+                                            && !body["response"]["cancelled"].is_array()
+                                        {
+                                            Outcome::Unknown {
+                                                evidence:
+                                                    "中断回应缺少 cancelled，未将排队消息当成已撤回"
+                                                        .into(),
+                                            }
+                                        } else {
+                                            let cancelled = body["response"]["cancelled"]
+                                                .as_array()
+                                                .into_iter()
+                                                .flatten()
+                                                .filter_map(|id| {
+                                                    id.as_str().and_then(|id| {
+                                                        self.writes.remove(id);
+                                                        self.pending.remove(id)
+                                                    })
+                                                })
+                                                .collect();
+                                            Outcome::Ok {
+                                                done: Done::Interrupted { cancelled },
+                                            }
+                                        }
+                                    }
+                                    Act::Withdraw { send, .. } => {
+                                        match body["response"]["cancelled"].as_bool() {
+                                            Some(cancelled) => {
+                                                if cancelled {
+                                                    let uuid = native_uuid(&send);
+                                                    self.writes.remove(&uuid);
+                                                    self.pending.remove(&uuid);
+                                                }
+                                                Outcome::Ok {
+                                                    done: Done::Withdrawn { ok: cancelled },
+                                                }
+                                            }
+                                            None => Outcome::Unknown {
+                                                evidence: "撤回回应缺少 cancelled".into(),
+                                            },
+                                        }
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            };
+                            facts.push(done(&ticket, outcome.clone()));
+                            facts.push(clarified(&ticket, outcome));
+                        }
+                        if let Some(ticket) = self.settings_controls.remove(&request_id) {
+                            if !ok {
+                                let reason = body["error"]
+                                    .as_str()
+                                    .unwrap_or("CLI 拒绝此设置")
+                                    .to_owned();
+                                let outcome = if request_id.starts_with("settings:") {
+                                    Outcome::Unknown {
+                                        evidence: format!("设置已被接受，但回读失败：{reason}"),
+                                    }
+                                } else {
+                                    Outcome::failed(reason)
+                                };
+                                facts.push(done(&ticket, outcome));
+                            } else if request_id.starts_with("title:") {
+                                facts.push(done(
+                                    &ticket,
+                                    Outcome::Ok {
+                                        done: Done::Titled {
+                                            title: body["response"]["title"]
+                                                .as_str()
+                                                .map(str::to_owned),
+                                        },
+                                    },
+                                ));
+                            } else if request_id.starts_with("configure:") {
+                                let id = format!("settings:{ticket}");
+                                self.settings_controls.insert(id.clone(), ticket.clone());
+                                if let Err(error) = self.write_control(&json!({"type":"control_request","request_id":id,"request":{"subtype":"get_settings"}})).await {
+                                    self.settings_controls.remove(&id);
+                                    facts.push(done(&ticket, Outcome::Unknown {evidence:error.to_string()}));
+                                }
+                            } else {
+                                facts.push(done(
+                                    &ticket,
+                                    Outcome::Ok {
+                                        done: Done::Configured {
+                                            settings: settings_with_caps(body["response"].clone()),
+                                        },
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    Convo::Lifecycle { .. } => {}
                     Convo::TurnMapped {
                         turn,
                         uuids,
@@ -1389,9 +1990,7 @@ impl Actor {
                             // `!` 的自动批准：只这一次，用掉就清。
                             pending.approval = None;
                             let answer = invoke::allow(&request_id, &raw);
-                            if self.run.write(&answer).await.is_err() && self.relink().await {
-                                let _ = self.run.write(&answer).await;
-                            }
+                            let _ = self.write_control(&answer).await;
                             continue;
                         }
                         facts.push(fact(
@@ -1408,8 +2007,32 @@ impl Actor {
                     Convo::Exit { code } => exited = Some(code),
                 }
             }
+            if had_cancel != self.convo.can_cancel_queued() {
+                facts.push(fact(
+                    format!("{}:{}:cancel-queue-cap", self.run_id, record.seq),
+                    FactBody::CanCancelQueued {
+                        available: self.convo.can_cancel_queued(),
+                    },
+                ));
+            }
         }
         if let Some(code) = exited {
+            for (_, (ticket, _)) in self.controls.drain() {
+                facts.push(done(
+                    &ticket,
+                    Outcome::Unknown {
+                        evidence: "控制请求写出后进程退出，未见回应".into(),
+                    },
+                ));
+            }
+            for (_, ticket) in self.settings_controls.drain() {
+                facts.push(done(
+                    &ticket,
+                    Outcome::Unknown {
+                        evidence: "后端进程退出，设置或标题结果未确认".into(),
+                    },
+                ));
+            }
             for (_, ticket) in self.pending.drain() {
                 facts.push(done(
                     &ticket,
@@ -1447,15 +2070,11 @@ impl Actor {
             self.inner.carriers.lock().unwrap().remove(&self.carrier);
             // 进程退出时还排在队列里、没写出的票：证明没写出，引擎另发（会按需拉起）。
             self.rx.close();
-            while let Ok(cmd) = self.rx.try_recv() {
+            while let Some(cmd) = self.queued.pop_front().or_else(|| self.rx.try_recv().ok()) {
                 match cmd {
-                    Cmd::Send { ticket, .. } => facts.push(done(
-                        &ticket,
-                        Outcome::Refused {
-                            refusal: Refusal::Withheld,
-                        },
-                    )),
-                    Cmd::Invoke { ticket, .. } => facts.push(done(
+                    Cmd::Send { ticket, .. }
+                    | Cmd::Configure { ticket, .. }
+                    | Cmd::Title { ticket, .. } => facts.push(done(
                         &ticket,
                         Outcome::Refused {
                             refusal: Refusal::Withheld,
@@ -1465,6 +2084,15 @@ impl Actor {
                         &ticket,
                         Outcome::Ok {
                             done: Done::Ended { code: Some(code) },
+                        },
+                    )),
+                    Cmd::Control { ticket, .. } => {
+                        facts.push(done(&ticket, Outcome::failed("控制目标进程不在了")))
+                    }
+                    Cmd::Invoke { ticket, .. } => facts.push(done(
+                        &ticket,
+                        Outcome::Refused {
+                            refusal: Refusal::Withheld,
                         },
                     )),
                     Cmd::Ack(_) | Cmd::Concluded { .. } => {}
@@ -1565,16 +2193,41 @@ impl BackendAdapter for ClaudeBackend {
                     .spawn(inner.open(issued, carrier, run, spec));
                 accepted
             }
-            Act::Send { to, msg } => {
+            Act::Invoke { to, invocation } => match self.inner.carriers.lock().unwrap().get(&to) {
+                Some(slot)
+                    if slot.session == issued.session
+                        && slot
+                            .tx
+                            .send(if titles(&invocation) {
+                                Cmd::Title {
+                                    ticket: issued.ticket.clone(),
+                                    invocation,
+                                    write: true,
+                                }
+                            } else {
+                                Cmd::Invoke {
+                                    ticket: issued.ticket.clone(),
+                                    invocation,
+                                }
+                            })
+                            .is_ok() =>
+                {
+                    accepted
+                }
+                _ => Admit::Rejected {
+                    reject: Reject::Gone,
+                },
+            },
+            Act::Configure { to, setting } => {
                 let carriers = self.inner.carriers.lock().unwrap();
                 match carriers.get(&to) {
                     Some(slot)
                         if slot.session == issued.session
                             && slot
                                 .tx
-                                .send(Cmd::Send {
+                                .send(Cmd::Configure {
                                     ticket: issued.ticket.clone(),
-                                    msg,
+                                    setting,
                                 })
                                 .is_ok() =>
                     {
@@ -1585,20 +2238,58 @@ impl BackendAdapter for ClaudeBackend {
                     },
                 }
             }
-            Act::Invoke { to, what } => {
+            Act::Interrupt { ref to, .. } | Act::Withdraw { ref to, .. } => {
                 let carriers = self.inner.carriers.lock().unwrap();
-                match carriers.get(&to) {
+                match carriers.get(to) {
                     Some(slot)
                         if slot.session == issued.session
                             && slot
                                 .tx
-                                .send(Cmd::Invoke {
-                                    ticket: issued.ticket.clone(),
-                                    what,
+                                .send(Cmd::Control {
+                                    ticket: issued.ticket,
+                                    act,
                                 })
                                 .is_ok() =>
                     {
                         accepted
+                    }
+                    _ => Admit::Rejected {
+                        reject: Reject::Gone,
+                    },
+                }
+            }
+            Act::Send { to, msg } => {
+                let carriers = self.inner.carriers.lock().unwrap();
+                match carriers.get(&to) {
+                    Some(slot) if slot.session == issued.session => {
+                        // 普通输入最多 128 条；控制和流水确认不占这份容量。
+                        if slot
+                            .normal_queued
+                            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                (n < 128).then_some(n + 1)
+                            })
+                            .is_err()
+                        {
+                            return Admit::Rejected {
+                                reject: Reject::Busy,
+                            };
+                        }
+                        let permit = NormalPermit(slot.normal_queued.clone());
+                        if slot
+                            .tx
+                            .send(Cmd::Send {
+                                ticket: issued.ticket,
+                                msg,
+                                _permit: permit,
+                            })
+                            .is_ok()
+                        {
+                            accepted
+                        } else {
+                            Admit::Rejected {
+                                reject: Reject::Gone,
+                            }
+                        }
                     }
                     _ => Admit::Rejected {
                         reject: Reject::Gone,
@@ -1654,4 +2345,51 @@ impl BackendAdapter for ClaudeBackend {
     fn release(&self, session: &SessionId) {
         self.inner.inboxes.lock().unwrap().remove(session);
     }
+}
+
+fn settings_with_caps(mut settings: Value) -> Value {
+    if !settings.is_object() {
+        settings = json!({});
+    }
+    // 缺字段即不可用；ACK 不能代替实际状态。Codex 适配没有这个能力。
+    let ultra = settings["applied"]["ultracodeAvailable"] == true
+        && settings["applied"]["ultracodeRequested"].is_boolean()
+        && settings["applied"]["ultracode"].is_boolean();
+    settings = json!({"applied":settings["applied"],"permission_modes":["default","acceptEdits","plan","dontAsk","auto","bypassPermissions"]});
+    settings["caps"] = json!({"model":settings["applied"]["model"].is_string(),"effort":settings["applied"].is_object(),"permission_mode":settings["applied"].is_object(),"ultracode":ultra});
+    settings
+}
+
+fn setting_request(setting: &nd_wire::LiveSetting) -> Value {
+    match setting {
+        nd_wire::LiveSetting::Model(model) => json!({"subtype":"set_model","model":model}),
+        nd_wire::LiveSetting::Effort(effort) => {
+            json!({"subtype":"apply_flag_settings","settings":{"effortLevel":effort}})
+        }
+        nd_wire::LiveSetting::Ultracode(on) => {
+            json!({"subtype":"apply_flag_settings","settings":{"ultracode":on}})
+        }
+        nd_wire::LiveSetting::PermissionMode(mode) => {
+            json!({"subtype":"set_permission_mode","mode":mode})
+        }
+    }
+}
+
+// 仅用于 Open 阶段：还没有提交给此进程的人类提示，因此不会吞对话流水。
+async fn initial_control(run: &mut ClaudeRun, request: Value) -> Result<Value, String> {
+    let id = format!("initial-settings-{}", run.next_input());
+    run.write(&json!({"type":"control_request","request_id":id,"request":request}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let frames = run
+        .wait_frame(Duration::from_secs(30), |f| {
+            f["type"] == "control_response" && f["response"]["request_id"] == id
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let response = &frames.last().ok_or("设置没有回应")?["response"];
+    if response["subtype"] != "success" {
+        return Err(response.to_string());
+    }
+    Ok(response["response"].clone())
 }

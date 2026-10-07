@@ -94,30 +94,61 @@ pub enum Act {
         carrier: CarrierId,
         how: EndHow,
     },
+    /// 经后端进程替会话做的一件事：改标题、生成标题，以及总结、`!` 命令、派 fork 型子代理
+    /// （后三种至多一次、不可重发：结果不明就是 `Unknown`）。
+    Invoke {
+        to: CarrierId,
+        invocation: Invocation,
+    },
+    Configure {
+        to: CarrierId,
+        setting: nd_wire::LiveSetting,
+    },
     Send {
         to: CarrierId,
         msg: Msg,
     },
-    /// 经后端进程替会话做的一件事：总结、`!` 命令、派 fork 型子代理。至多一次，不可重发：
-    /// 结果不明就是 `Unknown`。
-    Invoke {
+    /// 只停当前回合，保留排队输入和后台任务。
+    Interrupt {
         to: CarrierId,
-        what: Invocation,
+        #[serde(default)]
+        queued: QueuedPolicy,
+    },
+    /// 撤回指定 Send 票；票派生的原生编号留在适配器内部。
+    Withdraw {
+        to: CarrierId,
+        send: Ticket,
     },
 }
 impl Act {
     pub fn carrier(&self) -> &CarrierId {
         match self {
             Act::Open { carrier, .. } | Act::End { carrier, .. } => carrier,
-            Act::Send { to, .. } | Act::Invoke { to, .. } => to,
+            Act::Send { to, .. }
+            | Act::Interrupt { to, .. }
+            | Act::Withdraw { to, .. }
+            | Act::Configure { to, .. }
+            | Act::Invoke { to, .. } => to,
         }
     }
     /// 恢复对账时证明没写出的票怎么办：要经独占登记放行的写类动作不补发（`Withhold`），
     /// 由引擎按当下事实重新放行另发；其余照写（`Resend`）。只由动作种类定。
     pub fn if_unsent(&self) -> IfUnsent {
         match self {
-            Act::Open { .. } | Act::Send { .. } | Act::Invoke { .. } => IfUnsent::Withhold,
-            Act::End { .. } => IfUnsent::Resend,
+            Act::Open { .. } | Act::Send { .. } => IfUnsent::Withhold,
+            Act::Invoke {
+                invocation:
+                    Invocation::GenerateTitle { .. }
+                    | Invocation::Compact { .. }
+                    | Invocation::Shell { .. }
+                    | Invocation::ForkAgent { .. },
+                ..
+            } => IfUnsent::Withhold,
+            Act::End { .. }
+            | Act::Interrupt { .. }
+            | Act::Withdraw { .. }
+            | Act::Configure { .. }
+            | Act::Invoke { .. } => IfUnsent::Resend,
         }
     }
 }
@@ -126,6 +157,10 @@ impl Act {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "invoke", rename_all = "snake_case")]
 pub enum Invocation {
+    /// 改标题（CLI `rename_session`）。
+    Title { title: String },
+    /// 生成标题（CLI `generate_session_title`）。
+    GenerateTitle { description: String },
     /// 只压缩所选范围：`From` 从所选提示（含）到末尾，`UpTo` 从开头到所选提示（不含）。
     /// 提示按原文和次序定位；定位不到不压缩，结果是 `Refused(AnchorGone)`。
     Compact { scope: CompactScope, anchor: Anchor },
@@ -193,6 +228,8 @@ pub enum IfUnsent {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenSpec {
+    #[serde(default)]
+    pub live_settings: Vec<nd_wire::LiveSetting>,
     pub origin: Origin,
     pub profile: Profile,
 }
@@ -217,6 +254,8 @@ impl Origin {
 /// 后端种类、模型、权限模式、工作目录；跨后端换算经这个中立形状（ADR 0017）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
+    #[serde(default)]
+    pub effort: Option<String>,
     pub kind: BackendKind,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
@@ -252,6 +291,14 @@ pub enum Intent {
     Fold,
     AfterTurn,
     Interrupting,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedPolicy {
+    #[default]
+    Keep,
+    Cancel,
 }
 
 /// `act` 的同步结论：只校验、排队，不做 I/O。
@@ -331,6 +378,7 @@ impl Outcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum Refusal {
+    Withdrawn,
     /// 恢复对账证明没写出，按 `IfUnsent::Withhold` 没有补发：引擎重新放行后另发。
     Withheld,
     /// 写出了，但端口证实没生效。
@@ -349,10 +397,25 @@ pub enum Refusal {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "done", rename_all = "snake_case")]
 pub enum Done {
+    /// 控制请求的 ACK；不证明回合已结束。
+    Interrupted {
+        cancelled: Vec<Ticket>,
+    },
+    Withdrawn {
+        ok: bool,
+    },
+    Titled {
+        title: Option<String>,
+    },
+    Configured {
+        settings: Value,
+    },
     Opened {
         bs: BackendSessionId,
         run: RunId,
         readiness: Readiness,
+        #[serde(default)]
+        interaction: InteractionCaps,
         /// 适配器在守护进程重启后接回这个进程要用的记录（Claude：拉起时的能力表），执行器原样保存。
         adopt: Value,
         /// 这个进程的能力表；旧记录没有时为空。
@@ -369,6 +432,19 @@ pub enum Done {
     Invoked {
         result: Invoked,
     },
+}
+
+/// 中立的发送与停止能力；界面只消费这些值，不解读后端私有字段。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionCaps {
+    pub send_intents: Vec<Intent>,
+    pub withdraw: bool,
+    pub interrupt: bool,
+    #[serde(default)]
+    pub cancel_queued: bool,
+    pub interrupt_spares_background: bool,
+    pub immediate_preserves_mcp: bool,
+    pub rewind_menu: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +467,12 @@ pub struct Fact {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "fact", rename_all = "snake_case")]
 pub enum FactBody {
+    CanCancelQueued {
+        available: bool,
+    },
+    TitleChanged {
+        title: String,
+    },
     /// 此承载位的 hello、流水追平和未结票对账完成；本代恢复闸门据此放行。
     Recovered,
     /// 能力变了（例如守护进程重启后 mod 没回来，进程降为只能聊天）。
@@ -539,6 +621,8 @@ pub struct CarrierRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTicket {
+    /// 已经终结为 Unknown；只对账，不重新执行。
+    pub unknown: bool,
     pub issued: Issued,
     pub act: Act,
 }
@@ -641,4 +725,15 @@ impl Backends {
             adapter.release(session);
         }
     }
+}
+
+/// 承载位报告的能力经过后端端口的硬约束，再交给所有界面。
+/// 缺字段一律不开放 ultracode；Codex 无论报告内容如何都不可用。
+pub fn session_capabilities(kind: &BackendKind, reported: &Value) -> Value {
+    let mut caps = reported.as_object().cloned().unwrap_or_default();
+    caps.insert(
+        "ultracode".into(),
+        Value::Bool(*kind == BackendKind::Claude && reported["ultracode"] == true),
+    );
+    Value::Object(caps)
 }

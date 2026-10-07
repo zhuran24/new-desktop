@@ -30,8 +30,9 @@ pub fn sha256_hex(text: &str) -> String {
 }
 
 /// 给动作 mod 的命令。`row` 是所选提示按发出时的内容块算出的用户行文字（只对总结有用）。
-pub fn action(what: &Invocation, row: Option<&str>) -> Action {
-    match what {
+/// 改标题、生成标题走控制请求，不经动作 mod，回 None。
+pub fn action(what: &Invocation, row: Option<&str>) -> Option<Action> {
+    Some(match what {
         Invocation::Compact { scope, anchor } => Action::Compact {
             spec: SummarizeSpec {
                 scope: match scope {
@@ -51,7 +52,8 @@ pub fn action(what: &Invocation, row: Option<&str>) -> Action {
             prompt: prompt.clone(),
             description: description(prompt),
         },
-    }
+        Invocation::Title { .. } | Invocation::GenerateTitle { .. } => return None,
+    })
 }
 
 fn description(prompt: &str) -> String {
@@ -167,6 +169,7 @@ pub fn outcome(what: &Invocation, result: Option<&crate::CommandResult>) -> Outc
                 },
             }
         }
+        Invocation::Title { .. } | Invocation::GenerateTitle { .. } => malformed(),
         Invocation::ForkAgent { .. } => {
             let Ok(done) = serde_json::from_value::<ForkDone>(value.clone()) else {
                 return malformed();
