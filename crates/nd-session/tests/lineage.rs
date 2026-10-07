@@ -31,6 +31,7 @@ fn observe(lineage: Lineage, key: &str, natives: &[&str], complete: bool) -> Lin
     lineage
         .fold(&Event::TurnObserved {
             carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs1"),
             key: key.into(),
             natives: natives.iter().map(|s| s.to_string()).collect(),
             complete,
@@ -38,6 +39,52 @@ fn observe(lineage: Lineage, key: &str, natives: &[&str], complete: bool) -> Lin
         })
         .unwrap()
 }
+#[test]
+fn clear_rebinds_the_same_carrier_without_mixing_old_and_new_rounds() {
+    let before = observe(
+        land(root(), "old", "old#1", "old-u"),
+        "old-t",
+        &["old-u"],
+        true,
+    );
+    let clear = Event::Branch {
+        segment: "z-clear".into(),
+        from: "s1".into(),
+        through: None,
+        kind: nd_session::lineage::BranchKind::Clear,
+        carrier: "c1".into(),
+        backend_session: BackendSessionId::claude("bs2"),
+    };
+    let cleared = before.fold(&clear).unwrap();
+    let landed = cleared
+        .fold(&Event::Landed {
+            message: "new".into(),
+            ticket: "new#1".into(),
+            position: NativePosition {
+                carrier: "c1".into(),
+                backend_session: BackendSessionId::claude("bs2"),
+                native: "new-u".into(),
+            },
+        })
+        .unwrap();
+    let after = landed
+        .fold(&Event::TurnObserved {
+            carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs2"),
+            key: "new-t".into(),
+            natives: vec!["new-u".into()],
+            complete: true,
+            last_assistant: None,
+        })
+        .unwrap();
+    assert_eq!(after.turns("s1").unwrap()[0].messages, ["old"]);
+    assert_eq!(after.turns("z-clear").unwrap()[0].messages, ["new"]);
+    assert!(after.common_prefix("s1", "z-clear").unwrap().is_empty());
+    assert_eq!(after.fold(&clear).unwrap(), after);
+    let restored: Lineage = serde_json::from_str(&serde_json::to_string(&after).unwrap()).unwrap();
+    assert_eq!(restored, after);
+}
+
 #[test]
 fn landed_prompts_open_one_round_only_when_their_actual_turn_is_known() {
     let landed = land(
@@ -431,6 +478,7 @@ fn replaying_an_older_turn_prefix_does_not_move_the_completed_fork_anchor() {
     let landed = land(root(), "a", "a#1", "ua");
     let early = Event::TurnObserved {
         carrier: "c1".into(),
+        backend_session: BackendSessionId::claude("bs1"),
         key: "turn".into(),
         natives: vec!["ua".into()],
         complete: false,
@@ -440,6 +488,7 @@ fn replaying_an_older_turn_prefix_does_not_move_the_completed_fork_anchor() {
     let ended = running
         .fold(&Event::TurnObserved {
             carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs1"),
             key: "turn".into(),
             natives: vec!["ua".into()],
             complete: true,
@@ -450,6 +499,7 @@ fn replaying_an_older_turn_prefix_does_not_move_the_completed_fork_anchor() {
     let followup = ended
         .fold(&Event::TurnObserved {
             carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs1"),
             key: "background-followup".into(),
             natives: vec!["ua".into()],
             complete: true,

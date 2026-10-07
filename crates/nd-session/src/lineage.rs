@@ -149,6 +149,7 @@ pub enum Event {
     /// 适配器确认的实际落点；key 是这一原生回合的稳定身份，不是消息或票。
     TurnObserved {
         carrier: CarrierId,
+        backend_session: BackendSessionId,
         key: String,
         natives: Vec<String>,
         complete: bool,
@@ -365,10 +366,15 @@ impl Lineage {
                     }
                     return Err(Error("目标段已存在".into()));
                 }
+                let rebind = *kind == BranchKind::Clear
+                    && self.carriers.get(carrier).is_some_and(|known| {
+                        &known.segment == from && &known.backend_session != backend_session
+                    });
                 if self
                     .segments
                     .values()
                     .any(|s| s.bindings.iter().any(|b| &b.carrier == carrier))
+                    && !rebind
                 {
                     return Err(Error("新段不能复用来源承载位".into()));
                 }
@@ -398,7 +404,21 @@ impl Lineage {
                     turns: source.turns[..count].to_vec(),
                     bindings,
                 };
-                self.record_carrier(segment, carrier, backend_session)?;
+                if rebind {
+                    let source = self.segments.get_mut(from).unwrap();
+                    if let Some(binding) = source.bindings.last_mut() {
+                        binding.to = Some(source.turns.len());
+                    }
+                    self.carriers.insert(
+                        carrier.clone(),
+                        KnownCarrier {
+                            segment: segment.clone(),
+                            backend_session: backend_session.clone(),
+                        },
+                    );
+                } else {
+                    self.record_carrier(segment, carrier, backend_session)?;
+                }
                 self.segments.insert(segment.clone(), target);
                 self.edges.push(Edge {
                     from: from.clone(),
@@ -534,6 +554,7 @@ impl Lineage {
             }
             Event::TurnObserved {
                 carrier,
+                backend_session,
                 key,
                 natives,
                 complete,
@@ -545,7 +566,9 @@ impl Lineage {
                     .find_map(|s| {
                         s.bindings
                             .last()
-                            .filter(|b| &b.carrier == carrier)
+                            .filter(|b| {
+                                &b.carrier == carrier && &b.backend_session == backend_session
+                            })
                             .map(|b| (s.id.clone(), b.clone()))
                     })
                     .ok_or_else(|| Error(format!("未知承载位 {carrier}")))?;
@@ -560,8 +583,24 @@ impl Lineage {
                     })
                     .cloned()
                     .collect();
-                let identity = serde_json::to_string(&(carrier, key)).expect("string tuple");
-                let mut known = self.observed.get(&identity).cloned();
+                let identity =
+                    serde_json::to_string(&(carrier, backend_session, key)).expect("binding tuple");
+                // Old checkpoints keyed observations only by carrier. Reuse an old
+                // round only when its recorded backend session also matches.
+                let legacy = serde_json::to_string(&(carrier, key)).expect("string tuple");
+                let mut known = self
+                    .observed
+                    .get(&identity)
+                    .or_else(|| {
+                        self.observed.get(&legacy).filter(|id| {
+                            self.turns.get(*id).is_some_and(|t| {
+                                t.positions.iter().any(|p| {
+                                    &p.carrier == carrier && &p.backend_session == backend_session
+                                })
+                            })
+                        })
+                    })
+                    .cloned();
                 for id in &self.segment(&segment)?.turns {
                     if landed
                         .iter()

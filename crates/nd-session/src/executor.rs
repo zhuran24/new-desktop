@@ -1382,11 +1382,17 @@ impl Executor {
                     last_assistant,
                 } => {
                     self.ensure_lineage(&batch.carrier)?;
+                    let Some(backend_session) =
+                        self.core.carriers.get(&batch.carrier).map(|c| c.bs.clone())
+                    else {
+                        continue;
+                    };
                     self.core.lineage = self
                         .core
                         .lineage
                         .fold(&LineageEvent::TurnObserved {
                             carrier: batch.carrier.clone(),
+                            backend_session,
                             key: turn,
                             natives,
                             complete,
