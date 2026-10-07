@@ -2241,10 +2241,7 @@ impl Executor {
             });
             return Ok(true);
         };
-        if matches!(
-            &*act,
-            Act::Send { .. } | Act::Configure { .. } | Act::Invoke { .. }
-        ) {
+        if matches!(&*act, Act::Send { .. }) {
             let bs = self.core.carriers[carrier].bs.clone();
             match self.deps.claims.admit(
                 tx,
