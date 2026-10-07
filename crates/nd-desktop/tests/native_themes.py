@@ -22,6 +22,7 @@ def inner():
     daemon = None
     portals = []
     offsets = {}
+    click_after = {}
 
     def start(name):
         for path in ['/sandbox/controls.json', '/sandbox/escape.json']:
@@ -54,7 +55,7 @@ def inner():
     def click(app, name, control):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            for line in reversed((out / f'{name}.jsonl').read_text().splitlines()):
+            for line in reversed((out / f'{name}.jsonl').read_text().splitlines()[click_after.get(name, 0):]):
                 try:
                     data = json.loads(line).get('theme_control')
                 except json.JSONDecodeError:
@@ -71,6 +72,10 @@ def inner():
                                 pass
                         consumed = next((i for i, e in enumerate(events) if e.get('theme_input_consumed') == nonce), None)
                         if consumed is not None and any('theme_control' in e for e in events[consumed + 1:]):
+                            # A theme change can move every menu row. The next
+                            # click must find its own control after this receipt,
+                            # even if only the menu button has painted so far.
+                            click_after[name] = consumed + 1
                             return
                         assert app.poll() is None
                         time.sleep(.02)
