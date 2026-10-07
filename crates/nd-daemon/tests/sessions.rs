@@ -2261,6 +2261,16 @@ async fn a_create_that_never_started_a_backend_is_withdrawn_with_one_notice() {
         "{:#?}",
         runs.items
     );
+    let rejected = fx
+        .command(
+            "withdrawn-send",
+            "session.send",
+            json!({"session":session,"text":"late"}),
+        )
+        .await;
+    assert!(
+        matches!(rejected, CommandReply::Receipt { receipt: Receipt::Rejected { ref code, .. } } if code == "precondition")
+    );
     fx.close();
 }
 
@@ -2285,6 +2295,12 @@ async fn a_create_whose_backend_died_after_the_first_message_was_written_is_part
     // 已拉起的后端会话属于根段；没等到回显的首条提示还不是轮。
     assert_eq!(lineage(&written)["segments"].as_array().unwrap().len(), 1);
     assert!(lineage(&written)["rounds"].as_array().unwrap().is_empty());
+    fx.send("held-before-partial", &session, "queued during creation")
+        .await;
+    fx.wait(&session, "held during create", |s| {
+        prompt(s, "queued during creation").is_some_and(|p| p.data["state"] == "held")
+    })
+    .await;
     let pid = cli_pid(&fx, &written).await;
     signal(pid, rustix::process::Signal::KILL);
     let snapshot = fx
@@ -2306,6 +2322,11 @@ async fn a_create_whose_backend_died_after_the_first_message_was_written_is_part
         "partial"
     );
     assert!(fx.scenario.endpoint().requests().is_empty());
+    let final_state = fx.peek(&session).await;
+    assert_eq!(
+        prompt(&final_state, "queued during creation").unwrap().data["state"],
+        "failed"
+    );
     fx.close();
 }
 
@@ -2324,6 +2345,21 @@ async fn an_idle_backend_is_reclaimed_and_the_next_message_resumes_it() {
         .as_str()
         .unwrap()
         .to_owned();
+    let mut watcher = fx.ui().await;
+    watcher
+        .subscribe(&format!("session/{session}"))
+        .await
+        .unwrap();
+    let watched = tokio::time::Instant::now();
+    while watched.elapsed() < Duration::from_millis(1800) {
+        assert_eq!(
+            listed(&fx, &session).await.unwrap().data["process_alive"],
+            true,
+            "a real subscriber holds the carrier"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    watcher.close().await.unwrap();
     // 没人订阅这个会话：只经列表看它的后端进程还在不在。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while listed(&fx, &session).await.unwrap().data["process_alive"] == true {
@@ -4841,4 +4877,63 @@ impl Drop for WatchdogCut {
     fn drop(&mut self) {
         let _ = std::fs::rename(&self.parked, &self.socket);
     }
+}
+
+#[tokio::test]
+async fn messages_held_during_creation_reach_the_real_cli_in_arrival_order() {
+    let fx = Fixture::start("create-held-order", 3_600_000).await;
+    std::fs::write(
+        fx.scenario.root().join("runtime/backend-fault.json"),
+        r#"{"contains":"hold first"}"#,
+    )
+    .unwrap();
+    for n in 0..3 {
+        fx.scenario
+            .endpoint()
+            .enqueue(fx.main(), ModelReply::text(format!("answer {n}")));
+    }
+    let session = fx
+        .create("held-create", "/sandbox/project", "hold first")
+        .await;
+    let first = fx
+        .wait(&session, "first written before create completes", |s| {
+            prompt(s, "hold first").is_some_and(|p| p.data["state"] == "written")
+        })
+        .await;
+    fx.send("held-second", &session, "second").await;
+    fx.send("held-third", &session, "third").await;
+    fx.wait(&session, "both held", |s| {
+        ["second", "third"]
+            .iter()
+            .all(|text| prompt(s, text).is_some_and(|p| p.data["state"] == "held"))
+    })
+    .await;
+    signal(cli_pid(&fx, &first).await, rustix::process::Signal::CONT);
+    fx.wait(&session, "all original echoes", |s| {
+        ["hold first", "second", "third"]
+            .iter()
+            .all(|text| prompt(s, text).is_some_and(|p| p.data["state"] == "landed"))
+    })
+    .await;
+    let run = header(&first)["process"]["run"].as_str().unwrap();
+    let records =
+        std::fs::read_to_string(fx.scenario.root().join(format!("recordings/{run}.jsonl")))
+            .unwrap();
+    let written: Vec<_> = records
+        .lines()
+        .filter_map(|line| serde_json::from_str::<nd_watchdog_proto::Record>(line).ok())
+        .filter_map(|record| match record.event {
+            nd_watchdog_proto::Event::In { line, .. } => serde_json::from_str::<Value>(&line).ok(),
+            _ => None,
+        })
+        .filter(|frame| frame["type"] == "user")
+        .map(|frame| {
+            frame["message"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(written, ["hold first", "second", "third"]);
+    fx.close();
 }
