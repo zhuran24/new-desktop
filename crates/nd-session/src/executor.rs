@@ -1237,7 +1237,7 @@ impl Executor {
         let lineage = &self.core.lineage;
         let rounds: Vec<_> = lineage
             .current()
-            .map(|id| lineage.turns(id).expect("current segment"))
+            .map(|id| lineage.rounds(id).expect("current segment"))
             .unwrap_or_default()
             .iter()
             .enumerate()

@@ -143,7 +143,7 @@ impl Executor {
         let lineage = &self.core.lineage;
         lineage
             .current()
-            .and_then(|segment| lineage.turns(segment).ok())
+            .and_then(|segment| lineage.rounds(segment).ok())
             .unwrap_or_default()
             .iter()
             .flat_map(|turn| turn.messages.clone())

@@ -187,7 +187,7 @@ fn merged_prompts_share_one_mark_and_old_branch_cursors_cannot_jump_into_a_new_s
                 .unwrap();
         }
     }
-    let merged = lineage.turns("old").unwrap()[0].id.clone();
+    let merged = lineage.rounds("old").unwrap()[0].id.clone();
     lineage = lineage
         .fold(&Event::Branch {
             segment: "new".into(),
@@ -219,7 +219,7 @@ fn merged_prompts_share_one_mark_and_old_branch_cursors_cannot_jump_into_a_new_s
             last_assistant: None,
         })
         .unwrap();
-    let rounds = serde_json::to_value(lineage.turns("new").unwrap()).unwrap();
+    let rounds = serde_json::to_value(lineage.rounds("new").unwrap()).unwrap();
     history.insert(item(
         "lineage",
         "lineage",
