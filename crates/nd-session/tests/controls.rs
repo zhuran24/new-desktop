@@ -4,6 +4,98 @@ use serde_json::json;
 use support::*;
 
 #[tokio::test]
+async fn confirmed_queue_cancellation_returns_an_unknown_send_and_revokes_resend() {
+    use nd_backend::{Act, Done, Outcome, Refusal};
+    let h = Harness::new(config()).await;
+    let session = accepted_session(&h.create("unknown-cancel", "ready").await);
+    h.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    h.adapter
+        .script(ActKind::Send, Reply::Unknown("echo missing".into()));
+    h.send("pending", &session, "confirmed cancelled").await;
+    h.wait(&session, "unknown send", |s| {
+        prompt(s, "confirmed cancelled").is_some_and(|i| i.data["state"] == "unknown")
+    })
+    .await;
+    let original = h
+        .adapter
+        .received()
+        .into_iter()
+        .find(|(_, a)| matches!(a,Act::Send { msg,.. } if msg.text == "confirmed cancelled"))
+        .unwrap()
+        .0;
+    h.adapter
+        .script(ActKind::Interrupt, Reply::Unknown("ack missing".into()));
+    h.sessions
+        .execute(&command(
+            "cancel",
+            "session.interrupt",
+            json!({"session":session,"queued":"cancel"}),
+        ))
+        .await;
+    h.wait(&session, "unknown control", |s| {
+        s.items
+            .iter()
+            .any(|i| i.id == "control/cancel" && i.data["state"] == "unknown")
+    })
+    .await;
+    let control = h
+        .adapter
+        .received()
+        .into_iter()
+        .find(|(_, a)| matches!(a, Act::Interrupt { .. }))
+        .unwrap()
+        .0;
+    h.adapter.clarify(
+        &control,
+        Outcome::Ok {
+            done: Done::Interrupted {
+                cancelled: vec![original.clone()],
+            },
+        },
+    );
+    let snapshot = h
+        .wait(&session, "returned", |s| {
+            prompt(s, "confirmed cancelled").is_some_and(|i| i.data["state"] == "withdrawn")
+        })
+        .await;
+    assert_eq!(item(&snapshot, "draft").data["text"], "confirmed cancelled");
+    h.adapter.clarify(
+        &original,
+        Outcome::Refused {
+            refusal: Refusal::Lost {
+                evidence: "late superseded evidence".into(),
+            },
+        },
+    );
+    // 同一适配器来源中更晚的送达事实充当观察屏障。
+    h.send("later-observation", &session, "later observation")
+        .await;
+    h.wait(&session, "later fact", |s| {
+        prompt(s, "later observation").is_some_and(|i| i.data["state"] == "landed")
+    })
+    .await;
+    assert_eq!(
+        prompt(&h.snapshot(&session), "confirmed cancelled")
+            .unwrap()
+            .data["state"],
+        "withdrawn"
+    );
+    let reply = h
+        .sessions
+        .execute(&command(
+            "resend-cancelled",
+            "session.resend",
+            json!({"session":session,"message":"pending"}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply,nd_wire::CommandReply::Receipt { receipt:nd_wire::Receipt::Rejected { code,.. } } if code == "precondition")
+    );
+}
+
+#[tokio::test]
 async fn late_withdrawal_confirmation_restores_the_original_draft_once() {
     let h = Harness::new(config()).await;
     let session = accepted_session(&h.create("clarify-withdraw", "ready").await);

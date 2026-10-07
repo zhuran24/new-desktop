@@ -1338,8 +1338,10 @@ impl Actor {
                                                 .into_iter()
                                                 .flatten()
                                                 .filter_map(|id| {
-                                                    id.as_str()
-                                                        .and_then(|id| self.pending.remove(id))
+                                                    id.as_str().and_then(|id| {
+                                                        self.writes.remove(id);
+                                                        self.pending.remove(id)
+                                                    })
                                                 })
                                                 .collect();
                                             Outcome::Ok {
@@ -1351,7 +1353,9 @@ impl Actor {
                                         match body["response"]["cancelled"].as_bool() {
                                             Some(cancelled) => {
                                                 if cancelled {
-                                                    self.pending.remove(&native_uuid(&send));
+                                                    let uuid = native_uuid(&send);
+                                                    self.writes.remove(&uuid);
+                                                    self.pending.remove(&uuid);
                                                 }
                                                 Outcome::Ok {
                                                     done: Done::Withdrawn { ok: cancelled },

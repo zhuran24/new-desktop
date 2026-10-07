@@ -386,7 +386,7 @@ impl Executor {
                 .map(|row| {
                     if matches!(row.act, Act::Send { .. }) {
                         let arrival = match &row.issuer {
-                            Issuer::Message { id } => {
+                            Issuer::Message { id, .. } => {
                                 self.core.messages.get(id).map_or(0, |m| m.arrival)
                             }
                             _ => 0,
@@ -779,10 +779,24 @@ impl Executor {
 
     fn restore_withdrawn(
         &mut self,
-        tx: &Tx<'_>,
+        tx: &mut Tx<'_>,
         fx: &mut Effects,
         message: &Message,
     ) -> nd_store::Result<()> {
+        if let Some(send) = &message.ticket {
+            if let Some(mut row) = self.core.uncertain.remove(send) {
+                row.outcome = None;
+                self.core.outbox.insert(send.clone(), row);
+            }
+            self.record_outcome(
+                tx,
+                fx,
+                send,
+                Outcome::Refused {
+                    refusal: Refusal::Withdrawn,
+                },
+            )?;
+        }
         self.core.messages.remove(&message.id);
         self.show_message(tx, fx, message, "withdrawn", None)
     }
@@ -1390,16 +1404,6 @@ impl Executor {
                     Outcome::Ok {
                         done: Done::Withdrawn { ok: true },
                     } => {
-                        if let Some(send) = &message.ticket {
-                            self.record_outcome(
-                                tx,
-                                fx,
-                                send,
-                                Outcome::Refused {
-                                    refusal: Refusal::Withdrawn,
-                                },
-                            )?;
-                        }
                         self.restore_withdrawn(tx, fx, &message)?;
                         self.refill_draft(tx, &id, &restore, std::slice::from_ref(&message))?;
                         "withdrawn"
@@ -1450,26 +1454,33 @@ impl Executor {
                     done: Done::Interrupted { cancelled },
                 } = &outcome
                 {
-                    held.extend(
-                        self.core
+                    for send in cancelled {
+                        if let Some(message) = self
+                            .core
                             .messages
                             .values()
-                            .filter(|m| m.ticket.as_ref().is_some_and(|t| cancelled.contains(t)))
-                            .cloned(),
-                    );
+                            .find(|m| m.ticket.as_ref() == Some(send))
+                        {
+                            held.push(message.clone());
+                        } else if let Some(row) = self.core.uncertain.get(send)
+                            && let (Act::Send { msg, .. }, Issuer::Message { id, arrival }) =
+                                (&row.act, &row.issuer)
+                        {
+                            held.push(Message {
+                                id: id.clone(),
+                                text: msg.text.clone(),
+                                attachments: msg.attachments.clone(),
+                                intent: msg.intent,
+                                ticket: Some(send.clone()),
+                                attempt: 0,
+                                waiting: None,
+                                arrival: *arrival,
+                            });
+                        }
+                    }
                 }
                 held.sort_by_key(|m| m.arrival);
                 for message in &held {
-                    if let Some(send) = &message.ticket {
-                        self.record_outcome(
-                            tx,
-                            fx,
-                            send,
-                            Outcome::Refused {
-                                refusal: Refusal::Withdrawn,
-                            },
-                        )?;
-                    }
                     self.restore_withdrawn(tx, fx, message)?;
                 }
                 if let Some(restore) = restore {
@@ -1539,7 +1550,7 @@ impl Executor {
                 }
                 self.core.ops.insert(op, record);
             }
-            Issuer::Message { id } => {
+            Issuer::Message { id, .. } => {
                 if matches!(
                     outcome,
                     Outcome::Refused {
@@ -2271,7 +2282,10 @@ impl Executor {
                             },
                         },
                         kind: carrier.kind.clone(),
-                        issuer: Issuer::Message { id: m.id.clone() },
+                        issuer: Issuer::Message {
+                            id: m.id.clone(),
+                            arrival: m.arrival,
+                        },
                         display: Some(m.id.clone()),
                         outcome: None,
                         handed: false,

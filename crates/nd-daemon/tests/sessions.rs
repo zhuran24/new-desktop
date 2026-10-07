@@ -588,6 +588,23 @@ async fn native_controls_send_withdraw_reopen_and_dispatch_escape() {
     let output = std::env::var_os("ND18_NATIVE_OUTPUT")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| fx.scenario.root().join("native-controls"));
+    // 输出目录可供复验复用；上一轮的协调文件不能充当本轮的时序证据。
+    std::fs::create_dir_all(&output).unwrap();
+    for marker in [
+        "arm-withdraw",
+        "armed",
+        "ui-killed",
+        "resumed",
+        "wait-now",
+        "now-started",
+        "result.json",
+    ] {
+        match std::fs::remove_file(output.join(marker)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove stale native marker {marker}: {error}"),
+        }
+    }
     let mut child = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_controls.py"))
         .arg("--desktop")

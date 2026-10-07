@@ -93,6 +93,8 @@ pub enum Issuer {
     },
     Message {
         id: String,
+        #[serde(default)]
+        arrival: u64,
     },
     Control {
         id: String,
