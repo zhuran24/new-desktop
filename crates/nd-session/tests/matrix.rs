@@ -586,3 +586,144 @@ async fn attached_draft_conflict_and_send_consumption_recover_at_every_commit_po
     })
     .await;
 }
+
+fn invoke_state(s: &Snapshot, id: &str) -> Option<String> {
+    s.items
+        .iter()
+        .find(|i| i.id == format!("invoke/{id}"))
+        .and_then(|i| i.data["state"].as_str().map(str::to_owned))
+}
+
+fn receipt(h: &Harness, id: &str) -> nd_wire::Receipt {
+    match nd_ledger::lookup(&h.store, id, None).unwrap() {
+        nd_wire::ReceiptLookup::Found { receipt } => receipt,
+        other => panic!("no receipt for {id}: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn summarize_from_here_backfills_the_draft_once_at_every_commit_point() {
+    let session = session_id_for("matrix-sum-create");
+    matrix(Scenario {
+        name: "compact/from-ok",
+        uploads: vec![],
+        script: vec![],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-sum-create", "第一条"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "matrix-sum-send",
+                    "session.send",
+                    json!({"session":session,"text":"第二条"}),
+                ),
+                until: |s| prompt(s, "第二条").is_some_and(|p| p.data["state"] == "landed"),
+            },
+            Step {
+                command: nd_wire::Command {
+                    id: "matrix-sum-draft".into(),
+                    device: "a".into(),
+                    name: "session.draft.update".into(),
+                    args: json!({"session":session,"text":"旧稿"}),
+                    expect: json!({"draft_version":0}),
+                },
+                until: |s| item(s, "draft").data["version"] == 1,
+            },
+            Step {
+                command: command(
+                    "matrix-sum",
+                    "session.compact",
+                    json!({"session":session,"message":"matrix-sum-send","scope":"from"}),
+                ),
+                until: |s| invoke_state(s, "matrix-sum").as_deref() == Some("done"),
+            },
+        ],
+        check: |h, s| {
+            assert_eq!(
+                applied_counts(h).get("invoke:compact:From:第二条"),
+                Some(&1)
+            );
+            let d = &item(s, "draft").data;
+            assert_eq!(d["text"], "第二条", "{d}");
+            assert_eq!(d["version"], 2, "backfilled exactly once: {d}");
+            let saved = d["saved"].as_array().unwrap();
+            assert_eq!(saved.len(), 1, "{d}");
+            assert_eq!(saved[0]["text"], "旧稿");
+            assert_eq!(item(s, "lineage").data["summarized"], json!(["matrix-sum-send"]));
+            let nd_wire::Receipt::Done { value } = receipt(h, "matrix-sum") else {
+                panic!("compact receipt is not Done");
+            };
+            assert_eq!(value["draft"]["text"], "第二条");
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bang_whose_result_is_lost_is_unknown_and_never_rerun_at_every_commit_point() {
+    let session = session_id_for("matrix-bang-create");
+    matrix(Scenario {
+        name: "shell/unknown",
+        uploads: vec![],
+        script: vec![(ActKind::Invoke, Reply::Unknown("mod 重载".into()))],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-bang-create", "你好"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "matrix-bang",
+                    "session.shell",
+                    json!({"session":session,"command":"pwd"}),
+                ),
+                until: |s| invoke_state(s, "matrix-bang").as_deref() == Some("unknown"),
+            },
+        ],
+        check: |h, _| {
+            assert_eq!(applied_counts(h).get("invoke:shell:pwd?"), Some(&1));
+            assert!(
+                matches!(receipt(h, "matrix-bang"), nd_wire::Receipt::Unknown { .. }),
+                "an unknown bang keeps an Unknown receipt"
+            );
+        },
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subtask_dispatches_one_fork_subagent_at_every_commit_point() {
+    let session = session_id_for("matrix-fork-create");
+    matrix(Scenario {
+        name: "subtask/ok",
+        uploads: vec![],
+        script: vec![],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create("matrix-fork-create", "你好"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "matrix-fork",
+                    "session.subtask",
+                    json!({"session":session,"prompt":"查资料"}),
+                ),
+                until: |s| invoke_state(s, "matrix-fork").as_deref() == Some("done"),
+            },
+        ],
+        check: |h, _| {
+            assert_eq!(applied_counts(h).get("invoke:fork:查资料"), Some(&1));
+            let nd_wire::Receipt::Done { value } = receipt(h, "matrix-fork") else {
+                panic!("subtask receipt is not Done");
+            };
+            assert!(value["agent"].as_str().is_some_and(|a| a.starts_with("agent-")));
+        },
+    })
+    .await;
+}

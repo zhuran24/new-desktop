@@ -302,8 +302,20 @@ impl ScriptedAdapter {
                         },
                     ),
                     done(Outcome::Ok {
-                        done: Done::Landed { native },
+                        done: Done::Landed {
+                            native: native.clone(),
+                        },
                     }),
+                    // 后端确认的实际回合：一条消息一轮（谱系据此开轮，总结据此定位）。
+                    fact(
+                        &format!("turn:{ticket}"),
+                        FactBody::TurnMapped {
+                            turn: format!("turn-{native}"),
+                            natives: vec![native],
+                            complete: true,
+                            last_assistant: None,
+                        },
+                    ),
                 ]
             }
             (Act::Send { msg, .. }, Reply::Unknown(why)) => {
