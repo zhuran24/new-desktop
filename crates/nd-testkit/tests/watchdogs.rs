@@ -142,9 +142,12 @@ async fn storage_failure_reports_lost_lines_and_never_claims_a_clean_tail() {
 async fn backend_exit_cleans_descendants_even_without_daemon_and_watchdog_never_restarts() {
     let scenario = Scenario::start(options("exit-cleanup")).await.unwrap();
     let script = "import subprocess,sys,os\np=subprocess.Popen(['sleep','60'])\nprint(p.pid,flush=True)\nsys.stdin.readline()\nos._exit(7)";
-    let spec = scenario
+    let mut spec = scenario
         .watchdog_spec("exit", "/usr/bin/python3", &["-u", "-c", script])
         .unwrap();
+    spec.limits.soft_bytes = 0;
+    spec.limits.hard_bytes = 0;
+    let overflow = spec.limits.overflow.clone();
     let runs = scenario.watchdogs().unwrap();
     let launch = runs.launch("exit", spec.clone()).await.unwrap();
     let mut link = runs.link("exit").await.unwrap();
@@ -170,13 +173,33 @@ async fn backend_exit_cleans_descendants_even_without_daemon_and_watchdog_never_
     .unwrap();
     assert!(runs.launch("exit", spec).await.is_err());
     let found = runs.recover().await.unwrap();
-    assert_eq!(found[0].state, "Gone");
+    assert!(found[0].state.is_gone());
     assert_eq!(found[0].exit, Some(7));
     assert!(
         runs.records("exit", 0, 100)
             .unwrap()
             .iter()
             .any(|r| matches!(r.event, nd_watchdog_proto::Event::Exit { code: 7 }))
+    );
+    assert_eq!(
+        runs.collect_unused(&std::collections::BTreeSet::from(["exit".to_owned()]))
+            .unwrap(),
+        0,
+        "a committed reference keeps the unread tail"
+    );
+    assert!(runs.directory("exit").unwrap().exists());
+    assert_eq!(runs.collect_unused(&Default::default()).unwrap(), 1);
+    assert!(!runs.directory("exit").unwrap().exists());
+    assert!(!overflow.exists());
+    assert_eq!(
+        runs.inspect().unwrap()[0].exit,
+        Some(7),
+        "compact tombstone preserves the exit"
+    );
+    let spec = scenario.watchdog_spec("exit", "/usr/bin/cat", &[]).unwrap();
+    assert!(
+        runs.launch("exit", spec).await.is_err(),
+        "collection must not allow launch replay"
     );
     scenario.close().unwrap();
 }
@@ -415,7 +438,10 @@ async fn live_process_without_its_expected_unit_is_identity_mismatch_not_gone() 
     wrong.unit_prefix.push_str("-absent");
     let wrong = nd_runs::Watchdogs::new(wrong).unwrap();
     assert!(wrong.link("live").await.is_err());
-    assert_eq!(wrong.recover().await.unwrap()[0].state, "IdentityMismatch");
+    assert_eq!(
+        wrong.recover().await.unwrap()[0].state,
+        nd_runs::RunState::IdentityMismatch
+    );
     assert!(launched.identity.alive());
     scenario.close().unwrap();
 }
@@ -518,7 +544,7 @@ async fn watchdog_death_cleans_backend_and_cannot_replay_the_launch() {
     .await
     .unwrap();
     assert!(runs.launch("dead", spec).await.is_err());
-    assert_eq!(runs.recover().await.unwrap()[0].state, "Gone");
+    assert!(runs.recover().await.unwrap()[0].state.is_gone());
     scenario.close().unwrap();
 }
 
@@ -576,8 +602,13 @@ async fn failed_backend_spawn_reports_never_launched_with_no_live_identity() {
     assert!(runs.launch("missing", spec).await.is_err());
     tokio::time::sleep(Duration::from_millis(100)).await;
     let found = runs.recover().await.unwrap();
-    assert_eq!(found[0].state, "Gone");
-    assert_eq!(found[0].reason.as_deref(), Some("NeverLaunched"));
+    assert!(found[0].state.is_gone());
+    assert_eq!(
+        found[0].state,
+        nd_runs::RunState::Gone {
+            reason: nd_runs::GoneReason::NeverLaunched
+        }
+    );
     assert!(found[0].identity.is_none());
     scenario.close().unwrap();
 }

@@ -484,3 +484,28 @@ fn read_settings<'de, D: serde::Deserializer<'de>>(
 ) -> Result<nd_backend::LiveSettings, D::Error> {
     Ok(Option::<nd_backend::LiveSettings>::deserialize(de)?.unwrap_or_default())
 }
+
+/// Gone 流水回收的持久引用屏障，包括未结和交付不明的 Open 票。
+pub fn referenced_runs(
+    store: &nd_store::Store,
+) -> nd_store::Result<std::collections::BTreeSet<String>> {
+    let db = store.read()?;
+    let mut stmt = db.prepare("SELECT core FROM sessions")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut runs = std::collections::BTreeSet::new();
+    for row in rows {
+        let core: Core = serde_json::from_str(&row?).map_err(corrupt)?;
+        runs.extend(
+            core.carriers
+                .values()
+                .filter_map(|c| c.run.as_ref())
+                .map(|r| r.0.clone()),
+        );
+        for row in core.outbox.values().chain(core.uncertain.values()) {
+            if let nd_backend::Act::Open { run, .. } = &row.act {
+                runs.insert(run.0.clone());
+            }
+        }
+    }
+    Ok(runs)
+}

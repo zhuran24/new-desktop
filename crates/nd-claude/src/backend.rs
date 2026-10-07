@@ -375,17 +375,11 @@ impl Inner {
     }
 
     async fn inspect(&self, run: &RunId) -> Option<Found> {
-        let watchdogs = self.watchdogs.clone();
-        let run = run.0.clone();
-        tokio::task::spawn_blocking(move || {
-            watchdogs
-                .inspect()
-                .ok()
-                .and_then(|found| found.into_iter().find(|f| f.run == run))
-        })
-        .await
-        .ok()
-        .flatten()
+        self.watchdogs
+            .inspect_run_async(&run.0)
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn observe(&self, observation: Observed) {
@@ -397,7 +391,7 @@ impl Inner {
         let claims = self.claims.clone();
         let generation = self.generation;
         let _ = tokio::task::spawn_blocking(move || {
-            claims.observe_watchdog(&found, generation, nd_claims::BackendKind::Claude)
+            claims.observe(found.observation(generation, nd_claims::BackendKind::Claude))
         })
         .await;
     }
@@ -423,11 +417,11 @@ impl Inner {
                     .await;
                     return true;
                 }
-                Some(found) if found.state == "Gone" => {
+                Some(found) if found.state.is_gone() => {
                     self.observe_found(found).await;
                     return true;
                 }
-                Some(found) if found.state == "Up" && kill && !killed => {
+                Some(found) if found.state == nd_runs::RunState::Up && kill && !killed => {
                     self.observe_found(found).await;
                     if let Ok(mut link) = self.watchdogs.link(&run.0).await {
                         let _ = link.finish(Finish::Kill).await;
@@ -900,11 +894,11 @@ impl Inner {
         let mut delay = Duration::from_millis(50);
         let adopted = loop {
             match self.inspect(&run).await {
-                Some(found) if found.state == "Gone" => {
+                Some(found) if found.state.is_gone() => {
                     self.observe_found(found).await;
                     break None;
                 }
-                Some(found) if found.state == "Up" => {
+                Some(found) if found.state == nd_runs::RunState::Up => {
                     if let Some(caps) = caps.clone()
                         && let Ok(adopted) = self.claude.adopt(&run.0, &bs, caps).await
                     {
@@ -1801,7 +1795,7 @@ impl Actor {
                     return self.process(rest, None).await;
                 }
                 match self.inner.inspect(&self.run_id).await {
-                    Some(found) if found.state != "Gone" => return false,
+                    Some(found) if !found.state.is_gone() => return false,
                     _ => return self.process(vec![], Some(-1)).await,
                 }
             }

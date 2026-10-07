@@ -4162,7 +4162,6 @@ name = "nd-claims"
 version = "0.1.0"
 dependencies = [
  "nd-claude-records",
- "nd-runs",
  "nd-store",
  "nd-watchdog-proto",
  "notify",
@@ -4315,10 +4314,13 @@ name = "nd-runs"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "nd-claims",
+ "nd-store",
  "nd-watchdog-proto",
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

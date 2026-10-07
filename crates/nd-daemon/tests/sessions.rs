@@ -2313,6 +2313,19 @@ async fn an_idle_backend_is_reclaimed_and_the_next_message_resumes_it() {
         "{:#?}",
         runs.items
     );
+    let run_dir = fx
+        .scenario
+        .watchdogs()
+        .unwrap()
+        .directory(&first_run)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while run_dir.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("committed Gone run must release its runtime spool directory");
     endpoint.enqueue(fx.main(), ModelReply::text("第二轮"));
     fx.send("idle-send", &session, "继续").await;
     let after = fx

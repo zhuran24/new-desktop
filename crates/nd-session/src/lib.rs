@@ -233,6 +233,11 @@ pub fn session_id_for(command_id: &str) -> SessionId {
 }
 
 impl Sessions {
+    /// 已提交会话状态仍引用的 run；供看守回收使用，不能以展示列表代替此集合。
+    pub fn referenced_runs(&self) -> nd_store::Result<std::collections::BTreeSet<String>> {
+        state::referenced_runs(&self.deps.store)
+    }
+
     /// 建表、读回列表。独占登记的变化会唤醒全部装载中的会话（放行可能变了）。
     pub fn new(
         store: Arc<Store>,

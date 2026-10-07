@@ -17,6 +17,7 @@ pub struct Config {
 fn default_memory_max() -> u64 {
     2 * 1024 * 1024 * 1024
 }
+#[derive(Clone)]
 pub struct Watchdogs {
     config: Config,
 }
@@ -25,16 +26,91 @@ pub struct Launched {
     pub identity: Identity,
     pub unit: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state")]
+pub enum RunState {
+    Up,
+    Gone { reason: GoneReason },
+    IdentityMismatch,
+}
+impl std::fmt::Display for RunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Up => "Up",
+            Self::Gone { .. } => "Gone",
+            Self::IdentityMismatch => "IdentityMismatch",
+        })
+    }
+}
+impl RunState {
+    pub fn is_gone(self) -> bool {
+        matches!(self, Self::Gone { .. })
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GoneReason {
+    NeverLaunched,
+    Exited,
+    ProcGone,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tail {
+    Available,
+    Unknown,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Found {
     pub run: String,
     pub identity: Option<Identity>,
-    pub state: String,
+    #[serde(flatten)]
+    pub state: RunState,
     pub high: u64,
     pub exit: Option<i32>,
-    pub tail: String,
-    pub reason: Option<String>,
+    pub tail: Tail,
     pub detail: Option<String>,
+}
+impl Found {
+    /// 看守报告方把已核实的进程事实交给独占登记；无法核实的身份继续拒写。
+    pub fn observation(
+        &self,
+        generation: u64,
+        kind: nd_claims::BackendKind,
+    ) -> nd_claims::Observed {
+        use nd_claims::{GoneHow, Observed};
+        let run = self.run.clone();
+        match (self.state, self.identity.as_ref()) {
+            (RunState::Up, Some(identity)) if identity.matching() == Some(true) => Observed::Up {
+                run,
+                identity: identity.clone(),
+                generation,
+                kind,
+            },
+            (
+                RunState::Gone {
+                    reason: reason @ (GoneReason::ProcGone | GoneReason::Exited),
+                },
+                Some(identity),
+            ) if identity.matching() == Some(false) => Observed::Gone {
+                run,
+                identity: Some(identity.clone()),
+                how: match reason {
+                    GoneReason::Exited => GoneHow::Exited,
+                    _ => GoneHow::ProcGone,
+                },
+            },
+            (
+                RunState::Gone {
+                    reason: GoneReason::NeverLaunched,
+                },
+                None,
+            ) => Observed::Gone {
+                run,
+                identity: None,
+                how: GoneHow::NeverLaunched,
+            },
+            _ => Observed::IdentityMismatch { run },
+        }
+    }
 }
 fn valid(s: &str) -> bool {
     !s.is_empty() && s.len() < 100 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -93,6 +169,9 @@ impl Watchdogs {
     pub async fn launch(&self, run: &str, spec: LaunchSpec) -> Result<Launched> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         let directory = self.directory(run)?;
+        if self.archive(run)?.exists() {
+            return Err("run already collected; cannot replay launch".into());
+        }
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -125,7 +204,7 @@ impl Watchdogs {
             )?;
         }
         // Spec publication can precede a daemon crash. Retry only before any watchdog started.
-        if !directory.join("started").exists() && self.unit_group(run)?.is_none() {
+        if !directory.join("started").exists() && self.unit_group_async(run).await?.is_none() {
             let mut cmd = command("systemd-run");
             cmd.args([
                 "--user",
@@ -153,7 +232,7 @@ impl Watchdogs {
                 .arg(&self.config.watchdog)
                 .arg("--spec")
                 .arg(&path);
-            let out = cmd.output()?;
+            let out = tokio::task::spawn_blocking(move || cmd.output()).await??;
             if !out.status.success() {
                 return Err(String::from_utf8_lossy(&out.stderr).to_string().into());
             }
@@ -161,9 +240,9 @@ impl Watchdogs {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(found) = self
-                    .inspect()?
-                    .into_iter()
-                    .find(|f| f.run == run && f.state == "Up")
+                    .inspect_run_async(run)
+                    .await?
+                    .filter(|f| f.state == RunState::Up)
                 {
                     return Ok(Launched {
                         identity: found.identity.ok_or("missing live identity")?,
@@ -177,7 +256,9 @@ impl Watchdogs {
                     )
                     .into());
                 }
-                if directory.join("hello.json").exists() && self.unit_group(run)?.is_none() {
+                if directory.join("hello.json").exists()
+                    && self.unit_group_async(run).await?.is_none()
+                {
                     return Err("run already ended; use recover".into());
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -190,7 +271,8 @@ impl Watchdogs {
         let expected: Hello =
             serde_json::from_slice(&std::fs::read(directory.join("hello.json"))?)?;
         let group = self
-            .unit_group(run)?
+            .unit_group_async(run)
+            .await?
             .ok_or("IdentityMismatch: unit absent")?;
         if !in_group(&expected.identity, &group) || !in_group(&expected.watchdog, &group) {
             return Err("IdentityMismatch: cgroup".into());
@@ -216,8 +298,8 @@ impl Watchdogs {
             return Err("IdentityMismatch".into());
         }
         // 旧看守尚无 accepted；从保留流水补齐在途输入，不能只信 written。
-        if hello.accepted == 0 {
-            hello.accepted = hello.written;
+        if hello.accepted.is_none() {
+            let mut accepted = hello.written;
             let mut cursor = 0;
             loop {
                 let rows = read_records(&directory, cursor, MAX_RECORDS_PER_READ)?;
@@ -226,7 +308,7 @@ impl Watchdogs {
                 }
                 for row in &rows {
                     match row.event {
-                        Event::In { in_seq, .. } => hello.accepted = hello.accepted.max(in_seq),
+                        Event::In { in_seq, .. } => accepted = accepted.max(in_seq),
                         Event::Gap {
                             reason: GapReason::LostLines,
                         } => return Err("legacy watchdog input watermark unavailable".into()),
@@ -235,6 +317,7 @@ impl Watchdogs {
                     cursor = row.end_seq;
                 }
             }
+            hello.accepted = Some(accepted);
         }
         Ok(WatchLink {
             socket: Some(socket),
@@ -243,12 +326,13 @@ impl Watchdogs {
     }
     /// Startup claims each still-live controller once, reads hello, and never acknowledges output.
     pub async fn recover(&self) -> Result<Vec<Found>> {
-        let mut found = self.inspect()?;
+        let this = self.clone();
+        let mut found = tokio::task::spawn_blocking(move || this.inspect()).await??;
         for run in &mut found {
-            if run.state == "Up" {
+            if run.state == RunState::Up {
                 match self.link(&run.run).await {
                     Ok(link) => run.high = link.hello.high,
-                    Err(_) => run.state = "IdentityMismatch".into(),
+                    Err(_) => run.state = RunState::IdentityMismatch,
                 }
             }
         }
@@ -275,67 +359,126 @@ impl Watchdogs {
         let group = String::from_utf8(out.stdout)?.trim().to_owned();
         Ok((!group.is_empty()).then_some(group))
     }
+    async fn unit_group_async(&self, run: &str) -> Result<Option<String>> {
+        let this = self.clone();
+        let run = run.to_owned();
+        tokio::task::spawn_blocking(move || this.unit_group(&run)).await?
+    }
+    pub async fn inspect_run_async(&self, run: &str) -> Result<Option<Found>> {
+        let this = self.clone();
+        let run = run.to_owned();
+        tokio::task::spawn_blocking(move || this.inspect_run(&run)).await?
+    }
+    fn archive(&self, run: &str) -> Result<PathBuf> {
+        self.directory(run)?;
+        Ok(self.config.root.join(format!("{run}.gone.json")))
+    }
     /// Read-only diagnostics never acquire the adapter's control connection.
     pub fn inspect(&self) -> Result<Vec<Found>> {
-        let mut found = vec![];
+        let mut runs = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&self.config.root)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type()?.is_dir() {
+                runs.insert(name);
+            } else if let Some(run) = name.strip_suffix(".gone.json") {
+                runs.insert(run.to_owned());
+            }
+        }
+        runs.into_iter()
+            .filter_map(|run| self.inspect_run(&run).transpose())
+            .collect()
+    }
+    pub fn inspect_run(&self, run: &str) -> Result<Option<Found>> {
+        let directory = self.directory(run)?;
+        if self.archive(run)?.exists() {
+            return Ok(Some(serde_json::from_slice(&std::fs::read(
+                self.archive(run)?,
+            )?)?));
+        }
+        if !directory.exists() {
+            return Ok(None);
+        }
+        let saved = std::fs::read(directory.join("hello.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Hello>(&b).ok());
+        let group = self.unit_group(&run);
+        let state = match (&saved, &group) {
+            (Some(h), Ok(Some(group)))
+                if h.identity.alive()
+                    && h.watchdog.alive()
+                    && in_group(&h.identity, group)
+                    && in_group(&h.watchdog, group) =>
+            {
+                RunState::Up
+            }
+            (Some(h), Ok(None))
+                if h.identity.matching() == Some(false) && h.watchdog.matching() == Some(false) =>
+            {
+                RunState::Gone {
+                    reason: if h.exit.is_some() {
+                        GoneReason::Exited
+                    } else {
+                        GoneReason::ProcGone
+                    },
+                }
+            }
+            (None, Ok(None))
+                if !directory.join("started").exists()
+                    || directory.join("failed.json").exists() =>
+            {
+                RunState::Gone {
+                    reason: GoneReason::NeverLaunched,
+                }
+            }
+            _ => RunState::IdentityMismatch,
+        };
+        Ok(Some(Found {
+            detail: group.as_ref().err().map(ToString::to_string),
+            tail: tail_state(&directory),
+            run: run.to_owned(),
+            identity: saved.as_ref().map(|h| h.identity.clone()),
+            state,
+            high: saved.as_ref().map_or(0, |h| h.high),
+            exit: saved.and_then(|h| h.exit),
+        }))
+    }
+    /// 调用方提供持久会话状态的引用集合；仅回收已 Gone 且无人引用的流水。
+    /// 小墓碑保留诊断和 run 幂等性；它不需要 systemctl，也不保存流水。
+    pub fn collect_unused(&self, referenced: &std::collections::BTreeSet<String>) -> Result<usize> {
+        let mut collected = 0;
         for entry in std::fs::read_dir(&self.config.root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
             }
             let run = entry.file_name().to_string_lossy().into_owned();
-            let saved = std::fs::read(entry.path().join("hello.json"))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Hello>(&b).ok());
-            let group = self.unit_group(&run);
-            let state = match (&saved, &group) {
-                (Some(h), Ok(Some(group)))
-                    if h.identity.alive()
-                        && h.watchdog.alive()
-                        && in_group(&h.identity, group)
-                        && in_group(&h.watchdog, group) =>
-                {
-                    "Up"
-                }
-                (Some(h), Ok(None))
-                    if h.identity.matching() == Some(false)
-                        && h.watchdog.matching() == Some(false) =>
-                {
-                    "Gone"
-                }
-                (None, Ok(None))
-                    if !entry.path().join("started").exists()
-                        || entry.path().join("failed.json").exists() =>
-                {
-                    "Gone"
-                }
-                _ => "IdentityMismatch",
+            if referenced.contains(&run) {
+                continue;
+            }
+            let Some(found) = self.inspect_run(&run)? else {
+                continue;
             };
-            let reason = if state == "Gone" {
-                Some(
-                    match &saved {
-                        None => "NeverLaunched",
-                        Some(h) if h.exit.is_some() => "Exited",
-                        Some(_) => "ProcGone",
-                    }
-                    .into(),
-                )
-            } else {
-                None
-            };
-            found.push(Found {
-                reason,
-                detail: group.as_ref().err().map(ToString::to_string),
-                tail: tail_state(&entry.path()),
-                run,
-                identity: saved.as_ref().map(|h| h.identity.clone()),
-                state: state.into(),
-                high: saved.as_ref().map_or(0, |h| h.high),
-                exit: saved.and_then(|h| h.exit),
-            });
+            if !found.state.is_gone() {
+                continue;
+            }
+            private_json(&self.archive(&run)?, &found)?;
+            if let Ok(bytes) = std::fs::read(entry.path().join("journal.json")) {
+                let manifest: JournalManifest = serde_json::from_slice(&bytes)?;
+                // 只删除这个 run 专属目录；自定义共享目录不递归删除。
+                if manifest
+                    .overflow
+                    .file_name()
+                    .is_some_and(|name| name == run.as_str())
+                    && manifest.overflow.exists()
+                {
+                    std::fs::remove_dir_all(manifest.overflow)?;
+                }
+            }
+            std::fs::remove_dir_all(entry.path())?;
+            collected += 1;
         }
-        found.sort_by(|a, b| a.run.cmp(&b.run));
-        Ok(found)
+        Ok(collected)
     }
     pub fn records(&self, run: &str, after: u64, limit: usize) -> Result<Vec<Record>> {
         read_records(&self.directory(run)?, after, limit)
@@ -404,18 +547,17 @@ impl WatchLink {
     }
 }
 
-fn tail_state(directory: &std::path::Path) -> String {
+fn tail_state(directory: &std::path::Path) -> Tail {
     if directory.join("lost.json").exists()
         || std::fs::read(directory.join("stats.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<Stats>(&b).ok())
             .is_some_and(|s| s.lost_lines)
     {
-        "Unknown"
+        Tail::Unknown
     } else {
-        "Available"
+        Tail::Available
     }
-    .into()
 }
 
 fn in_group(identity: &Identity, group: &str) -> bool {

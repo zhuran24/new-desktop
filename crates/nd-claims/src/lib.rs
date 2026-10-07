@@ -885,51 +885,6 @@ impl Exclusivity {
 }
 
 impl Exclusivity {
-    /// Consume #6's already cgroup-checked observation. /proc is read before entering SQLite.
-    /// An unknown reason, missing identity, or still-live process never releases a lease.
-    pub fn observe_watchdog(
-        &self,
-        found: &nd_runs::Found,
-        generation: u64,
-        kind: BackendKind,
-    ) -> Result<()> {
-        let run = found.run.clone();
-        let observation = match (
-            found.state.as_str(),
-            found.identity.as_ref(),
-            found.reason.as_deref(),
-        ) {
-            ("Up", Some(identity), _) if identity.matching() == Some(true) => Observed::Up {
-                run,
-                identity: identity.clone(),
-                generation,
-                kind,
-            },
-            ("Gone", Some(identity), Some(reason @ ("ProcGone" | "Exited")))
-                if identity.matching() == Some(false) =>
-            {
-                Observed::Gone {
-                    run,
-                    identity: Some(identity.clone()),
-                    how: if reason == "Exited" {
-                        GoneHow::Exited
-                    } else {
-                        GoneHow::ProcGone
-                    },
-                }
-            }
-            ("Gone", None, Some("NeverLaunched")) => Observed::Gone {
-                run,
-                identity: None,
-                how: GoneHow::NeverLaunched,
-            },
-            _ => Observed::IdentityMismatch { run },
-        };
-        self.observe(observation)
-    }
-}
-
-impl Exclusivity {
     /// Invalidation stream for the registry/session owner. After a change, re-read peek/lease/externals.
     /// Persisted state is authoritative; coalesced notifications never carry responsibilities.
     pub fn watch(&self) -> tokio::sync::watch::Receiver<u64> {

@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         watchdog: Identity::read(std::process::id())?,
         high: 0,
         written: 0,
-        accepted: 0,
+        accepted: Some(0),
         exit: None,
     };
     private_json(&spec.directory.join("hello.json"), &hello)?;
@@ -254,7 +254,8 @@ async fn main() -> Result<()> {
                                 }
                                 {
                                     let mut state = state.lock().await;
-                                    state.hello.accepted = state.hello.accepted.max(in_seq);
+                                    state.hello.accepted =
+                                        Some(state.hello.accepted.unwrap_or(0).max(in_seq));
                                 }
                                 let (tx, rx) = oneshot::channel();
                                 inputs.send((request, tx)).await?;

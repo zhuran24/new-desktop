@@ -503,7 +503,7 @@ async fn assemble_sessions(
         for found in watchdogs.recover().await? {
             let claims = claims.clone();
             tokio::task::spawn_blocking(move || {
-                claims.observe_watchdog(&found, generation, nd_claims::BackendKind::Claude)
+                claims.observe(found.observation(generation, nd_claims::BackendKind::Claude))
             })
             .await??;
         }
@@ -609,11 +609,34 @@ pub async fn run_at(paths: Paths) -> Result<()> {
             blobs.clone(),
             store.clone(),
             sessions.clone(),
-            runs,
+            runs.clone(),
             &paths.data,
         )
         .await?,
     ));
+    let mut collection_changes = sessions.listing().changes();
+    let collection_sessions = sessions.clone();
+    let run_collector = tokio::spawn(async move {
+        let Some(runs) = runs else {
+            return;
+        };
+        loop {
+            let sessions = collection_sessions.clone();
+            let runs = runs.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                runs.collect_unused(&sessions.referenced_runs()?)?;
+                Ok(())
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                eprintln!("看守目录回收未完成：{result:?}");
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                changed = collection_changes.changed() => { if changed.is_err() { break; } },
+            }
+        }
+    });
     let mut listing_changes = sessions.listing().changes();
     let mut storage_config = config.section::<StorageConfig>()?;
     let collector = tokio::spawn(async move {
@@ -689,6 +712,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     .await?;
     monitor.abort();
     collector.abort();
+    run_collector.abort();
     receipts_gc.abort();
     let mut engine = state.lock().await;
     let scope = engine.scope;
@@ -865,7 +889,7 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
                                     Some(runs) => match runs.inspect() {
                                         Ok(found) => page_items(found.into_iter().map(|f| Item {
                                             id: format!("run/{}", f.run), namespace: "runs".into(), kind: "run".into(),
-                                            fallback: Fallback { title: f.run.clone(), text: f.state.clone() },
+                                            fallback: Fallback { title: f.run.clone(), text: f.state.to_string() },
                                             data: serde_json::to_value(f).unwrap(),
                                         }).collect(), &page),
                                         Err(e) => Err(e.to_string()),

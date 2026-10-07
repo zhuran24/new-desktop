@@ -282,7 +282,12 @@ impl Claude {
                 _ => previous,
             };
             let cursor = link.hello.high;
-            let next_in = link.hello.accepted.max(link.hello.written) + 1;
+            let next_in = link
+                .hello
+                .accepted
+                .unwrap_or(link.hello.written)
+                .max(link.hello.written)
+                + 1;
             Ok(ClaudeRun {
                 ready: Ready {
                     run: run.to_owned(),
@@ -403,9 +408,13 @@ impl ClaudeRun {
     }
     /// 看守连接断了（传输错误后连接作废）：换一条新连接，输入序号接着看守报的已写高水位。
     pub fn relink(&mut self, link: WatchLink) {
-        self.next_in = self
-            .next_in
-            .max(link.hello.accepted.max(link.hello.written) + 1);
+        self.next_in = self.next_in.max(
+            link.hello
+                .accepted
+                .unwrap_or(link.hello.written)
+                .max(link.hello.written)
+                + 1,
+        );
         self.link = link;
     }
     /// 只重试同一帧的同一序号；不得为后续新帧复用一次失败写入的序号。
