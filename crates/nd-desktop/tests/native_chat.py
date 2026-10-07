@@ -31,6 +31,8 @@ def inner():
         args = ['/nd-desktop', '--socket', socket, '--state', f'/sandbox/state/{device}.json', '--quit-after', '45']
         if create:
             args += ['--scenario-create', json.dumps({'cwd': '/sandbox/project', 'model': 'haiku', 'text': '请写代码', 'attachments': settings.get('attachments', False)})]
+        if settings.get('session_settings'):
+            args += ['--scenario-settings', '{}']
         if settings.get('history'):
             args += ['--scenario-history', json.dumps({'round': settings['round']})]
         if draft is not None:
@@ -75,6 +77,16 @@ def inner():
         raise AssertionError(f'{name}: compositor only produced empty screenshots')
 
     try:
+        if settings.get('session_settings'):
+            Path('/sandbox/state/ui.json').write_text(json.dumps({'selected_session': settings['session']}))
+            app = start('settings')
+            def configured(s):
+                h = next((i['data'] for i in s['items'] if i['kind'] == 'header'), {})
+                return h.get('model') == 'opus' and h.get('settings', {}).get('applied', {}).get('effort') == 'high' and h.get('title') == '原生设置标题'
+            value = wait('settings', configured)
+            screenshot('settings-dark')
+            (out / 'result.json').write_text(json.dumps({'pass': True, 'session': value}, ensure_ascii=False))
+            return
         if settings.get('history'):
             (Path('/sandbox/state') / 'ui.json').write_text(json.dumps({'selected_session': settings['session']}))
             app = start('history')
@@ -178,7 +190,7 @@ def run(args):
     try:
         for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
             (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'drafts': args.session is not None and not args.history, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments}))
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments}))
         if args.attachments:
             shutil.copy(Path(__file__).resolve().parents[2] / 'nd-daemon/tests/fixtures/preview.png', work / 'pixel.png')
             (work / 'pasted.txt').write_text('复制文件里的中文正文')
@@ -226,6 +238,7 @@ if __name__ == '__main__':
         parser.add_argument('--attachments', action='store_true')
         parser.add_argument('--session', help='run the draft editor scenario for this session')
         parser.add_argument('--history', action='store_true')
+        parser.add_argument('--settings', action='store_true')
         parser.add_argument('--round')
         parser.add_argument('--text')
         parser.add_argument('--rounds', type=int)

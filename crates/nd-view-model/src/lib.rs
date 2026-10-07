@@ -41,3 +41,6 @@ pub fn project(snapshot: &nd_wire::Snapshot, state: &ViewState) -> View {
 
 mod diff;
 pub use diff::*;
+
+mod settings;
+pub use settings::*;

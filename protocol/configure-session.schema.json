@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConfigureSession",
+  "description": "session.configure 的参数。只修改一个会话运行时设置。",
+  "type": "object",
+  "properties": {
+    "session": {
+      "type": "string"
+    },
+    "setting": {
+      "$ref": "#/$defs/LiveSetting"
+    }
+  },
+  "required": [
+    "session",
+    "setting"
+  ],
+  "$defs": {
+    "LiveSetting": {
+      "description": "会话运行时设置；一次命令只改一项，结果以会话头的回读为准。",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "model"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "effort": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "effort"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ultracode": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ultracode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "permission_mode": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "permission_mode"
+          ]
+        }
+      ]
+    }
+  }
+}

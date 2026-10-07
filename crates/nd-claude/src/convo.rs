@@ -20,6 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "convo", rename_all = "snake_case")]
 pub enum Convo {
+    TitleChanged {
+        title: String,
+    },
     /// 我方写进 stdin 的 user 行（看守流水的输入记录）：已写出。
     Written {
         uuid: String,
@@ -252,6 +255,15 @@ impl Conversation {
         let main = frame["parent_tool_use_id"].is_null();
         if main {
             self.map_turn(frame, out);
+        }
+        if main
+            && frame["type"] == "system"
+            && frame["subtype"] == "session_title_changed"
+            && let Some(title) = frame["title"].as_str()
+        {
+            out.push(Convo::TitleChanged {
+                title: title.into(),
+            });
         }
         match frame["type"].as_str() {
             Some("user") => {

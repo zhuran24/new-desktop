@@ -33,6 +33,7 @@ impl Fixture {
     /// 守护进程配 Claude 后端：钉住的 CLI（看守沙盒里叫 /cli）、仓库里的两个 mod、
     /// 场景自己的 CLAUDE_CONFIG_DIR；后端环境从白名单构造，只有离线端点和假 key。
     async fn start(name: &str, idle_reclaim_ms: u64) -> Self {
+        let auto_title = name.starts_with("nd21-title-ai");
         let poll_timeout_ms = if name == "nd20-thousand" { 20 } else { 5000 };
         let config = format!(
             r#"
@@ -64,6 +65,7 @@ DISABLE_TELEMETRY = "1"
 DISABLE_ERROR_REPORTING = "1"
 
 [sessions]
+auto_title = {auto_title}
 idle_reclaim_ms = {idle_reclaim_ms}
 tick_ms = 50
 "#
@@ -110,8 +112,14 @@ tick_ms = 50
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}: {:#?}",
-                snapshot.items
+                "timed out waiting for {what}: {:#?}; requests={:?}",
+                snapshot.items,
+                self.scenario
+                    .endpoint()
+                    .requests()
+                    .iter()
+                    .map(|r| (&r.route, &r.body["max_tokens"]))
+                    .collect::<Vec<_>>()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -2516,6 +2524,351 @@ async fn draft_attachments_survive_conflicts_restart_and_transfer_to_the_sent_me
 }
 
 #[tokio::test]
+async fn settings_model_changes_the_next_turn_and_survives_restart() {
+    let fx = Fixture::start("nd21-model", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| {
+        header(s)["status"] == "active" && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text("first"));
+    fx.send("busy", &session, "more").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.wait(&session, "running", |s| {
+        header(s)["process"]["turn_running"] == true
+    })
+    .await;
+    let reply = fx
+        .command(
+            "model",
+            "session.configure",
+            json!({"session":session,"setting":{"model":"claude-sonnet-4-6"}}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Accepted { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    let next = Route::new(None, "claude-sonnet-4-6");
+    endpoint.enqueue(next.clone(), ModelReply::text("valid")); // CLI validates a custom model with max_tokens=1.
+    endpoint.enqueue(next.clone(), ModelReply::text("second"));
+    fx.send("next", &session, "continue").await;
+    assert_eq!(endpoint.requests().len(), 2);
+    gate.release();
+    endpoint
+        .wait_for_requests(&next, 2, Duration::from_secs(30))
+        .await
+        .unwrap_or_else(|e| panic!("{e}: requests={:?}", endpoint.requests()));
+    assert_eq!(endpoint.requests()[2].body["max_tokens"], 1);
+    assert!(request_text(&endpoint.requests()[3].body).contains("continue"));
+    let snapshot = fx
+        .wait(&session, "second turn", |s| {
+            texts(s).iter().any(|t| t == "second")
+        })
+        .await;
+    assert_eq!(header(&snapshot)["model"], "claude-sonnet-4-6");
+    fx.scenario.kill_daemon().unwrap();
+    let after = fx
+        .wait(&session, "reopened", |s| {
+            header(s)["model"] == "claude-sonnet-4-6"
+        })
+        .await;
+    assert_eq!(
+        header(&after)["settings"]["applied"]["model"],
+        "claude-sonnet-4-6"
+    );
+}
+
+#[tokio::test]
+async fn settings_effort_and_ultracode_follow_cli_availability_and_preserve_effort() {
+    let fx = Fixture::start("nd21-flags", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| {
+        header(s)["status"] == "active" && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    for (id, setting, key, expected) in [
+        (
+            "opus",
+            json!({"model":"opus"}),
+            "model",
+            json!("claude-opus-5-5"),
+        ),
+        ("effort", json!({"effort":"high"}), "effort", json!("high")),
+        ("on", json!({"ultracode":true}), "ultracode", json!(true)),
+        ("off", json!({"ultracode":false}), "ultracode", json!(false)),
+    ] {
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":setting}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{id}: {reply:?}"
+        );
+        let s = fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+        assert_eq!(
+            header(&s)["settings"]["applied"][key],
+            expected,
+            "{id}: {}",
+            header(&s)
+        );
+        if id == "on" || id == "off" {
+            assert_eq!(header(&s)["settings"]["applied"]["effort"], "high");
+            assert_eq!(header(&s)["caps"]["ultracode"], true);
+            assert_eq!(
+                header(&s)["settings"]["applied"]["ultracodeRequested"],
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn settings_are_read_on_open_and_permissions_and_effort_survive_reclaim() {
+    let fx = Fixture::start("nd21-resume-settings", 900).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    let first = fx
+        .wait(&session, "active", |s| {
+            header(s)["status"] == "active" && header(s)["op"].is_null()
+        })
+        .await;
+    assert_eq!(header(&first)["caps"]["model"], true);
+    assert_eq!(header(&first)["caps"]["ultracode"], false);
+    let denied = fx
+        .command(
+            "ultra-denied",
+            "session.configure",
+            json!({"session":session,"setting":{"ultracode":true}}),
+        )
+        .await;
+    assert!(matches!(
+        denied,
+        CommandReply::Receipt {
+            receipt: Receipt::Rejected { .. }
+        }
+    ));
+    // Keep a watcher while editing; reclaim only after the watcher closes.
+    let mut watcher = fx.ui().await;
+    watcher
+        .subscribe(&format!("session/{session}"))
+        .await
+        .unwrap();
+    for (id, setting) in [
+        ("mode", json!({"permission_mode":"acceptEdits"})),
+        ("opus", json!({"model":"opus"})),
+        ("effort", json!({"effort":"high"})),
+    ] {
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":setting}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+    }
+    watcher.close().await.unwrap();
+    fx.wait(&session, "reclaimed", |s| {
+        header(s)["process"]["alive"] == false && header(s)["op"].is_null()
+    })
+    .await;
+    let opus = Route::new(None, "claude-opus-5-5");
+    fx.scenario
+        .endpoint()
+        .enqueue(opus.clone(), ModelReply::text("resumed"));
+    fx.send("resume", &session, "continue").await;
+    fx.scenario
+        .endpoint()
+        .wait_for_requests(&opus, 1, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let snapshot = fx
+        .wait(&session, "resumed", |s| {
+            texts(s).iter().any(|s| s == "resumed")
+        })
+        .await;
+    assert_eq!(header(&snapshot)["permission_mode"], "acceptEdits");
+    assert_eq!(header(&snapshot)["settings"]["applied"]["effort"], "high");
+    assert_eq!(
+        fx.scenario.endpoint().requests().last().unwrap().body["output_config"]["effort"],
+        "high"
+    );
+}
+
+#[tokio::test]
+async fn settings_manual_title_updates_sidebar_and_survives_resume() {
+    let fx = Fixture::start("nd21-rename", 900).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| {
+        header(s)["status"] == "active" && header(s)["op"].is_null()
+    })
+    .await;
+    let reply = fx
+        .command(
+            "rename",
+            "session.rename",
+            json!({"session":session,"title":"新的中文标题 🦀"}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Accepted { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    fx.wait(&session, "renamed", |s| {
+        header(s)["title"] == "新的中文标题 🦀" && header(s)["op"].is_null()
+    })
+    .await;
+    let global = fx.ui().await.subscribe("global").await.unwrap();
+    assert!(
+        global
+            .items
+            .iter()
+            .any(|i| i.data["title"] == "新的中文标题 🦀")
+    );
+    fx.scenario.kill_daemon().unwrap();
+    fx.wait(&session, "reclaimed", |s| {
+        header(s)["process"]["alive"] == false && header(s)["op"].is_null()
+    })
+    .await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("resumed"));
+    fx.send("resume", &session, "continue").await;
+    let after = fx
+        .wait(&session, "resumed", |s| {
+            texts(s).iter().any(|s| s == "resumed")
+        })
+        .await;
+    assert_eq!(header(&after)["title"], "新的中文标题 🦀");
+    assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+    let native = fx.transcript(
+        header(&after)["process"]["backend_session"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(
+        native
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|row| row["type"] == "custom-title" && row["customTitle"] == "新的中文标题 🦀")
+    );
+}
+
+#[tokio::test]
+async fn settings_ai_title_is_generated_once_and_return_value_updates_the_sidebar() {
+    let fx = Fixture::start("nd21-title-ai", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text(r#"{"title":"会话设置实现"}"#));
+    let session = fx
+        .create("create", "/sandbox/project", "请实现会话设置与标题管理功能")
+        .await;
+    let s = fx
+        .wait(&session, "AI title", |s| header(s)["title_source"] == "ai")
+        .await;
+    assert_eq!(header(&s)["title"], "会话设置实现");
+    fx.scenario.kill_daemon().unwrap();
+    assert_eq!(header(&fx.peek(&session).await)["title"], "会话设置实现");
+    assert_eq!(fx.scenario.endpoint().requests().len(), 2);
+    let text = fx.transcript(header(&s)["process"]["backend_session"].as_str().unwrap());
+    assert!(text.contains("ai-title") && text.contains("会话设置实现"));
+}
+
+#[tokio::test]
+async fn settings_inflight_ai_title_survives_restart_and_never_overwrites_manual_title() {
+    let fx = Fixture::start("nd21-title-ai-restart", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let gate = endpoint.enqueue_held(fx.main(), ModelReply::text(r#"{"title":"晚到的自动标题"}"#));
+    let session = fx
+        .create("create", "/sandbox/project", "为会话设置增加持久化和标题")
+        .await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.scenario.kill_daemon().unwrap();
+    fx.peek(&session).await;
+    let reply = fx
+        .command(
+            "rename",
+            "session.rename",
+            json!({"session":session,"title":"我的标题"}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Accepted { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    fx.wait(&session, "manual title", |s| {
+        header(s)["title"] == "我的标题"
+    })
+    .await;
+    gate.release();
+    let after = fx
+        .wait(&session, "all title operations complete", |s| {
+            header(s)["op"].is_null()
+        })
+        .await;
+    assert_eq!(header(&after)["title"], "我的标题");
+    assert_eq!(
+        endpoint.requests().len(),
+        2,
+        "recovery must not repeat AI generation"
+    );
+}
+
+#[tokio::test]
 async fn history_pages_are_read_only_ordered_and_resume_after_restart() {
     let fx = Fixture::start("nd20-history", 3_600_000).await;
     fx.scenario
@@ -2742,4 +3095,289 @@ async fn native_history(fx: &Fixture, session: &str, round: &str, text: &str, ro
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+#[tokio::test]
+async fn settings_native_window_changes_model_effort_and_title_through_nd_wire() {
+    let fx = Fixture::start("nd21-native", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    let output = std::env::var("ND_NATIVE_SETTINGS_OUTPUT")
+        .unwrap_or_else(|_| "/mnt/wd_external/nd-build/tmp/ticket-21-native".into());
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
+        .args([
+            "--desktop",
+            &std::env::var("ND_TEST_DESKTOP").unwrap(),
+            "--socket",
+            fx.socket().to_str().unwrap(),
+            "--output",
+            &output,
+            "--session",
+            &session,
+            "--settings",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+}
+
+#[tokio::test]
+async fn settings_stale_clients_conflict_and_cli_rejection_preserves_applied_values() {
+    let fx = Fixture::start("nd21-setting-conflict", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    let make = |id: &str, revision: u64, setting: Value| Command {
+        id: id.into(),
+        device: "settings-ui".into(),
+        name: "session.configure".into(),
+        args: json!({"session":session,"setting":setting}),
+        expect: json!({"settings_revision":revision}),
+    };
+    let mut ui = fx.ui().await;
+    let first = make("mode", 0, json!({"permission_mode":"acceptEdits"}));
+    let receipt = ui.command(&first).await.unwrap();
+    fx.wait(&session, "mode", |s| header(s)["op"].is_null())
+        .await;
+    let stale = ui
+        .command(&make("stale", 0, json!({"permission_mode":"plan"})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(stale,CommandReply::Receipt {receipt:Receipt::Rejected {ref code,..}} if code == "conflict"),
+        "{stale:?}"
+    );
+    assert_eq!(ui.command(&first).await.unwrap(), receipt);
+    let invalid = make("invalid-mode", 1, json!({"permission_mode":"not-a-mode"}));
+    assert!(matches!(
+        ui.command(&invalid).await.unwrap(),
+        CommandReply::Receipt {
+            receipt: Receipt::Accepted { .. }
+        }
+    ));
+    let after = fx
+        .wait(&session, "rejected", |s| header(s)["op"].is_null())
+        .await;
+    assert_eq!(header(&after)["permission_mode"], "acceptEdits");
+    assert!(
+        after
+            .items
+            .iter()
+            .any(|i| i.kind == "op" && i.data["phase"] == "compensated")
+    );
+}
+
+#[tokio::test]
+async fn settings_lost_title_process_settles_without_blocking_the_session() {
+    let fx = Fixture::start("nd21-title-ai-exit", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let _gate = endpoint.enqueue_held(fx.main(), ModelReply::text(r#"{"title":"不会返回"}"#));
+    let session = fx
+        .create("create", "/sandbox/project", "后端退出时保留可用的首条摘要")
+        .await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let s = fx.peek(&session).await;
+    signal(cli_pid(&fx, &s).await, rustix::process::Signal::KILL);
+    let after = fx
+        .wait(&session, "title settled after exit", |s| {
+            header(s)["process"]["alive"] == false && header(s)["op"].is_null()
+        })
+        .await;
+    assert_eq!(header(&after)["title_source"], "summary");
+    assert!(
+        after
+            .items
+            .iter()
+            .any(|i| i.kind == "op" && i.data["phase"] == "partial")
+    );
+}
+
+#[tokio::test]
+async fn settings_effort_changes_clear_ultracode_and_support_max() {
+    let fx = Fixture::start("nd21-effort-rules", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    for (id, setting) in [
+        ("opus", json!({"model":"opus"})),
+        ("high", json!({"effort":"high"})),
+        ("ultra", json!({"ultracode":true})),
+        ("medium", json!({"effort":"medium"})),
+        ("max", json!({"effort":"max"})),
+    ] {
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":setting}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        let after = fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+        eprintln!(
+            "effort-rules {id}: {}",
+            header(&after)["settings"]["applied"]
+        );
+        if id == "medium" {
+            assert_eq!(header(&after)["settings"]["applied"]["effort"], "medium");
+            assert_eq!(header(&after)["settings"]["applied"]["ultracode"], false);
+        }
+        if id == "max" {
+            assert_eq!(header(&after)["settings"]["applied"]["effort"], "max");
+        }
+    }
+    let opus = Route::new(None, "claude-opus-5-5");
+    fx.scenario
+        .endpoint()
+        .enqueue(opus.clone(), ModelReply::text("maximum"));
+    fx.send("max-turn", &session, "continue").await;
+    fx.wait(&session, "max turn", |s| {
+        texts(s).iter().any(|s| s == "maximum") && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    assert_eq!(
+        fx.scenario.endpoint().requests().last().unwrap().body["output_config"]["effort"],
+        "max"
+    );
+    for (id, setting) in [
+        ("on-again", json!({"ultracode":true})),
+        ("haiku", json!({"model":"haiku"})),
+    ] {
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":setting}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+    }
+    let after = fx.peek(&session).await;
+    assert_eq!(header(&after)["caps"]["ultracode"], false);
+    assert_eq!(header(&after)["settings"]["applied"]["ultracode"], false);
+    if let Ok(path) = std::env::var("ND_RECORD_SETTINGS") {
+        let run = header(&after)["process"]["run"].as_str().unwrap();
+        let text = std::fs::read_to_string(
+            fx.scenario
+                .root()
+                .join("recordings")
+                .join(format!("{run}.jsonl")),
+        )
+        .unwrap();
+        let records: Vec<&str> = text
+            .lines()
+            .filter(|line| {
+                let r: Value = serde_json::from_str(line).unwrap();
+                let f: Value = serde_json::from_str(r["event"]["line"].as_str().unwrap_or("{}"))
+                    .unwrap_or_default();
+                matches!(
+                    f["type"].as_str(),
+                    Some("control_request" | "control_response")
+                )
+            })
+            .collect();
+        std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{}\n", records.join("\n"))).unwrap();
+    }
+    signal(cli_pid(&fx, &after).await, rustix::process::Signal::KILL);
+    fx.wait(&session, "haiku process gone", |s| {
+        header(s)["process"]["alive"] == false
+    })
+    .await;
+    let haiku = Route::new(None, "claude-haiku-4-5-20251001");
+    fx.scenario
+        .endpoint()
+        .enqueue(haiku, ModelReply::text("restored"));
+    fx.send("restore-effort", &session, "continue").await;
+    fx.wait(&session, "restored", |s| {
+        texts(s).iter().any(|s| s == "restored") && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let reply = fx
+        .command(
+            "opus-restored",
+            "session.configure",
+            json!({"session":session,"setting":{"model":"opus"}}),
+        )
+        .await;
+    assert!(
+        matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Accepted { .. }
+            }
+        ),
+        "{reply:?}"
+    );
+    let restored = fx
+        .wait(&session, "effort restored", |s| header(s)["op"].is_null())
+        .await;
+    assert_eq!(header(&restored)["settings"]["applied"]["effort"], "max");
+}
+
+#[tokio::test]
+async fn settings_title_waits_for_eligible_prompt_and_keeps_summary_on_empty_generation() {
+    let fx = Fixture::start("nd21-title-ai-fallback", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("create", "/sandbox/project", "hello").await;
+    fx.wait(&session, "active", |s| {
+        header(s)["status"] == "active" && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    assert_eq!(endpoint.requests().len(), 1);
+    endpoint.enqueue(fx.main(), ModelReply::text("second"));
+    endpoint.enqueue(fx.main(), ModelReply::text("{}"));
+    fx.send("eligible", &session, "这是第一条足够长的正常人类提示")
+        .await;
+    let after = fx
+        .wait(&session, "title fallback", |s| {
+            header(s)["op"].is_null()
+                && s.items
+                    .iter()
+                    .any(|i| i.kind == "op" && i.data["kind"] == "title")
+        })
+        .await;
+    assert_eq!(header(&after)["title"], "hello");
+    assert_eq!(header(&after)["title_source"], "summary");
+    assert_eq!(endpoint.requests().len(), 3);
 }
