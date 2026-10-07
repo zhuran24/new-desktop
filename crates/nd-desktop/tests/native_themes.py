@@ -111,10 +111,28 @@ def inner():
         config = Path('/sandbox/config/xdg-desktop-portal')
         config.mkdir()
         (config / 'portals.conf').write_text('[preferred]\ndefault=gtk\n')
-        for binary in ['/usr/lib/dconf-service', '/usr/lib/xdg-desktop-portal-gtk', '/usr/lib/xdg-desktop-portal']:
+        for binary, bus_name in [
+            ('/usr/lib/dconf-service', 'ca.desrt.dconf'),
+            ('/usr/lib/xdg-desktop-portal-gtk', 'org.freedesktop.impl.portal.desktop.gtk'),
+            ('/usr/lib/xdg-desktop-portal', 'org.freedesktop.portal.Desktop'),
+        ]:
             log = (out / (Path(binary).name + '.log')).open('w')
             handles.append(log)
-            portals.append(subprocess.Popen([binary], stdout=log, stderr=log, env=dict(os.environ, GDK_BACKEND='wayland')))
+            portal = subprocess.Popen([binary], stdout=log, stderr=log, env=dict(os.environ, GDK_BACKEND='wayland'))
+            portals.append(portal)
+            # The frontend may otherwise activate a second GTK backend through
+            # D-Bus before the explicitly launched Wayland backend owns its name.
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                assert portal.poll() is None, Path(log.name).read_text()
+                owner = subprocess.run(['gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+                    '--object-path', '/org/freedesktop/DBus', '--method', 'org.freedesktop.DBus.NameHasOwner',
+                    bus_name], capture_output=True, text=True, timeout=3)
+                if owner.returncode == 0 and owner.stdout.strip() == '(true,)':
+                    break
+                time.sleep(.03)
+            else:
+                raise AssertionError(bus_name + ' did not acquire its bus name: ' + Path(log.name).read_text())
         system_scheme('prefer-light')
         log = (out / 'daemon.log').open('w')
         handles.append(log)
