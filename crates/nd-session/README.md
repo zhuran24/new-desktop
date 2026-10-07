@@ -10,7 +10,7 @@
 |---|---|
 | `Sessions::new(store, blobs, claims, backends, config)` | 建表、读回侧栏列表；独占登记一有变化就唤醒装载中的会话 |
 | `Sessions::recover()` | 守护进程启动时装载有活进程、进行中操作或未结票的会话，交端口 `adopt` 对账 |
-| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`、`session.resend`；不是会话命令时返回 None |
+| `Sessions::execute(&Command)` | `session.create`、`session.send`、`session.draft.update`、`session.resend`、`session.withdraw`、`session.interrupt`；不是会话命令时返回 None |
 | `Sessions::subscribe(&SessionId, since)` | `session/<id>` 流：快照或同纪元续上的事件，外加 `WatchGuard`（持有期间算「有人在看」） |
 | `Sessions::listing()` | 侧栏列表与一次性的提示（`global` 流里 `sessions` 命名空间的条目） |
 | `session_id_for(command_id)` | 新建会话的 id 由建它的命令 id 派生：同一条命令重试落在同一个会话上 |
@@ -37,7 +37,7 @@
 
 取回另存稿是带当前编辑基准版本的普通 `session.draft.update`，另存原文继续保留，暂不提供删除入口。已保存的草稿可在界面关闭、守护进程崩溃后从快照恢复；尚未确认持久化的编辑只存在活着的界面中，界面须显示保存状态并保留待确认命令的 id。
 
-`state::Core::update_draft(id, device, base, text, attachments)` 是同 crate 内的回填接入点。#18 撤回已使用该入口；#22 总结、#35 回退处理完成事实时在同一执行器事务调用它；调用方须用原操作账或去重事实保证一次落定，并保存操作开始时的草稿版本，不能拿完成时的最新版冒充基准。并发编辑时回填文字另存。`From` 回填原文、`UpTo` 回填空串的具体规则由对应操作接入，不在本单模拟后端动作。#17 扩展附件时，应同时扩展当前稿、另存稿和比较/清空条件，附件引用随核心事务更新 Blobs 引用。
+`state::Core::update_draft(id, device, base, text, attachments)` 是同 crate 内的回填接入点。#18 撤回已使用该入口；#22 总结、#35 回退处理完成事实时在同一执行器事务调用它；调用方须用原操作账或去重事实保证一次落定，并保存操作开始时的草稿版本，不能拿完成时的最新版冒充基准。并发编辑时回填文字另存。`From` 回填原文、`UpTo` 回填空串的具体规则由对应操作接入，不在本单模拟后端动作。当前稿、另存稿和比较/清空条件均包含 #17 的附件；附件引用随核心事务更新 Blobs 引用。
 
 接口类型和四份 `protocol/draft*.schema.json` 均从 `nd-wire` Rust 类型生成。草稿存正文和附件引用；光标、选区和组词只留在界面。
 
@@ -45,7 +45,8 @@
 
 - `session.withdraw`：`args:{session,message,draft?:{version,text,attachments?}}`。可选 draft 是界面在操作开始时看到的草稿基准，不是无条件保存。`Done{withdrawal,message}` 只表示持久受理；`prompt.state=withdrawing/withdrawn` 与 `control/<命令 id>` 给最终结果。已不在发送台的消息回 `not_withdrawable`，重复在途撤回回 `withdrawing`。
 - `session.interrupt`：`args:{session,queued?:"keep"|"cancel",draft?:{version,text,attachments?}}`，默认 keep。没有活进程回 `Done{idle:true}`；否则 `Done{control}` 是持久受理。`control.state=acknowledged` 只表示停止请求被确认，回合结束仍看 turn/header。Cancel 未获后端能力声明时拒绝；取消成功的消息按发送台到达顺序合成一份回填。
-- 成功撤回将原 Send 票结为 `Refused::Withdrawn`，在同事务通过 `Core::update_draft` 回填。保存操作开始时的版本、正文、设备；并发编辑时以稳定 `return/<命令 id>` 另存，不能覆盖新稿。撤回 false 不改变原 Send；未知结果不回填、不重投。迟到的撤回错误不能覆盖已经确认的送达。
+- 成功撤回将原 Send 票结为 `Refused::Withdrawn`，在同事务通过 `Core::update_draft` 回填。保存操作开始时的版本、正文、设备；并发编辑时以稳定 `return/<命令 id>` 另存，不能覆盖新稿。撤回 false 不改变原 Send；未知结果在确证前不回填，始终不自动重投。迟到的撤回错误不能覆盖已经确认的送达；迟到的成功证据可回填一次。确认取消的原 Unknown Send 结为 Withdrawn，迟到 Lost 不能重新赋予重发资格。
+- 只要求本会话的来源追平后受理控制，不等待其他会话完成恢复；未知控制仅对账，不能执行到后续回合。在途草稿附件引用保留至控制结果确证，正文分页保留未决提示和控制。
 - `header.interaction` 给三种发送意图、withdraw、interrupt、cancel_queued、interrupt_spares_background、immediate_preserves_mcp 和 rewind_menu。界面按这些中立能力呈现，不能解读 Claude 的私有字段。
 
 ### 会话流的条目（命名空间 `session`）
