@@ -5,13 +5,25 @@ export const PROTO_VERSION = 1;
 export const MOD_VERSION = "0.1.0";
 export const HOOK_MOD: ModName = "new-desktop";
 export const ACTION_MOD: ModName = "new-desktop-actions";
+export const SUMMARIZE_PREFIX = "ND_SUM ";
+export const ANCHOR_GONE = "nd-anchor-gone:";
+export const SUMMARIZE_FAILED = "nd-summarize-failed:";
 
 /** 命令的动作。可重发类别见 [`Action::resend`]。 */
 export type Action =
   /** 核对通道与身份，结果是 [`Pong`]。 */
   | { type: "ping" }
   /** 按操作 id 查本代次留下的状态和结果，结果是 [`QueryAnswer`]。 */
-  | { type: "query"; op_ids: string[] };
+  | { type: "query"; op_ids: string[] }
+  /**
+   * 动作 mod：发 `/compact`，参数是 [`SUMMARIZE_PREFIX`] 加 [`SummarizeSpec`] 的 JSON；钩子 mod 的
+   * 压缩钩子按它定位、只压缩所选范围。结果是 [`CompactDone`]。
+   */
+  | { type: "compact"; spec: SummarizeSpec }
+  /** 动作 mod：`$.tool.call` 调 Bash 跑这条命令，再把命令和输出追加进对话。结果是 [`ShellDone`]。 */
+  | { type: "shell"; command: string; description: string }
+  /** 动作 mod：`$.agent.spawn` 派 fork 型子代理。结果是 [`ForkDone`]。 */
+  | { type: "fork"; description: string; prompt: string };
 
 /** 守护进程发给 mod 的一条命令。mod 执行前核对身份，对不上就拒绝。 */
 export type Command = {
@@ -21,10 +33,29 @@ export type Command = {
   op_id: string;
 };
 
+/** [`Action::Compact`] 的结果。`compacted:false` 时 `skipped` 是 CLI 回的原因原文。 */
+export type CompactDone = {
+  compacted: boolean;
+  skipped?: string | null;
+};
+
+export type CompactScope =
+  /** 从所选提示（含）到末尾。 */
+  | "from"
+  /** 从开头到所选提示（不含）。 */
+  | "up_to";
+
 /** 非 200 回应的正文。 */
 export type ErrorReply = {
   code: string;
   message: string;
+};
+
+/** [`Action::Fork`] 的结果。`denied` 有值时没有派出。 */
+export type ForkDone = {
+  agent_id?: string | null;
+  denied?: string | null;
+  model?: string | null;
 };
 
 /** `POST /hello`：mod 报到并绑定到（后端进程，后端会话）。 */
@@ -63,7 +94,9 @@ export type ModName = "new-desktop" | "new-desktop-actions";
 
 /** 把全部消息类型挂在一个根上，供 JSON Schema 与 TypeScript 一次导出。 */
 export type ModProtocol = {
+  compact_done: CompactDone;
   error: ErrorReply;
+  fork_done: ForkDone;
   hello: Hello;
   hello_reply: HelloReply;
   next: Next;
@@ -74,6 +107,8 @@ export type ModProtocol = {
   report: Report;
   report_ack: ReportAck;
   result: ResultPost;
+  shell_done: ShellDone;
+  summarize: SummarizeSpec;
 };
 
 /** `GET /next` 的回应：长轮询到时限、有命令或要求重报 hello 时返回。 */
@@ -161,4 +196,25 @@ export type ResultPost = {
   mod_gen: string;
   outcome: Outcome;
   run: string;
+};
+
+/** [`Action::Shell`] 的结果。`denied` 有值时命令没有跑。 */
+export type ShellDone = {
+  /** 命令和输出已追加进对话。 */
+  appended: boolean;
+  denied?: string | null;
+  exit?: number | null;
+  stderr: string;
+  stdout: string;
+};
+
+/**
+ * 所选提示的定位：用户行的文字（各文字块直接相连）的 SHA-256，及它是同一文字的第 `nth` 次出现、
+ * 共 `of` 次。参数里只放散列，提示原文不进 `/compact` 的命令行。
+ */
+export type SummarizeSpec = {
+  nth: number;
+  of: number;
+  scope: CompactScope;
+  sha256: string;
 };

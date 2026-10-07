@@ -30,12 +30,25 @@ pub enum ActKind {
     Open,
     End,
     Send,
+    Invoke,
 }
 fn kind_of(act: &Act) -> ActKind {
     match act {
         Act::Open { .. } => ActKind::Open,
         Act::End { .. } => ActKind::End,
         Act::Send { .. } => ActKind::Send,
+        Act::Invoke { .. } => ActKind::Invoke,
+    }
+}
+
+/// 原生步骤的名字：`invoke:compact:<范围>:<原文>`、`invoke:shell:<命令>`、`invoke:fork:<提示>`。
+fn invoke_step(what: &nd_backend::Invocation) -> String {
+    match what {
+        nd_backend::Invocation::Compact { scope, anchor } => {
+            format!("invoke:compact:{scope:?}:{}", anchor.text)
+        }
+        nd_backend::Invocation::Shell { command } => format!("invoke:shell:{command}"),
+        nd_backend::Invocation::ForkAgent { prompt } => format!("invoke:fork:{prompt}"),
     }
 }
 
@@ -259,6 +272,7 @@ impl ScriptedAdapter {
                             run: run.clone(),
                             readiness: Readiness::Full,
                             adopt: json!({"scripted": true}),
+                            features: vec![],
                         },
                     }),
                     fact(&format!("tasks:{ticket}"), FactBody::Tasks { drain }),
@@ -299,6 +313,42 @@ impl ScriptedAdapter {
                     .unwrap()
                     .applied
                     .push(format!("send?:{}", msg.text));
+                vec![done(Outcome::Unknown { evidence: why })]
+            }
+            (Act::Invoke { what, .. }, Reply::Ok) => {
+                self.inner.lock().unwrap().applied.push(invoke_step(what));
+                let result = match what {
+                    nd_backend::Invocation::Compact { .. } => nd_backend::Invoked::Compacted,
+                    nd_backend::Invocation::Shell { command } => nd_backend::Invoked::Shell {
+                        exit: Some(0),
+                        stdout: format!("ran {command}"),
+                        stderr: String::new(),
+                        appended: true,
+                    },
+                    nd_backend::Invocation::ForkAgent { .. } => nd_backend::Invoked::Forked {
+                        agent: format!("agent-{}", nd_backend::native_uuid(&ticket)),
+                    },
+                };
+                vec![
+                    fact(
+                        &format!("written:{ticket}"),
+                        FactBody::Written {
+                            ticket: ticket.clone(),
+                            native: nd_backend::native_uuid(&ticket),
+                        },
+                    ),
+                    done(Outcome::Ok {
+                        done: Done::Invoked { result },
+                    }),
+                ]
+            }
+            (Act::Invoke { what, .. }, Reply::Unknown(why)) => {
+                // 交给了后端、结论丢了：可能已生效。
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .applied
+                    .push(format!("{}?", invoke_step(what)));
                 vec![done(Outcome::Unknown { evidence: why })]
             }
             (Act::End { .. }, Reply::Ok) => {

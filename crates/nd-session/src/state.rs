@@ -10,7 +10,10 @@ use nd_backend::{
 use nd_store::{OptionalExtension, Tx, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +69,23 @@ pub struct Carrier {
     pub drain: Drain,
     pub turn_running: bool,
     pub turns: u64,
+    /// 端口报的能力表（拉起时、能力变了时）；旧记录没有时为空。
+    #[serde(default)]
+    pub features: Vec<nd_backend::Feature>,
+}
+impl Carrier {
+    /// 某项能力不可用的原因；能力表里没有这一项时按可用处理（由端口在执行时再核）。
+    pub fn unavailable(&self, feature: &str) -> Option<String> {
+        if let Some(Readiness::ChatOnly { why }) = &self.readiness
+            && self.features.is_empty()
+        {
+            return Some(why.clone());
+        }
+        self.features
+            .iter()
+            .find(|f| f.id == feature && !f.available)
+            .map(|f| f.why.clone().unwrap_or_else(|| "后端进程不提供".into()))
+    }
 }
 
 /// 发件箱的一行：签发它的是操作账里的一个键，或发送台里的一条消息。
@@ -85,8 +105,17 @@ pub struct OutRow {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "by", rename_all = "snake_case")]
 pub enum Issuer {
-    Op { op: String, key: String },
-    Message { id: String },
+    Op {
+        op: String,
+        key: String,
+    },
+    Message {
+        id: String,
+    },
+    /// 经后端进程做的一件事（总结、`!`、派 fork 型子代理）；`id` 是起它的命令 id。
+    Invoke {
+        id: String,
+    },
 }
 
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
@@ -102,6 +131,49 @@ pub struct Message {
     pub attempt: u32,
     pub waiting: Option<String>,
     pub arrival: u64,
+}
+
+/// 收据等动作有结果的一件事（规格「收据时点」）：命令受理时记下意图，结果到了才落收据。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Invoke {
+    /// 起它的命令 id，也是界面条目 `invoke/<id>` 的 id。
+    pub id: String,
+    /// 命令的内容散列：同 id 不同内容回 conflict。
+    pub digest: String,
+    pub device: String,
+    pub invocation: nd_backend::Invocation,
+    /// 总结所选提示的消息 id。
+    #[serde(default)]
+    pub message: Option<String>,
+    /// 「从这里总结」成功后放回输入框的原文与附件。
+    #[serde(default)]
+    pub restore: Option<(String, Vec<nd_wire::Attachment>)>,
+    /// 受理时的草稿版本：回填以它为基准，之后的编辑不被覆盖。
+    pub draft_base: u64,
+    /// 总结成功后不再是 CLI 对话行的提示（受理时算出）。
+    #[serde(default)]
+    pub covers: Vec<String>,
+    pub ticket: Option<Ticket>,
+    pub attempt: u32,
+    pub waiting: Option<String>,
+    pub arrival: u64,
+}
+impl Invoke {
+    pub fn kind(&self) -> &'static str {
+        match self.invocation {
+            nd_backend::Invocation::Compact { .. } => "compact",
+            nd_backend::Invocation::Shell { .. } => "shell",
+            nd_backend::Invocation::ForkAgent { .. } => "subtask",
+        }
+    }
+    /// 端口能力表里对应的那一项。
+    pub fn feature(&self) -> &'static str {
+        match self.invocation {
+            nd_backend::Invocation::Compact { .. } => "summarize",
+            nd_backend::Invocation::Shell { .. } => "bang_mode",
+            nd_backend::Invocation::ForkAgent { .. } => "fork_subagent",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -122,6 +194,12 @@ pub struct Core {
     pub messages: BTreeMap<String, Message>,
     pub next_op: u64,
     pub arrivals: u64,
+    /// 等结果的总结、`!` 命令、fork 型子代理，按命令 id。
+    #[serde(default)]
+    pub invokes: BTreeMap<String, Invoke>,
+    /// 已被总结、不再是 CLI 对话行的提示（消息 id）。
+    #[serde(default)]
+    pub summarized: BTreeSet<String>,
 }
 impl Core {
     pub fn meta(&self) -> &Meta {
@@ -288,6 +366,7 @@ pub fn needing_recovery(store: &nd_store::Store) -> nd_store::Result<Vec<Session
             || !core.outbox.is_empty()
             || !core.uncertain.is_empty()
             || !core.messages.is_empty()
+            || !core.invokes.is_empty()
             || core.carriers.values().any(|c| c.run.is_some())
         {
             out.push(SessionId(id));

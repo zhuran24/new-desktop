@@ -62,6 +62,12 @@ pub enum Shown {
         kind: String,
         raw: Value,
     },
+    /// 总结、`!` 命令、fork 型子代理：`kind` 是 `compact`、`shell`、`subtask`，`data` 是状态与结果。
+    Invoke {
+        id: String,
+        kind: String,
+        data: Value,
+    },
 }
 
 fn kind_name(kind: ItemKind) -> &'static str {
@@ -95,6 +101,7 @@ impl Shown {
             Shown::Turn { carrier, n, .. } => format!("turn/{carrier}/{n}"),
             Shown::Op { id, .. } => format!("op/{id}"),
             Shown::Asked { id, .. } => format!("asked/{id}"),
+            Shown::Invoke { id, .. } => format!("invoke/{id}"),
         }
     }
     pub fn is_delta(&self) -> bool {
@@ -192,6 +199,44 @@ impl Shown {
                 "后端在等回答".to_owned(),
                 format!("{kind}（这一版界面还不能回答）"),
             ),
+            Shown::Invoke { kind, data, .. } => {
+                let state = data["state"].as_str().unwrap_or("?");
+                let (title, text) = match kind.as_str() {
+                    "shell" => (
+                        "! 命令".to_owned(),
+                        format!(
+                            "! {}［{state}］{}",
+                            data["command"].as_str().unwrap_or_default(),
+                            shorten(&format!(
+                                "{}{}",
+                                data["stdout"].as_str().unwrap_or_default(),
+                                data["stderr"].as_str().unwrap_or_default()
+                            ))
+                        ),
+                    ),
+                    "compact" => (
+                        "总结".to_owned(),
+                        format!(
+                            "{}［{state}］{}",
+                            if data["scope"] == "from" {
+                                "从这里总结"
+                            } else {
+                                "总结到这里"
+                            },
+                            data["reason"].as_str().unwrap_or_default()
+                        ),
+                    ),
+                    _ => (
+                        "fork 型子代理".to_owned(),
+                        format!(
+                            "{}［{state}］{}",
+                            shorten(data["prompt"].as_str().unwrap_or_default()),
+                            data["agent"].as_str().unwrap_or_default()
+                        ),
+                    ),
+                };
+                (kind.as_str(), data.clone(), title, text)
+            }
         };
         data["seq"] = json!(seq);
         Item {

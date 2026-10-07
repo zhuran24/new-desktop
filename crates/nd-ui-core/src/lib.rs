@@ -143,9 +143,19 @@ impl SyncReplica {
     }
     /// 正文只送一次。传输中断只查收据；查不到返回交付不明。
     pub async fn command(&mut self, command: &nd_wire::Command) -> Result<nd_wire::CommandReply> {
+        self.command_waiting(command, std::time::Duration::from_secs(5))
+            .await
+    }
+    /// 同 [`Self::command`]，但回应最多等 `wait`：收据等动作有结果的命令（`!`、总结、
+    /// 派 fork 型子代理）要等后端做完才回。到时限仍没回应就只查收据，不重发正文。
+    pub async fn command_waiting(
+        &mut self,
+        command: &nd_wire::Command,
+        wait: std::time::Duration,
+    ) -> Result<nd_wire::CommandReply> {
         let mut attempt = 0u32;
         loop {
-            match self.command_once(command).await {
+            match self.command_once(command, wait).await {
                 Ok(nd_wire::CommandReply::Unavailable { .. }) => {
                     tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(5)))
                         .await;
@@ -171,14 +181,18 @@ impl SyncReplica {
         }
     }
 
-    async fn command_once(&mut self, command: &nd_wire::Command) -> Result<nd_wire::CommandReply> {
+    async fn command_once(
+        &mut self,
+        command: &nd_wire::Command,
+        wait: std::time::Duration,
+    ) -> Result<nd_wire::CommandReply> {
         let id = self.request_id()?;
         self.send(Request::Execute {
             id,
             command: command.clone(),
         })
         .await?;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(wait, async {
             loop {
                 match self.receive().await? {
                     Response::CommandReply { id: got, result } if got == id => return Ok(result),

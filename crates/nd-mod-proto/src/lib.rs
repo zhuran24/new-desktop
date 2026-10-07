@@ -115,6 +115,74 @@ pub enum Action {
     Ping,
     /// 按操作 id 查本代次留下的状态和结果，结果是 [`QueryAnswer`]。
     Query { op_ids: Vec<String> },
+    /// 动作 mod：发 `/compact`，参数是 [`SUMMARIZE_PREFIX`] 加 [`SummarizeSpec`] 的 JSON；钩子 mod 的
+    /// 压缩钩子按它定位、只压缩所选范围。结果是 [`CompactDone`]。
+    Compact { spec: SummarizeSpec },
+    /// 动作 mod：`$.tool.call` 调 Bash 跑这条命令，再把命令和输出追加进对话。结果是 [`ShellDone`]。
+    Shell {
+        command: String,
+        description: String,
+    },
+    /// 动作 mod：`$.agent.spawn` 派 fork 型子代理。结果是 [`ForkDone`]。
+    Fork { prompt: String, description: String },
+}
+
+/// `/compact` 参数的前缀：钩子 mod 只处理以它开头、且不是子代理的那次压缩。
+pub const SUMMARIZE_PREFIX: &str = "ND_SUM ";
+/// 钩子 mod 定位不到所选提示时，回给 CLI 的 skip 原因以它开头。
+pub const ANCHOR_GONE: &str = "nd-anchor-gone:";
+/// 钩子 mod 压缩出错（摘要请求失败等）时，skip 原因以它开头。
+pub const SUMMARIZE_FAILED: &str = "nd-summarize-failed:";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactScope {
+    /// 从所选提示（含）到末尾。
+    From,
+    /// 从开头到所选提示（不含）。
+    UpTo,
+}
+
+/// 所选提示的定位：用户行的文字（各文字块直接相连）的 SHA-256，及它是同一文字的第 `nth` 次出现、
+/// 共 `of` 次。参数里只放散列，提示原文不进 `/compact` 的命令行。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SummarizeSpec {
+    pub scope: CompactScope,
+    pub sha256: String,
+    pub nth: u32,
+    pub of: u32,
+}
+
+/// [`Action::Compact`] 的结果。`compacted:false` 时 `skipped` 是 CLI 回的原因原文。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompactDone {
+    pub compacted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+}
+
+/// [`Action::Shell`] 的结果。`denied` 有值时命令没有跑。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ShellDone {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    /// 命令和输出已追加进对话。
+    pub appended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
+}
+
+/// [`Action::Fork`] 的结果。`denied` 有值时没有派出。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ForkDone {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
 }
 
 /// 重连后查不到结果时能不能用同一个操作 id 再发。
@@ -131,6 +199,9 @@ impl Action {
     pub fn resend(&self) -> Resend {
         match self {
             Action::Ping | Action::Query { .. } => Resend::Resendable,
+            Action::Compact { .. } | Action::Shell { .. } | Action::Fork { .. } => {
+                Resend::NotResendable
+            }
         }
     }
 }
@@ -255,6 +326,10 @@ pub struct ModProtocol {
     report: Report,
     report_ack: ReportAck,
     error: ErrorReply,
+    summarize: SummarizeSpec,
+    compact_done: CompactDone,
+    shell_done: ShellDone,
+    fork_done: ForkDone,
 }
 
 /// 公开的 JSON Schema（`protocol/mod.schema.json`）。
@@ -270,7 +345,10 @@ pub fn typescript_module() -> String {
          export const PROTO_VERSION = {PROTO_VERSION};\n\
          export const MOD_VERSION = {MOD_VERSION:?};\n\
          export const HOOK_MOD: ModName = {:?};\n\
-         export const ACTION_MOD: ModName = {:?};\n\n{}",
+         export const ACTION_MOD: ModName = {:?};\n\
+         export const SUMMARIZE_PREFIX = {SUMMARIZE_PREFIX:?};\n\
+         export const ANCHOR_GONE = {ANCHOR_GONE:?};\n\
+         export const SUMMARIZE_FAILED = {SUMMARIZE_FAILED:?};\n\n{}",
         ModName::Hook.as_str(),
         ModName::Actions.as_str(),
         ts::typescript(&schema())

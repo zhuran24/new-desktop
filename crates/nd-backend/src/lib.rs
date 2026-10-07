@@ -98,22 +98,90 @@ pub enum Act {
         to: CarrierId,
         msg: Msg,
     },
+    /// 经后端进程替会话做的一件事：总结、`!` 命令、派 fork 型子代理。至多一次，不可重发：
+    /// 结果不明就是 `Unknown`。
+    Invoke {
+        to: CarrierId,
+        what: Invocation,
+    },
 }
 impl Act {
     pub fn carrier(&self) -> &CarrierId {
         match self {
             Act::Open { carrier, .. } | Act::End { carrier, .. } => carrier,
-            Act::Send { to, .. } => to,
+            Act::Send { to, .. } | Act::Invoke { to, .. } => to,
         }
     }
     /// 恢复对账时证明没写出的票怎么办：要经独占登记放行的写类动作不补发（`Withhold`），
     /// 由引擎按当下事实重新放行另发；其余照写（`Resend`）。只由动作种类定。
     pub fn if_unsent(&self) -> IfUnsent {
         match self {
-            Act::Open { .. } | Act::Send { .. } => IfUnsent::Withhold,
+            Act::Open { .. } | Act::Send { .. } | Act::Invoke { .. } => IfUnsent::Withhold,
             Act::End { .. } => IfUnsent::Resend,
         }
     }
+}
+
+/// `Act::Invoke` 的内容（规格「三个加深模块的契约」的 `Invoke`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "invoke", rename_all = "snake_case")]
+pub enum Invocation {
+    /// 只压缩所选范围：`From` 从所选提示（含）到末尾，`UpTo` 从开头到所选提示（不含）。
+    /// 提示按原文和次序定位；定位不到不压缩，结果是 `Refused(AnchorGone)`。
+    Compact { scope: CompactScope, anchor: Anchor },
+    /// `!` 模式：在后端进程里跑一条 shell 命令，命令和输出追加进对话，本身不起回合。
+    Shell { command: String },
+    /// 派 fork 型子代理：带着当前上下文跑一件子任务。
+    ForkAgent { prompt: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactScope {
+    From,
+    UpTo,
+}
+
+/// 所选提示的定位：原文（正文与附件，按发出时的样子）和次序——它是对话里同一原文的
+/// 第 `nth` 次出现，共 `of` 次。后端看到的次数对不上就不压缩。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Anchor {
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<nd_wire::Attachment>,
+    pub nth: u32,
+    pub of: u32,
+}
+
+/// `Done::Invoked` 的结果。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "invoked", rename_all = "snake_case")]
+pub enum Invoked {
+    Compacted,
+    Shell {
+        /// 退出码；读不出来（例如超时被杀）时为 None。
+        exit: Option<i32>,
+        stdout: String,
+        stderr: String,
+        /// 命令和输出已追加进对话（模型下一次请求读得到）。
+        appended: bool,
+    },
+    Forked {
+        agent: String,
+    },
+}
+
+/// 能力表的一项：后端进程能不能做某件事，不能时写明原因（规格「后端端口」的 `caps`）。
+/// 界面按它置灰或隐藏入口，不按后端种类写死。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feature {
+    /// 稳定的英文标识，例如 `summarize`、`bang_mode`、`fork_subagent`。
+    pub id: String,
+    /// 给人看的名字。
+    pub label: String,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +340,10 @@ pub enum Refusal {
     Other {
         why: String,
     },
+    /// 总结的提示定位不到（原文找不到，或同一原文的次数对不上）：没有压缩。
+    AnchorGone {
+        why: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +355,9 @@ pub enum Done {
         readiness: Readiness,
         /// 适配器在守护进程重启后接回这个进程要用的记录（Claude：拉起时的能力表），执行器原样保存。
         adopt: Value,
+        /// 这个进程的能力表；旧记录没有时为空。
+        #[serde(default)]
+        features: Vec<Feature>,
     },
     Ended {
         code: Option<i32>,
@@ -290,6 +365,9 @@ pub enum Done {
     /// 送达：后端回显了这条输入的原生编号（Claude：带原 uuid 的 `isReplay` 回显）。
     Landed {
         native: String,
+    },
+    Invoked {
+        result: Invoked,
     },
 }
 
@@ -315,6 +393,11 @@ pub struct Fact {
 pub enum FactBody {
     /// 此承载位的 hello、流水追平和未结票对账完成；本代恢复闸门据此放行。
     Recovered,
+    /// 能力变了（例如守护进程重启后 mod 没回来，进程降为只能聊天）。
+    CapsChanged {
+        readiness: Readiness,
+        features: Vec<Feature>,
+    },
     /// Unknown 之后的新证据；不产生第二个终结结果，由原签发者更新当前结论。
     Clarified {
         ticket: Ticket,
