@@ -4408,7 +4408,7 @@ async fn settings_native_window_changes_model_effort_and_title_through_nd_wire()
     fx.wait(&session, "active", |s| header(s)["status"] == "active")
         .await;
     let output = std::env::var("ND_NATIVE_SETTINGS_OUTPUT")
-        .unwrap_or_else(|_| "/mnt/wd_external/nd-build/tmp/ticket-21-native".into());
+        .unwrap_or_else(|_| fx.scenario.root().join("native-settings").to_string_lossy().into_owned());
     let result = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
         .args([
