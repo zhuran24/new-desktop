@@ -304,6 +304,12 @@ def inner():
             assert before_process['run'] == after_process['run']
             assert before_process['backend_session'] == after_process['backend_session']
             assert next(i['data']['text'] for i in after['items'] if i['id'] == 'draft') == '主题切换保留的草稿'
+            finished = wait('creating', lambda s: block(s) is not None and block(s)['data']['complete'] is True)
+            (out / 'result.json').write_text(json.dumps({'pass': True,
+                'session': finished['stream'].removeprefix('session/'),
+                'checks': ['streaming theme reload preserves process and draft',
+                           'Markdown link, inline code and table header use file colors']}, ensure_ascii=False))
+            return
         app.kill()
         assert app.wait(timeout=5) == -9
         app = start('reopened')
