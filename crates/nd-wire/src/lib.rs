@@ -152,6 +152,20 @@ pub struct Cursor {
     pub epoch: String,
     pub seq: u64,
 }
+impl Snapshot {
+    pub fn position(&self) -> Cursor {
+        Cursor {
+            epoch: self.epoch.clone(),
+            seq: self.cursor,
+        }
+    }
+}
+impl Cursor {
+    pub fn is_followed_by(&self, event: &Event) -> bool {
+        self.epoch == event.epoch && self.seq.checked_add(1) == Some(event.cursor)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {

@@ -67,9 +67,7 @@ impl SyncReplica {
             }
             Response::Event { event } => {
                 let snapshot = self.replicas.get_mut(&event.stream)?;
-                if snapshot.epoch != event.epoch
-                    || snapshot.cursor.checked_add(1) != Some(event.cursor)
-                {
+                if !snapshot.position().is_followed_by(&event) {
                     return None;
                 }
                 snapshot.items.retain(|i| !event.remove.contains(&i.id));
@@ -203,18 +201,11 @@ impl SyncReplica {
             command: command.clone(),
         })
         .await?;
-        tokio::time::timeout(wait, async {
-            loop {
-                match self.receive().await? {
-                    Response::CommandReply { id: got, result } if got == id => return Ok(result),
-                    Response::Bye { .. } => return Err("nd-wire disconnected".into()),
-                    response => {
-                        self.apply(response);
-                    }
-                }
-            }
+        self.wait_response(wait, |response| match response {
+            Response::CommandReply { id: got, result } if *got == id => Some(result.clone()),
+            _ => None,
         })
-        .await?
+        .await
     }
     /// 查询可以安全重试，但 Missing 不能变成重发正文。
     pub async fn receipt(&mut self, command_id: &str) -> Result<nd_wire::ReceiptLookup> {
@@ -245,35 +236,51 @@ impl SyncReplica {
             content_hash,
         })
         .await?;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        self.wait_response(
+            std::time::Duration::from_secs(5),
+            |response| match response {
+                Response::ReceiptReply { id: got, result } if *got == id => Some(result.clone()),
+                _ => None,
+            },
+        )
+        .await
+    }
+    async fn wait_response<T>(
+        &mut self,
+        wait: std::time::Duration,
+        select: impl Fn(&Response) -> Option<T>,
+    ) -> Result<T> {
+        tokio::time::timeout(wait, async {
             loop {
-                match self.receive().await? {
-                    Response::ReceiptReply { id: got, result } if got == id => return Ok(result),
-                    Response::Bye { .. } => return Err("nd-wire disconnected".into()),
-                    response => {
-                        self.apply(response);
-                    }
+                let response = self.receive().await?;
+                if let Some(result) = select(&response) {
+                    return Ok(result);
                 }
+                if matches!(response, Response::Bye { .. }) {
+                    return Err("nd-wire disconnected".into());
+                }
+                self.apply(response);
             }
         })
         .await?
     }
+    async fn restore_subscriptions(&mut self) -> Result<()> {
+        let mut fresh = Self::connect(&self.path).await?;
+        for (stream, snapshot) in &self.replicas {
+            fresh
+                .send(Request::Subscribe {
+                    stream: stream.clone(),
+                    since: Some(snapshot.position()),
+                })
+                .await?;
+        }
+        self.socket = fresh.socket;
+        Ok(())
+    }
     async fn reconnect(&mut self) -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let Ok(mut fresh) = Self::connect(&self.path).await {
-                    for (stream, snapshot) in &self.replicas {
-                        fresh
-                            .send(Request::Subscribe {
-                                stream: stream.clone(),
-                                since: Some(nd_wire::Cursor {
-                                    epoch: snapshot.epoch.clone(),
-                                    seq: snapshot.cursor,
-                                }),
-                            })
-                            .await?;
-                    }
-                    self.socket = fresh.socket;
+                if self.restore_subscriptions().await.is_ok() {
                     return Ok(());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -286,31 +293,17 @@ impl SyncReplica {
         loop {
             match self.receive().await {
                 Ok(Response::Bye { .. }) | Err(_) => loop {
-                    if let Ok(mut fresh) = Self::connect(&self.path).await {
-                        for stream in self.replicas.keys() {
-                            fresh
-                                .send(Request::Subscribe {
-                                    stream: stream.clone(),
-                                    since: self.replicas.get(stream).map(|s| nd_wire::Cursor {
-                                        epoch: s.epoch.clone(),
-                                        seq: s.cursor,
-                                    }),
-                                })
-                                .await?;
-                        }
-                        self.socket = fresh.socket;
+                    if self.restore_subscriptions().await.is_ok() {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 },
                 Ok(response) => {
                     let gap = match &response {
-                        Response::Event { event } => {
-                            self.replicas.get(&event.stream).is_none_or(|s| {
-                                s.epoch != event.epoch
-                                    || s.cursor.checked_add(1) != Some(event.cursor)
-                            })
-                        }
+                        Response::Event { event } => self
+                            .replicas
+                            .get(&event.stream)
+                            .is_none_or(|s| !s.position().is_followed_by(event)),
                         Response::Resumed {
                             stream,
                             epoch,

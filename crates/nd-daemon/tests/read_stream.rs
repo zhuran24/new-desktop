@@ -230,10 +230,7 @@ async fn short_disconnect_replays_events_and_wrong_epoch_forces_snapshot() {
     wire.send(Message::Text(
         serde_json::to_string(&nd_wire::Request::Subscribe {
             stream: "global".into(),
-            since: Some(nd_wire::Cursor {
-                epoch: initial.epoch.clone(),
-                seq: initial.cursor,
-            }),
+            since: Some(initial.position()),
         })
         .unwrap()
         .into(),
@@ -391,10 +388,7 @@ async fn cursor_older_than_retained_events_gets_complete_snapshot() {
     wire.send(Message::Text(
         serde_json::to_string(&nd_wire::Request::Subscribe {
             stream: "global".into(),
-            since: Some(nd_wire::Cursor {
-                epoch: initial.epoch,
-                seq: initial.cursor,
-            }),
+            since: Some(initial.position()),
         })
         .unwrap()
         .into(),
