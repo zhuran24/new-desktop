@@ -61,6 +61,17 @@ struct StorageConfig {
 }
 impl Section for StorageConfig {
     const NAME: &'static str = "storage";
+    fn check(&self) -> nd_config::Result<()> {
+        if self.gc_interval_seconds == 0
+            || self.gc_interval_seconds > 86400
+            || self.blob_grace_seconds > 31536000
+        {
+            return Err(nd_config::Error::Invalid(
+                "附件清理间隔须为 1..86400 秒，宽限期须不超过一年".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Deserialize)]
 struct CommandsConfig {
@@ -68,6 +79,12 @@ struct CommandsConfig {
 }
 impl Section for CommandsConfig {
     const NAME: &'static str = "commands";
+    fn check(&self) -> nd_config::Result<()> {
+        if self.receipt_keep_ms == 0 || self.receipt_keep_ms > 31536000000 {
+            return Err(nd_config::Error::Invalid("收据保留期须为 1ms..1年".into()));
+        }
+        Ok(())
+    }
 }
 /// Claude 后端：钉住的 CLI、两个 mod、CLI 的配置目录（独占登记扫描它的注册表）。没配就没有 Claude 后端。
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -116,6 +133,14 @@ fn enabled_by_default() -> bool {
 }
 impl Section for SessionsConfig {
     const NAME: &'static str = "sessions";
+    fn check(&self) -> nd_config::Result<()> {
+        if self.idle_reclaim_ms == 0 || !(1..=60_000).contains(&self.tick_ms) {
+            return Err(nd_config::Error::Invalid(
+                "闲置回收时限须大于 0，检查间隔须为 1..60000ms".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Deserialize)]
 struct WireConfig {
@@ -124,45 +149,39 @@ struct WireConfig {
 }
 impl Section for WireConfig {
     const NAME: &'static str = "wire";
+    fn check(&self) -> nd_config::Result<()> {
+        if !(1..=4096).contains(&self.send_queue) || !(1..=60000).contains(&self.send_timeout_ms) {
+            return Err(nd_config::Error::Invalid(
+                "发送队列须为1..4096，超时须为1..60000ms".into(),
+            ));
+        }
+        Ok(())
+    }
 }
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+struct WatchdogsSection(Option<nd_runs::Config>);
+impl Section for WatchdogsSection {
+    const NAME: &'static str = "watchdogs";
+}
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+struct OptionalClaude(Option<ClaudeSection>);
+impl Section for OptionalClaude {
+    const NAME: &'static str = "claude";
+}
+
 fn validate_config(value: &Value) -> nd_config::Result<()> {
-    serde_json::from_value::<Option<nd_runs::Config>>(value["watchdogs"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    serde_json::from_value::<Option<ClaudeSection>>(value["claude"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    let sessions: SessionsConfig = serde_json::from_value(value["sessions"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    if sessions.idle_reclaim_ms == 0 || !(1..=60_000).contains(&sessions.tick_ms) {
-        return Err(nd_config::Error::Invalid(
-            "闲置回收时限须大于 0，检查间隔须为 1..60000ms".into(),
-        ));
-    }
-    serde_json::from_value::<DiagnosticsConfig>(value["diagnostics"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    let storage: StorageConfig = serde_json::from_value(value["storage"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    if storage.gc_interval_seconds == 0
-        || storage.gc_interval_seconds > 86400
-        || storage.blob_grace_seconds > 31536000
-    {
-        return Err(nd_config::Error::Invalid(
-            "附件清理间隔须为 1..86400 秒，宽限期须不超过一年".into(),
-        ));
-    }
-    let wire: WireConfig = serde_json::from_value(value["wire"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    if !(1..=4096).contains(&wire.send_queue) || !(1..=60000).contains(&wire.send_timeout_ms) {
-        return Err(nd_config::Error::Invalid(
-            "发送队列须为1..4096，超时须为1..60000ms".into(),
-        ));
-    }
-    let commands: CommandsConfig = serde_json::from_value(value["commands"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    if commands.receipt_keep_ms == 0 || commands.receipt_keep_ms > 31536000000 {
-        return Err(nd_config::Error::Invalid("收据保留期须为 1ms..1年".into()));
-    }
+    WatchdogsSection::parse(value)?;
+    OptionalClaude::parse(value)?;
+    SessionsConfig::parse(value)?;
+    DiagnosticsConfig::parse(value)?;
+    StorageConfig::parse(value)?;
+    WireConfig::parse(value)?;
+    CommandsConfig::parse(value)?;
     Ok(())
 }
+
 struct Engine {
     sessions: Arc<nd_session::Sessions>,
     runs: Option<Arc<nd_runs::Watchdogs>>,
@@ -237,7 +256,7 @@ impl Engine {
         let mut this = Self {
             sessions,
             runs,
-            runs_config: serde_json::from_value(config.snapshot().value["watchdogs"].clone())?,
+            runs_config: WatchdogsSection::parse(&config.snapshot().value)?.0,
             blobs,
             store,
             config: config.clone(),
@@ -262,8 +281,7 @@ impl Engine {
         Ok(this)
     }
     async fn configure(&mut self, config: &Config) -> Result<()> {
-        let next: Option<nd_runs::Config> =
-            serde_json::from_value(config.snapshot().value["watchdogs"].clone())?;
+        let next: Option<nd_runs::Config> = WatchdogsSection::parse(&config.snapshot().value)?.0;
         if next != self.runs_config {
             return Err("看守配置已变化，须重启守护进程才能生效".into());
         }
@@ -347,9 +365,9 @@ impl Engine {
             let reply = commands::execute(
                 tx,
                 command,
-                self.config.snapshot().value["commands"]["receipt_keep_ms"]
-                    .as_u64()
-                    .unwrap(),
+                CommandsConfig::parse(&self.config.snapshot().value)
+                    .expect("published configuration was validated")
+                    .receipt_keep_ms,
                 |tx| {
                     let receipt = self
                         .diagnostics
@@ -469,13 +487,10 @@ async fn assemble_sessions(
     paths: &Paths,
 ) -> Result<SessionAssembly> {
     let value = config.snapshot().value;
-    let watchdogs_config: Option<nd_runs::Config> =
-        serde_json::from_value(value["watchdogs"].clone())?;
-    let claude: Option<ClaudeSection> = serde_json::from_value(value["claude"].clone())?;
-    let sessions_config: SessionsConfig = serde_json::from_value(value["sessions"].clone())?;
-    let keep: u64 = value["commands"]["receipt_keep_ms"]
-        .as_u64()
-        .unwrap_or(604800000);
+    let watchdogs_config: Option<nd_runs::Config> = WatchdogsSection::parse(&value)?.0;
+    let claude: Option<ClaudeSection> = OptionalClaude::parse(&value)?.0;
+    let sessions_config: SessionsConfig = SessionsConfig::parse(&value)?;
+    let keep = CommandsConfig::parse(&value)?.receipt_keep_ms;
     let registry_root = claude
         .as_ref()
         .map(|c| c.config_dir.clone())

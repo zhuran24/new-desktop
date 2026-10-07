@@ -95,6 +95,15 @@ pub struct Config {
 }
 pub trait Section: DeserializeOwned + Clone {
     const NAME: &'static str;
+    fn parse(value: &Value) -> Result<Self> {
+        let section: Self = serde_json::from_value(value[Self::NAME].clone())
+            .map_err(|e| Error::Invalid(format!("{}: {e}", Self::NAME)))?;
+        section.check()?;
+        Ok(section)
+    }
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
 }
 pub struct SectionWatch<S> {
     last: Value,
@@ -106,8 +115,7 @@ impl<S: Section> SectionWatch<S> {
         let s = self.receiver.borrow();
         Ok(Versioned {
             revision: s.revision.clone(),
-            value: serde_json::from_value(s.value[S::NAME].clone())
-                .map_err(|e| Error::Invalid(e.to_string()))?,
+            value: S::parse(&s.value)?,
         })
     }
     pub async fn changed(&mut self) -> Result<Versioned<S>> {
