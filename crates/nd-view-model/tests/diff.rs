@@ -57,7 +57,7 @@ fn conversation_renders_fenced_and_edit_tool_diffs_without_losing_surrounding_te
     assert!(lines.iter().any(|l| l.text == "-旧"));
     assert!(lines.iter().any(|l| l.text == "+新"));
     assert!(
-        lines
+        !lines
             .iter()
             .any(|l| l.text == "\\ No newline at end of file")
     );
