@@ -282,6 +282,40 @@ pub(crate) fn box_shadow(theme: &nd_view_model::Theme) -> BoxShadow {
     }
 }
 
+/// 导航提示也是应用视图；保持打开时也读取当前变量，不冻结一份旧主题。
+pub(crate) fn tooltip(text: String, desktop: WeakEntity<Desktop>, cx: &mut App) -> AnyView {
+    cx.new(|_| ThemeTooltip { text, desktop }).into()
+}
+
+struct ThemeTooltip {
+    text: String,
+    desktop: WeakEntity<Desktop>,
+}
+impl Render for ThemeTooltip {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Ok(t) = self
+            .desktop
+            .read_with(cx, |desktop, _| desktop.theme.clone())
+        else {
+            return div().into_any_element();
+        };
+        div()
+            .max_w(window.viewport_size().width / 2.)
+            .m(px(t.spacing.small))
+            .p(px(t.spacing.small))
+            .bg(rgba(t.colors.surface))
+            .text_color(rgba(t.colors.foreground))
+            .font_family(t.typography.family.clone())
+            .text_size(px(t.typography.small))
+            .border(px(t.border_width))
+            .border_color(rgba(t.colors.border))
+            .rounded(px(t.radius))
+            .shadow(vec![box_shadow(&t)])
+            .child(self.text.clone())
+            .into_any_element()
+    }
+}
+
 fn control(element: Stateful<Div>, _id: String) -> Stateful<Div> {
     #[cfg(feature = "scenarios")]
     let element = element.child(

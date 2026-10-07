@@ -1,5 +1,5 @@
 use crate::Desktop;
-use gpui_kit::{component::tooltip::Tooltip, prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use nd_wire::PageReq;
 
 impl Desktop {
@@ -72,6 +72,7 @@ impl Desktop {
                                 let bounds = this.navigation_bounds.clone();
                                 #[cfg(feature = "scenarios")]
                                 let bound_id = id.clone();
+                                let desktop = cx.weak_entity();
                                 let mark = div()
                                     .relative()
                                     .id(SharedString::from(id.clone()))
@@ -80,13 +81,13 @@ impl Desktop {
                                     .items_center()
                                     .justify_center()
                                     .cursor_pointer()
-                                    .tooltip(move |window, cx| {
+                                    .tooltip(move |_, cx| {
                                         #[cfg(feature = "scenarios")]
                                         println!(
                                             "{}",
                                             serde_json::json!({"history_preview":preview})
                                         );
-                                        Tooltip::new(preview.clone()).build(window, cx)
+                                        crate::themes::tooltip(preview.clone(), desktop.clone(), cx)
                                     })
                                     .child(
                                         div()
@@ -223,6 +224,21 @@ impl Desktop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(200))
                 .await;
+            if let Some(gate) = plan["hover_gate"].as_str() {
+                for _ in 0..200 {
+                    let gate = std::path::PathBuf::from(gate);
+                    if cx
+                        .background_executor()
+                        .spawn(async move { gate.exists() })
+                        .await
+                    {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                }
+            }
             let position = weak
                 .update_in(cx, |this, window, cx| {
                     let bounds = *this
@@ -244,6 +260,21 @@ impl Desktop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(1000))
                 .await;
+            if let Some(gate) = plan["click_gate"].as_str() {
+                for _ in 0..200 {
+                    let gate = std::path::PathBuf::from(gate);
+                    if cx
+                        .background_executor()
+                        .spawn(async move { gate.exists() })
+                        .await
+                    {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                }
+            }
             cx.update(|window, cx| {
                 window.dispatch_event(
                     PlatformInput::MouseDown(MouseDownEvent {

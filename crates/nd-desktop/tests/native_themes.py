@@ -67,15 +67,19 @@ def inner():
         raise AssertionError('missing theme control: ' + control)
 
     def screenshot(name, expected=None):
-        time.sleep(.25)
-        subprocess.run(['spectacle', '-b', '-n', '-f', '-o', str(out / f'{name}.png')], check=True,
-                       capture_output=True, timeout=10, env=dict(os.environ, QT_QPA_PLATFORM='wayland'))
-        if expected is not None:
-            from PIL import Image
+        from PIL import Image
+        for _ in range(12):
+            # 副本日志早于实际合成；只接受非空且已呈现目标配色的图像。
+            time.sleep(.25)
+            subprocess.run(['spectacle', '-b', '-n', '-f', '-o', str(out / f'{name}.png')], check=True,
+                           capture_output=True, timeout=10, env=dict(os.environ, QT_QPA_PLATFORM='wayland'))
             with Image.open(out / f'{name}.png') as image:
+                histogram = image.convert('L').histogram()
                 colors = {color: count for count, color in image.convert('RGB').getcolors(image.width * image.height)}
-            for color in expected:
-                assert colors.get(color, 0) > 1000, (name, color, colors.get(color, 0))
+                visible = sum(histogram[16:]) > image.width * image.height * .05
+            if visible and all(colors.get(color, 0) > 1000 for color in expected or []):
+                return
+        raise AssertionError(f'{name}: compositor did not present the expected palette')
 
     def system_scheme(value):
         subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'color-scheme', value], check=True,

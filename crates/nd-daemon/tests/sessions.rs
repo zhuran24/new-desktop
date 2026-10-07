@@ -1810,14 +1810,29 @@ async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_inp
             ));
             fx.scenario.restart_daemon().unwrap();
         }
-        let mut ui = fx.ui().await;
+        // 写出后的故障可晚于 command 收据；一次性 peek 会撞上旧连接关闭。
+        // 和产品界面共用重连副本，必须等到新纪元里的真实投递确认。
+        let mut feed =
+            nd_ui_core::ReplicaFeed::start(fx.socket(), format!("session/{session}")).unwrap();
         signal(pid, rustix::process::Signal::CONT);
-        let done = fx
-            .wait(&session, "original delivery clarified", |s| {
-                texts(s) == ["第一轮", "已收到"]
-                    && prompt(s, "写后窗口").is_some_and(|i| i.data["state"] == "landed")
-            })
-            .await;
+        let done = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let update = feed
+                    .recv()
+                    .await
+                    .expect("replica feed closed before recovery");
+                if let nd_ui_core::FeedUpdate::Snapshot(snapshot) = update
+                    && snapshot.epoch != first.epoch
+                    && texts(&snapshot) == ["第一轮", "已收到"]
+                    && prompt(&snapshot, "写后窗口").is_some_and(|i| i.data["state"] == "landed")
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("new daemon epoch must clarify original delivery");
+        let mut ui = fx.ui().await;
         assert_eq!(cli_pid(&fx, &done).await, pid);
         assert_eq!(fx.scenario.endpoint().requests().len(), 2);
         assert!(matches!(
@@ -1831,6 +1846,7 @@ async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_inp
                 .exists(),
             "fault really fired"
         );
+        feed.close().await;
         fx.close();
     }
 }
@@ -2769,6 +2785,7 @@ async fn native_history(fx: &Fixture, session: &str, round: &str, text: &str, ro
         .arg("--session")
         .arg(session)
         .arg("--history")
+        .arg("--themes")
         .arg("--round")
         .arg(round)
         .arg("--text")

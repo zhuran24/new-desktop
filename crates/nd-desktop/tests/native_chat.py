@@ -39,7 +39,7 @@ def inner():
         if create:
             args += ['--scenario-create', json.dumps({'cwd': '/sandbox/project', 'model': 'haiku', 'text': '请写代码', 'attachments': settings.get('attachments', False)})]
         if settings.get('history'):
-            args += ['--scenario-history', json.dumps({'round': settings['round']})]
+            args += ['--scenario-history', json.dumps({'round': settings['round'], **({'hover_gate': '/sandbox/hover-ready', 'click_gate': '/sandbox/click-ready'} if settings.get('themes') else {})})]
         if draft is not None:
             args += ['--scenario-draft', json.dumps(draft)]
         process = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=dict(os.environ, WAYLAND_DEBUG='client'))
@@ -83,14 +83,63 @@ def inner():
 
     try:
         if settings.get('history'):
-            (Path('/sandbox/state') / 'ui.json').write_text(json.dumps({'selected_session': settings['session']}))
+            (Path('/sandbox/state') / 'ui.json').write_text(json.dumps({'selected_session': settings['session'], **({'theme_selection': {'kind': 'file', 'file': 'ocean.json'}} if settings.get('themes') else {})}))
             app = start('history')
+            if settings.get('themes'):
+                wait('history', lambda s: s['rounds'] == settings['rounds'] and s['messages'] > 0)
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    events = [json.loads(line) for line in (out / 'history.jsonl').read_text().splitlines()]
+                    if any(e.get('rendered_theme', {}).get('theme', {}).get('colors', {}).get('background') == '#123456ff' for e in events):
+                        break
+                    time.sleep(.05)
+                screenshot('before-hover')
+                Path('/sandbox/hover-ready').touch()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    if any('history_preview' in json.loads(line) for line in (out / 'history.jsonl').read_text().splitlines()):
+                        break
+                    time.sleep(.05)
+                screenshot('themed-tooltip')
+                with Image.open(out / 'before-hover.png') as before, Image.open(out / 'themed-tooltip.png') as after:
+                    # 只有悬停弹出的区域应新增文件指定的 surface 色；聊天正文早已呈现。
+                    newly_themed = sum(b != a and a == (23, 63, 95)
+                        for b, a in zip(before.convert('RGB').get_flattened_data(), after.convert('RGB').get_flattened_data()))
+                assert newly_themed > 1000, f'tooltip still uses a default palette: {newly_themed}'
+                theme_file.write_text(theme_source.replace('#173f5fff', '#3d293fff'))
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    events = [json.loads(line) for line in (out / 'history.jsonl').read_text().splitlines()]
+                    if any(e.get('rendered_theme', {}).get('theme', {}).get('colors', {}).get('surface') == '#3d293fff' for e in events):
+                        break
+                    time.sleep(.05)
+                screenshot('tooltip-hot-reload')
+                with Image.open(out / 'before-hover.png') as before, Image.open(out / 'themed-tooltip.png') as shown, Image.open(out / 'tooltip-hot-reload.png') as changed:
+                    repainted = sum(b != a and a == (23, 63, 95) and c == (61, 41, 63)
+                        for b, a, c in zip(before.convert('RGB').get_flattened_data(), shown.convert('RGB').get_flattened_data(), changed.convert('RGB').get_flattened_data()))
+                assert repainted > 1000, f'open tooltip kept the previous theme: {repainted}'
+                theme_file.write_text(theme_source)
+                Path('/sandbox/click-ready').touch()
             value = wait('history', lambda s: s.get('anchor') is not None)
             assert value['first'] == settings['text'], value
             assert value['rounds'] == settings['rounds'], value
             assert value['messages'] <= 60, value
             assert any(settings['text'] in json.loads(line).get('history_preview', '') for line in (out / 'history.jsonl').read_text().splitlines()), 'hover must show round preview'
             screenshot('history-dark')
+            if settings.get('themes'):
+                theme_file.write_text(theme_source.replace('#123456ff', '#26384aff').replace('"body": 18', '"body": 20'))
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    events = [json.loads(line) for line in (out / 'history.jsonl').read_text().splitlines()]
+                    theme_events = [e['rendered_theme'] for e in events if 'rendered_theme' in e]
+                    history_events = [e['rendered_history'] for e in events if 'rendered_history' in e]
+                    if theme_events and theme_events[-1]['theme']['colors']['background'] == '#26384aff':
+                        assert history_events[-1] == value, 'theme change moved the selected history page/anchor'
+                        break
+                    time.sleep(.05)
+                else:
+                    raise AssertionError('history theme never updated')
+                screenshot('history-new-theme')
             assert re.search(r'wl_surface#\d+\.attach\(wl_buffer#', (out / 'history.log').read_text())
             (out / 'result.json').write_text(json.dumps({'pass': True, 'history': value}))
             return
