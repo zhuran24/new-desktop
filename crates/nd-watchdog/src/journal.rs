@@ -206,13 +206,8 @@ impl Journal {
             return Err("cursor beyond high watermark".into());
         }
         let mut rows = read_records(&self.directory, after, limit)?;
-        if let Some(gap) = &self.emergency
-            && gap.end_seq > rows.last().map_or(after, |r| r.end_seq)
-            && rows.len() < limit.clamp(1, 1000)
-        {
-            let mut gap = gap.clone();
-            gap.seq = gap.seq.max(after + 1);
-            rows.push(gap);
+        if let Some(gap) = &self.emergency {
+            append_gap_tail(&mut rows, after, limit, gap.clone());
         }
         Ok(rows)
     }
