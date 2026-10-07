@@ -362,19 +362,18 @@ impl Engine {
                         })?;
                     #[cfg(feature = "scenarios")]
                     {
-                        fault.crash("after_effect");
-                        fault.unavailable("after_effect")?;
+                        fault.crash(faults::Point::AfterEffect);
                     }
                     Ok(receipt)
                 },
             )?;
             #[cfg(feature = "scenarios")]
-            fault.crash("before_commit");
+            fault.crash(faults::Point::BeforeCommit);
             Ok(reply)
         });
         #[cfg(feature = "scenarios")]
         if result.is_ok() {
-            fault.crash("after_commit");
+            fault.crash(faults::Point::AfterCommit);
         }
         match result {
             Ok(result) => {

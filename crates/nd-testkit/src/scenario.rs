@@ -163,7 +163,6 @@ pub enum CommandFault {
     CrashAfterEffect,
     CrashBeforeCommit,
     CrashAfterCommit,
-    UnavailableAfterEffect,
 }
 
 fn command(binary: &str) -> Command {
@@ -695,7 +694,6 @@ impl Scenario {
             CommandFault::CrashAfterEffect => ("after_effect", "crash"),
             CommandFault::CrashBeforeCommit => ("before_commit", "crash"),
             CommandFault::CrashAfterCommit => ("after_commit", "crash"),
-            CommandFault::UnavailableAfterEffect => ("after_effect", "unavailable"),
         };
         let dest = self.root().join("command-fault.json");
         if dest.exists() {

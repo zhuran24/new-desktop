@@ -1,30 +1,47 @@
-//! 仅 scenarios 构建的单次故障点，不进入生产二进制。
-use std::path::Path;
+//! 仅 scenarios 构建的提交点崩溃；故障文件只在实际崩溃时消费。
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
-pub struct Fault(serde_json::Value);
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Point {
+    AfterEffect,
+    BeforeCommit,
+    AfterCommit,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    Crash,
+}
+#[derive(Deserialize)]
+struct Spec {
+    point: Point,
+    action: Action,
+}
+pub struct Fault {
+    spec: Option<Spec>,
+    path: PathBuf,
+}
 impl Fault {
     pub fn take(root: &Path, id: &str) -> Self {
         let path = root.join("command-fault.json");
         let value = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-        if let Some(value) = value.filter(|v| v["id"] == id) {
-            std::fs::remove_file(path).expect("consume scenario fault");
-            Self(value)
-        } else {
-            Self(serde_json::Value::Null)
-        }
+        let spec = value
+            .filter(|v| v["id"] == id)
+            .map(|value| serde_json::from_value(value).expect("invalid scenario crash point"));
+        Self { spec, path }
     }
-    pub fn crash(&self, point: &str) {
-        if self.0["point"] == point && self.0["action"] == "crash" {
-            // 无析构、无清理；真实进程退出让 SQLite 自行恢复未提交事务。
+    pub fn crash(&self, point: Point) {
+        if self
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.point == point && matches!(spec.action, Action::Crash))
+        {
+            std::fs::remove_file(&self.path).expect("consume reached crash point");
             std::process::abort();
         }
-    }
-    pub fn unavailable(&self, point: &str) -> nd_store::Result<()> {
-        if self.0["point"] == point && self.0["action"] == "unavailable" {
-            return Err(nd_store::Error::Busy);
-        }
-        Ok(())
     }
 }

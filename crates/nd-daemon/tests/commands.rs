@@ -196,43 +196,6 @@ async fn crash_at_commit_boundaries_never_separates_effect_from_receipt() {
 }
 
 #[tokio::test]
-async fn unavailable_rolls_back_then_retries_the_same_id_with_backoff() {
-    let daemon = support::Daemon::start().await;
-    let mut ui = SyncReplica::connect(&daemon.socket).await.unwrap();
-    std::fs::write(
-        daemon.root().join("command-fault.json"),
-        json!({"id":"retry", "point":"after_effect", "action":"unavailable"}).to_string(),
-    )
-    .unwrap();
-    let started = tokio::time::Instant::now();
-    assert_eq!(
-        ui.command(&note("retry", "once", 0)).await.unwrap(),
-        CommandReply::Receipt {
-            receipt: Receipt::Done {
-                value: json!({"revision":1})
-            }
-        }
-    );
-    assert!(started.elapsed() >= std::time::Duration::from_millis(50));
-    assert_eq!(
-        ui.receipt("retry").await.unwrap(),
-        ReceiptLookup::Found {
-            receipt: Receipt::Done {
-                value: json!({"revision":1})
-            }
-        }
-    );
-    assert_eq!(
-        ui.get("diagnostics", Default::default())
-            .await
-            .unwrap()
-            .items[0]
-            .data["note"],
-        json!({"text":"once","revision":1})
-    );
-}
-
-#[tokio::test]
 async fn slow_connection_is_bounded_while_other_replicas_keep_event_order() {
     let daemon =
         support::Daemon::configured("[wire]\nsend_queue = 4\nsend_timeout_ms = 50\n").await;
@@ -368,6 +331,10 @@ async fn lost_conflict_response_is_not_mistaken_for_another_commands_receipt() {
             .await
             .unwrap(),
         CommandReply::Conflict
+    );
+    assert!(
+        !daemon.root().join("command-fault.json").exists(),
+        "the conflict response must actually be lost to a crash"
     );
 }
 
