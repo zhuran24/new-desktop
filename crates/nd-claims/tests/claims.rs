@@ -2,6 +2,58 @@ use nd_claims::*;
 use std::sync::Arc;
 
 #[test]
+fn a_verified_exit_before_up_releases_the_reserved_backend_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
+    let claims = support::ready(store.clone(), dir.path());
+    let mut child = ShortProcess::start();
+    let bs = BackendSessionId::claude("startup-exit");
+    let open = Act::Open {
+        session: "s".into(),
+        bs: NewBs::Known(bs.clone()),
+        via: "before-up".into(),
+    };
+    assert!(matches!(
+        store.write(|tx| claims.admit(tx, "first", &open)).unwrap(),
+        Admit::Go(_)
+    ));
+    let found = nd_runs::Found {
+        run: "before-up".into(),
+        identity: Some(child.identity()),
+        state: "Gone".into(),
+        high: 0,
+        exit: Some(1),
+        tail: "clean".into(),
+        reason: Some("Exited".into()),
+        detail: None,
+    };
+    // A claimed exit while the process is still alive is insufficient evidence.
+    claims
+        .observe_watchdog(&found, 1, BackendKind::Claude)
+        .unwrap();
+    assert!(claims.lease(&bs).unwrap().is_some());
+    child.stop();
+    claims
+        .observe_watchdog(&found, 1, BackendKind::Claude)
+        .unwrap();
+    assert_eq!(claims.lease(&bs).unwrap(), None);
+    drop(claims);
+    let claims = support::ready(store.clone(), dir.path());
+    claims
+        .observe_watchdog(&found, 1, BackendKind::Claude)
+        .unwrap();
+    let next = Act::Open {
+        session: "s".into(),
+        bs: NewBs::Known(bs),
+        via: "next-run".into(),
+    };
+    assert!(matches!(
+        store.write(|tx| claims.admit(tx, "next", &next)).unwrap(),
+        Admit::Go(_)
+    ));
+}
+
+#[test]
 fn opening_a_backend_session_reserves_it_for_one_run_and_rolls_back_with_the_caller() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());

@@ -579,7 +579,16 @@ impl Exclusivity {
                         identity.as_ref() == Some(&own.identity)
                             && !matches!(how, GoneHow::NeverLaunched)
                     }
-                    None => identity.is_none() && matches!(how, GoneHow::NeverLaunched),
+                    // A run may exit before initialize completes and reports Up.
+                    // Run ids are never reused; verified process death also ends
+                    // the reservation created before launch in that window.
+                    None => match (identity.as_ref(), &how) {
+                        (None, GoneHow::NeverLaunched) => true,
+                        (Some(identity), GoneHow::Exited | GoneHow::ProcGone) => {
+                            identity.matching() == Some(false)
+                        }
+                        _ => false,
+                    },
                 };
                 if matches {
                     state.leases.retain(|_, l| l.run != run);
