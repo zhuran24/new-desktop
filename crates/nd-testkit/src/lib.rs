@@ -6,3 +6,5 @@ mod scenario;
 pub use scenario::{
     CommandFault, Fifo, Process, Program, ResourceLimits, Scenario, ScenarioOptions,
 };
+
+pub mod isolation;

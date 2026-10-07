@@ -1,4 +1,7 @@
-use crate::{ClaudeEndpoint, Result};
+use crate::{
+    ClaudeEndpoint, Result,
+    isolation::{self, Isolation},
+};
 use nd_ui_core::SyncReplica;
 use std::{
     io::Write,
@@ -24,7 +27,7 @@ impl Program {
     /// The pinned BUILD.md CLI, with a fake key and only the local offline endpoint.
     pub fn claude() -> Self {
         Self {
-            binary: "/mnt/wd_external/nd-build/cli/claude-2.1.289".into(),
+            binary: isolation::pinned_cli().into(),
             args: vec![],
             claude: true,
         }
@@ -132,6 +135,7 @@ pub struct ScenarioOptions {
     pub timeout: Duration,
     pub watchdog: Option<PathBuf>,
     pub disk_scratch: bool,
+    pub default_paths: bool,
 }
 impl ScenarioOptions {
     pub fn new(name: &str, daemon: impl Into<PathBuf>) -> Self {
@@ -143,7 +147,16 @@ impl ScenarioOptions {
             timeout: Duration::from_secs(10),
             watchdog: None,
             disk_scratch: false,
+            default_paths: false,
         }
+    }
+    pub fn config(mut self, config: &str) -> Self {
+        self.config = config.into();
+        self
+    }
+    pub fn default_paths(mut self) -> Self {
+        self.default_paths = true;
+        self
     }
 }
 
@@ -153,6 +166,7 @@ pub struct Scenario {
     slice: String,
     services: Vec<String>,
     daemon_args: Vec<String>,
+    default_paths: bool,
     timeout: Duration,
     endpoint: Option<ClaudeEndpoint>,
     watchdog_config: Option<nd_runs::Config>,
@@ -240,6 +254,7 @@ impl Scenario {
             slice,
             services: vec![unit],
             daemon_args: Vec::new(),
+            default_paths: options.default_paths,
             timeout: options.timeout,
             endpoint: None,
             watchdog_config: None,
@@ -273,18 +288,7 @@ impl Scenario {
         if let Some(watchdog) = options.watchdog {
             let watchdog = watchdog.canonicalize()?;
             // Keep host PIDs for /proc identity checks. Network and home remain isolated.
-            let mut launcher = this.sandbox_args(&watchdog)?;
-            launcher.retain(|s| s != "--unshare-all");
-            launcher.splice(
-                1..1,
-                [
-                    "--unshare-user",
-                    "--unshare-ipc",
-                    "--unshare-net",
-                    "--unshare-uts",
-                ]
-                .map(str::to_owned),
-            );
+            let mut launcher = this.sandbox_args(&watchdog, Isolation::HostPid)?;
             launcher.extend([
                 "--ro-bind".into(),
                 watchdog.to_string_lossy().into_owned(),
@@ -293,7 +297,9 @@ impl Scenario {
             launcher.extend(
                 [
                     "--ro-bind",
-                    "/mnt/wd_external/nd-build/cli/claude-2.1.289",
+                    isolation::pinned_cli()
+                        .to_str()
+                        .expect("pinned path is UTF-8"),
                     "/cli",
                     "/usr/bin/python3",
                     "/sandbox/sandbox.py",
@@ -318,30 +324,27 @@ impl Scenario {
         }
         this.endpoint = Some(ClaudeEndpoint::bind(this.root().join("model.sock")).await?);
         let mut args = this.service_args(&this.services[0], true);
-        args.extend(this.sandbox_args(&daemon)?);
+        args.extend(this.sandbox_args(
+            &daemon,
+            if this.watchdog_config.is_some() {
+                Isolation::HostPid
+            } else {
+                Isolation::PrivatePid
+            },
+        )?);
         if this.watchdog_config.is_some() {
             // 短命的模型目录查询由真适配器在守护进程 cgroup 里直接拉起。
             args.extend(
                 [
                     "--ro-bind",
-                    "/mnt/wd_external/nd-build/cli/claude-2.1.289",
+                    isolation::pinned_cli()
+                        .to_str()
+                        .expect("pinned path is UTF-8"),
                     "/cli",
                 ]
                 .map(str::to_owned),
             );
             let bus = format!("/run/user/{}/bus", rustix::process::geteuid().as_raw());
-            args.retain(|s| s != "--unshare-all");
-            let at = args.iter().position(|s| s == "/usr/bin/bwrap").unwrap() + 1;
-            args.splice(
-                at..at,
-                [
-                    "--unshare-user",
-                    "--unshare-ipc",
-                    "--unshare-net",
-                    "--unshare-uts",
-                ]
-                .map(str::to_owned),
-            );
             args.extend(["--ro-bind".into(), bus.clone(), bus]);
             let private = format!(
                 "/run/user/{}/systemd/private",
@@ -349,11 +352,14 @@ impl Scenario {
             );
             args.extend(["--ro-bind".into(), private.clone(), private]);
         }
-        args.extend([
-            "/program".into(),
-            "--root".into(),
-            this.root().to_string_lossy().into_owned(),
-        ]);
+        args.push("/program".into());
+        if !this.default_paths {
+            args.extend(["--root".into(), this.root().to_string_lossy().into_owned()]);
+        } else {
+            let path = this.root().join("config/new-desktop");
+            std::fs::create_dir_all(&path)?;
+            std::fs::copy(this.root().join("config.toml"), path.join("config.toml"))?;
+        }
         checked(
             "systemd-run",
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -416,48 +422,49 @@ impl Scenario {
         }
         args
     }
-    fn sandbox_args(&self, binary: &Path) -> Result<Vec<String>> {
-        let mut args = vec![
-            "/usr/bin/bwrap",
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--symlink",
-            "usr/bin",
-            "/bin",
-            "--symlink",
-            "usr/lib",
-            "/lib",
-            "--symlink",
-            "usr/lib",
-            "/lib64",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--dir",
-            "/etc",
-            "--bind",
-            self.root().to_str().ok_or("non-UTF8 scenario root")?,
-            "/sandbox",
-            "--bind",
-            self.root().to_str().ok_or("non-UTF8 scenario root")?,
-            self.root().to_str().ok_or("non-UTF8 scenario root")?,
-            "--ro-bind",
-            binary.to_str().ok_or("non-UTF8 program path")?,
-            "/program",
-            "--chdir",
-            "/sandbox/project",
-            "--clearenv",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    fn sandbox_args(&self, binary: &Path, isolation: Isolation) -> Result<Vec<String>> {
+        let mut args = vec!["/usr/bin/bwrap".to_owned()];
+        args.extend(isolation.flags().iter().map(|s| (*s).to_owned()));
+        args.extend(
+            [
+                "--die-with-parent",
+                "--new-session",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib",
+                "/lib64",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--dir",
+                "/etc",
+                "--bind",
+                self.root().to_str().ok_or("non-UTF8 scenario root")?,
+                "/sandbox",
+                "--bind",
+                self.root().to_str().ok_or("non-UTF8 scenario root")?,
+                self.root().to_str().ok_or("non-UTF8 scenario root")?,
+                "--ro-bind",
+                binary.to_str().ok_or("non-UTF8 program path")?,
+                "/program",
+                "--chdir",
+                "/sandbox/project",
+                "--clearenv",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
         if let Some(disk) = &self.disk {
             args.extend([
                 "--bind".into(),
@@ -465,18 +472,8 @@ impl Scenario {
                 "/scratch".into(),
             ]);
         }
-        for (key, value) in [
-            ("PATH", "/usr/bin:/bin"),
-            ("LANG", "C.UTF-8"),
-            ("HOME", "/sandbox/home"),
-            ("CLAUDE_CONFIG_DIR", "/sandbox/claude"),
-            ("XDG_CONFIG_HOME", "/sandbox/config"),
-            ("XDG_DATA_HOME", "/sandbox/data"),
-            ("XDG_STATE_HOME", "/sandbox/state"),
-            ("XDG_CACHE_HOME", "/sandbox/cache"),
-            ("XDG_RUNTIME_DIR", "/sandbox/runtime"),
-        ] {
-            args.extend(["--setenv", key, value].map(str::to_owned));
+        for (key, value) in isolation::environment() {
+            args.extend(["--setenv".into(), key, value]);
         }
         Ok(args)
     }
@@ -516,19 +513,7 @@ impl Scenario {
                 r#"{"enableWorkflows":true}"#,
             ],
         )?;
-        for (key, value) in [
-            ("ANTHROPIC_BASE_URL", "http://127.0.0.1:8765"),
-            ("ANTHROPIC_API_KEY", "offline-fixture"),
-            ("DISABLE_AUTOUPDATER", "1"),
-            ("DISABLE_TELEMETRY", "1"),
-            ("DISABLE_ERROR_REPORTING", "1"),
-            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-            ("CLAUDE_CODE_EAGER_FLUSH", "1"),
-            ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
-            ("TERM", "dumb"),
-        ] {
-            spec.env.insert(key.into(), value.into());
-        }
+        spec.env.extend(isolation::offline_claude());
         Ok(spec)
     }
     pub fn watchdog_spec(
@@ -546,20 +531,7 @@ impl Scenario {
                 overflow: self.root().join("cache/spool-overflow").join(run),
                 ..Default::default()
             },
-            env: [
-                ("PATH", "/usr/bin:/bin"),
-                ("HOME", "/sandbox/home"),
-                ("CLAUDE_CONFIG_DIR", "/sandbox/claude"),
-                ("XDG_CONFIG_HOME", "/sandbox/config"),
-                ("XDG_DATA_HOME", "/sandbox/data"),
-                ("XDG_STATE_HOME", "/sandbox/state"),
-                ("XDG_CACHE_HOME", "/sandbox/cache"),
-                ("XDG_RUNTIME_DIR", "/sandbox/runtime"),
-                ("LANG", "C.UTF-8"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect(),
+            env: isolation::environment(),
         })
     }
     pub fn disk_root(&self) -> Option<&Path> {
@@ -586,14 +558,14 @@ impl Scenario {
         write!(
             file,
             "{}",
-            serde_json::json!({"name":name,"args":program.args,"claude":program.claude})
+            serde_json::json!({"name":name,"args":program.args,"claude":program.claude,"env":if program.claude {isolation::offline_claude()} else {Default::default()}})
         )?;
         let unit = self.services[0].replace("-daemon.service", &format!("-{name}.service"));
         if self.services.contains(&unit) {
             return Err("process name already used".into());
         }
         let mut args = self.service_args(&unit, false);
-        args.extend(self.sandbox_args(&program.binary.canonicalize()?)?);
+        args.extend(self.sandbox_args(&program.binary.canonicalize()?, Isolation::PrivatePid)?);
         args.extend([
             "/usr/bin/python3".into(),
             "/sandbox/sandbox.py".into(),
@@ -710,8 +682,15 @@ impl Scenario {
     pub fn command_fault_consumed(&self) -> bool {
         !self.root().join("command-fault.json").exists()
     }
+    pub fn socket(&self) -> PathBuf {
+        self.root().join(if self.default_paths {
+            "runtime/new-desktop/nd.sock"
+        } else {
+            "runtime/nd.sock"
+        })
+    }
     pub async fn connect(&self) -> Result<SyncReplica> {
-        let socket = self.root().join("runtime/nd.sock");
+        let socket = self.socket();
         tokio::time::timeout(self.timeout, async {
             loop {
                 if let Ok(ui) = SyncReplica::connect(&socket).await {

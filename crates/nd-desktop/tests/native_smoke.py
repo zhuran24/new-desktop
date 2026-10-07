@@ -8,12 +8,9 @@ import os
 from pathlib import Path
 import re
 import selectors
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
-import uuid
 
 
 def rendered(app):
@@ -130,55 +127,25 @@ def inner():
 
 
 def run(args, scenario=None, resources=()):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'nd-testkit/python'))
+    from isolation import Sandbox
     binaries = Path(args.bin_dir).resolve()
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix="nd-test-ticket7-"))
-    unit = f"nd-test-ticket7-{uuid.uuid4().hex}.service"
-    slice_name = f"nd-test-ticket7{uuid.uuid4().hex}.slice"
-    try:
-        for name in ["home", "claude", "config", "data", "state", "cache", "runtime", "daemon"]:
-            (work / name).mkdir(mode=0o700)
-        (work / "dbus.conf").write_text('''<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen>
-<policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/></policy></busconfig>''')
-        (work / "session.sh").write_text("#!/bin/sh\nexec /usr/bin/python /scenario.py --inner\n")
-        (work / "session.sh").chmod(0o700)
-        subprocess.run(["systemctl", "--user", "set-property", "--runtime", slice_name, "MemoryMax=2G", "MemorySwapMax=0"], check=True)
-        command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit", unit, "--slice", slice_name,
-                   "-p", "MemoryMax=2G", "-p", "MemorySwapMax=0", "-p", "LimitCORE=0", "bwrap", "--unshare-net", "--die-with-parent", "--new-session",
-                   "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64",
-                   "--proc", "/proc", "--ro-bind", "/sys", "/sys", "--dev", "/dev", "--dev-bind", "/dev/dri", "/dev/dri", "--tmpfs", "/tmp",
-                   "--bind", str(work), "/sandbox", "--bind", str(out), "/sandbox/out", "--ro-bind", str(Path(scenario or __file__).resolve()), "/scenario.py"]
-        for source, destination in resources:
-            command += ["--ro-bind", str(Path(source).resolve()), destination]
-        for name in ["nd-desktop", "nd-daemon", "ndctl"]:
-            command += ["--ro-bind", str(binaries / name), "/" + name]
+    with Sandbox('native', output=out) as box:
+        (box.root / 'daemon').mkdir(mode=0o700)
+        bindings = list(resources) + [(binaries / name, '/' + name) for name in ['nd-desktop', 'nd-daemon', 'ndctl']]
         if args.composer:
-            command += ["--ro-bind", str(binaries / "nd-composer-lab"), "/nd-composer-lab"]
-            command += ["--ro-bind", str(Path(__file__).resolve().parent.parent / "scripts/composer-lab.sh"), "/composer-lab.sh"]
-        command += ["--clearenv"]
-        command += ["--setenv", "ND_TEST_COMPOSER", "1" if args.composer else "0"]
-        for key, value in {"PATH": "/usr/bin", "HOME": "/sandbox/home", "CLAUDE_CONFIG_DIR": "/sandbox/claude", "XDG_RUNTIME_DIR": "/sandbox/runtime",
-                           "XDG_CONFIG_HOME": "/sandbox/config", "XDG_DATA_HOME": "/sandbox/data", "XDG_STATE_HOME": "/sandbox/state", "XDG_CACHE_HOME": "/sandbox/cache",
-                           "XDG_CURRENT_DESKTOP": "KDE", "QT_QPA_PLATFORM": "offscreen", "LANG": "C.UTF-8", "QT_LOGGING_RULES": "kwin_*.debug=true"}.items():
-            command += ["--setenv", key, value]
-        command += ["dbus-run-session", "--config-file", "/sandbox/dbus.conf", "--", "kwin_wayland", "--virtual", "--socket", "nd-test-ticket7",
-                    "--width", "1400", "--height", "900", "--no-lockscreen", "--no-global-shortcuts", "--no-kactivities", "--exit-with-session", "/sandbox/session.sh"]
-        with (out / "kwin.log").open("w") as log:
-            result = subprocess.run(command, stdout=log, stderr=log, timeout=getattr(args, "timeout", 55))
-        assert result.returncode == 0, (out / "kwin.log").read_text()[-5000:]
-        verdict = json.loads((out / "result.json").read_text())
-        assert verdict["pass"]
+            bindings += [(binaries / 'nd-composer-lab', '/nd-composer-lab'),
+                         (Path(__file__).resolve().parent.parent / 'scripts/composer-lab.sh', '/composer-lab.sh')]
+        command = box.native(scenario or __file__, bindings=bindings,
+            env={'ND_TEST_COMPOSER': '1' if args.composer else '0', 'QT_LOGGING_RULES': 'kwin_*.debug=true'})
+        with (out / 'kwin.log').open('w') as log:
+            result = subprocess.run(command, stdout=log, stderr=log, timeout=getattr(args, 'timeout', 55))
+        assert result.returncode == 0, (out / 'kwin.log').read_text()[-5000:]
+        verdict = json.loads((out / 'result.json').read_text())
+        assert verdict['pass']
         print(json.dumps(verdict, ensure_ascii=False, indent=2))
-    finally:
-        subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
-        subprocess.run(["systemctl", "--user", "stop", slice_name], capture_output=True)
-        subprocess.run(["systemctl", "--user", "reset-failed", unit], capture_output=True)
-        subprocess.run(["systemctl", "--user", "revert", slice_name], capture_output=True)
-        shutil.rmtree(work)
-        remaining = subprocess.check_output(["systemctl", "--user", "list-units", unit, slice_name, "--no-legend", "--plain"], text=True).strip()
-        (out / "cleanup.json").write_text(json.dumps({"unit": unit, "slice": slice_name, "remaining": remaining, "temporary_root_removed": not work.exists()}, indent=2))
-        assert not remaining, remaining
 
 
 if __name__ == "__main__":

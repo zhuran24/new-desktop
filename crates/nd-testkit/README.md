@@ -1,6 +1,6 @@
 # 离线场景运行器与 Claude 端点
 
-日期：2026-10-06。提供真守护进程、systemd/bwrap 隔离、同步副本、离线 Claude 端点、FIFO 与故障控制；#6 已接入真实看守，并提供 N7/V6 场景。产品会话与两个 mod 的接入由对应工单提供。
+日期：2026-10-07。提供真守护进程、systemd/bwrap 隔离、同步副本、离线 Claude 端点、FIFO 与故障控制；#6 已接入真实看守，并提供 N7/V6 场景。产品会话与两个 mod 的接入由对应工单提供。
 
 ## 运行
 
@@ -35,13 +35,17 @@ scripts/test-scenarios.sh
 | `Program::new(path)` | 用于真实 Bash、探针或后续真实看守；只带基础隔离环境。输入为 `/dev/null`，stdout/stderr 由 `Process` 读取 |
 | `Process::{wait,wait_for_stdout,kill}` | 有界等待退出/输出；kill 对整个进程服务发 SIGKILL。kill 会连输出监督进程一起杀掉，此后不能依赖 `.exit` 文件，应由 nd-wire/看守观察恢复结果 |
 | `Scenario::{kill_daemon,restart_daemon}` | 分别调用真实 `systemctl kill --signal=KILL` 与 `systemctl restart`；随后用 `connect()` 重新取同步副本 |
-| `arm_command_fault(id, CommandFault)` | 复用 #4 的测试构建故障点：效果后、提交前、提交后崩溃，以及效果后 unavailable。文件先完整写出再原子发布；不覆盖未消费故障 |
+| `arm_command_fault(id, CommandFault)` | 复用 #4 的测试构建故障点：效果后、提交前、提交后崩溃。文件先完整写出再原子发布；不覆盖未消费故障 |
 | `command_fault_consumed()` | 在已 arm 的测试中核对故障确实被消费，避免未命中却判通过；生产 daemon 不含故障逻辑 |
 | `Scenario::{root,units,limits,close}` | root 是宿主侧临时目录，隔离内固定 `/sandbox`；limits 实读内核 cgroup。close 返回清理错误，Drop 是失败/取消时的后备清理 |
 
 `Route::new(None, model)` 匹配没有 `x-claude-code-agent-id` 的主对话，`Some(id)` 精确匹配该请求头。模型名也精确匹配，不做别名归一化。未知组合和用尽的计划返回 409，仍计数；不能用缺省成功掩盖多请求。子代理 id 由 CLI 决定，场景可以从真实协议事件取得 id 后编排；V6 使用显式的 `enqueue_any_agent` 模型级计划接收动态 id。不能拿显示名猜 id，也不设置未编排请求的缺省成功。
 
 端点支持 `POST /v1/messages`（允许 query string）、非流式 JSON 与 SSE 的 text/tool_use；usage 是固定夹具值，不用于额度或 token 准确性测试。其他 API 未实现。工具应答中的程序必须由场景显式安排，真实工具结果通过下一次真实 CLI 请求观察。
+
+Rust 运行器、原生窗口场景和 CLI 现场生成器共用 `python/isolation.json` 中的 CLI 路径、基础环境与离线模型环境。Rust 的 `isolation` 模块读取同一策略；Python 的 `isolation.Sandbox` 负责 transient slice、bwrap、限额验证及清理。原生场景只增加私有 KWin/总线和渲染所需的只读挂载。所有 transient 服务带 `RuntimeMaxSec` 兜底。
+
+`ScenarioOptions::new(...).default_paths()` 验证产品的默认 XDG 路径；`Scenario::socket()` 给出对应宿主 socket。配置文本通过 `ScenarioOptions::config(...)` 设置。
 
 ## 隔离与清理
 
