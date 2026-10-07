@@ -129,7 +129,7 @@ def inner():
             handle.close()
 
 
-def run(args):
+def run(args, scenario=None, resources=()):
     binaries = Path(args.bin_dir).resolve()
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -148,7 +148,9 @@ def run(args):
                    "-p", "MemoryMax=2G", "-p", "MemorySwapMax=0", "-p", "LimitCORE=0", "bwrap", "--unshare-net", "--die-with-parent", "--new-session",
                    "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64",
                    "--proc", "/proc", "--ro-bind", "/sys", "/sys", "--dev", "/dev", "--dev-bind", "/dev/dri", "/dev/dri", "--tmpfs", "/tmp",
-                   "--bind", str(work), "/sandbox", "--bind", str(out), "/sandbox/out", "--ro-bind", str(Path(__file__).resolve()), "/scenario.py"]
+                   "--bind", str(work), "/sandbox", "--bind", str(out), "/sandbox/out", "--ro-bind", str(Path(scenario or __file__).resolve()), "/scenario.py"]
+        for source, destination in resources:
+            command += ["--ro-bind", str(Path(source).resolve()), destination]
         for name in ["nd-desktop", "nd-daemon", "ndctl"]:
             command += ["--ro-bind", str(binaries / name), "/" + name]
         if args.composer:
@@ -163,7 +165,7 @@ def run(args):
         command += ["dbus-run-session", "--config-file", "/sandbox/dbus.conf", "--", "kwin_wayland", "--virtual", "--socket", "nd-test-ticket7",
                     "--width", "1400", "--height", "900", "--no-lockscreen", "--no-global-shortcuts", "--no-kactivities", "--exit-with-session", "/sandbox/session.sh"]
         with (out / "kwin.log").open("w") as log:
-            result = subprocess.run(command, stdout=log, stderr=log, timeout=55)
+            result = subprocess.run(command, stdout=log, stderr=log, timeout=getattr(args, "timeout", 55))
         assert result.returncode == 0, (out / "kwin.log").read_text()[-5000:]
         verdict = json.loads((out / "result.json").read_text())
         assert verdict["pass"]

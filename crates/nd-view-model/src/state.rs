@@ -26,6 +26,9 @@ impl Default for WindowState {
 #[serde(default)]
 pub struct ViewState {
     pub theme: crate::ThemeMode,
+    /// None 只用于读取旧版本的 theme 明暗偏好。
+    #[serde(default)]
+    pub theme_selection: Option<crate::ThemeSelection>,
     pub components: BTreeMap<String, bool>,
     pub active_panel: Option<String>,
     pub window: WindowState,
@@ -35,6 +38,12 @@ pub struct ViewState {
     pub tree_views: BTreeMap<String, String>,
 }
 impl ViewState {
+    pub fn theme_selection(&self) -> crate::ThemeSelection {
+        self.theme_selection.clone().unwrap_or(match self.theme {
+            crate::ThemeMode::Light => crate::ThemeSelection::Light,
+            crate::ThemeMode::Dark => crate::ThemeSelection::Dark,
+        })
+    }
     pub fn validate(&self) -> io::Result<()> {
         if [self.window.width, self.window.height, self.sidebar_width]
             .iter()
@@ -52,6 +61,7 @@ impl Default for ViewState {
     fn default() -> Self {
         Self {
             theme: crate::ThemeMode::default(),
+            theme_selection: Some(crate::ThemeSelection::System),
             components: BTreeMap::new(),
             active_panel: None,
             window: WindowState::default(),

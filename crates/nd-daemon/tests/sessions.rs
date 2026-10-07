@@ -1680,16 +1680,57 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
 
 #[tokio::test]
 async fn native_chat_window_creates_and_recovers_during_streaming_markdown() {
-    let fx = Fixture::start("nd14-window", 3_600_000).await;
+    native_chat(false).await;
+}
+
+#[tokio::test]
+async fn native_theme_change_preserves_streaming_chat_and_draft() {
+    native_chat(true).await;
+}
+
+#[tokio::test]
+async fn native_theme_files_selection_and_system_appearance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = std::env::var_os("ND_NATIVE_THEME_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary.path().join("themes"));
+    let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_themes.py"))
+        .arg("--bin-dir")
+        .arg(Path::new(&desktop).parent().unwrap())
+        .arg("--output")
+        .arg(output)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+async fn native_chat(themes: bool) {
+    let fx = Fixture::start(
+        if themes { "nd23-window" } else { "nd14-window" },
+        3_600_000,
+    )
+    .await;
     let answer = "# 中文回答\n\n一段 **Markdown**。\n\n```rust\nfn main() { println!(\"你好\"); }\n```\n\n结束。";
     fx.scenario.endpoint().enqueue(
         Route::new(None, "claude-haiku-4-5-20251001"),
         ModelReply::streaming_text(answer, 1, 100),
     );
     let desktop = std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh");
-    let output = std::env::var_os("ND_NATIVE_OUTPUT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| fx.scenario.root().join("native-chat"));
+    let output = std::env::var_os(if themes {
+        "ND_NATIVE_THEME_CHAT_OUTPUT"
+    } else {
+        "ND_NATIVE_OUTPUT"
+    })
+    .map(std::path::PathBuf::from)
+    .unwrap_or_else(|| fx.scenario.root().join("native-chat"));
     let result = tokio::process::Command::new("python")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_chat.py"))
         .arg("--desktop")
@@ -1698,6 +1739,7 @@ async fn native_chat_window_creates_and_recovers_during_streaming_markdown() {
         .arg(fx.socket())
         .arg("--output")
         .arg(&output)
+        .args(if themes { vec!["--themes"] } else { vec![] })
         .output()
         .await
         .unwrap();
@@ -2766,14 +2808,29 @@ async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_inp
             ));
             fx.scenario.restart_daemon().unwrap();
         }
-        let mut ui = fx.ui().await;
+        // 写出后的故障可晚于 command 收据；一次性 peek 会撞上旧连接关闭。
+        // 和产品界面共用重连副本，必须等到新纪元里的真实投递确认。
+        let mut feed =
+            nd_ui_core::ReplicaFeed::start(fx.socket(), format!("session/{session}")).unwrap();
         signal(pid, rustix::process::Signal::CONT);
-        let done = fx
-            .wait(&session, "original delivery clarified", |s| {
-                texts(s) == ["第一轮", "已收到"]
-                    && prompt(s, "写后窗口").is_some_and(|i| i.data["state"] == "landed")
-            })
-            .await;
+        let done = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let update = feed
+                    .recv()
+                    .await
+                    .expect("replica feed closed before recovery");
+                if let nd_ui_core::FeedUpdate::Snapshot(snapshot) = update
+                    && snapshot.epoch != first.epoch
+                    && texts(&snapshot) == ["第一轮", "已收到"]
+                    && prompt(&snapshot, "写后窗口").is_some_and(|i| i.data["state"] == "landed")
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("new daemon epoch must clarify original delivery");
+        let mut ui = fx.ui().await;
         assert_eq!(cli_pid(&fx, &done).await, pid);
         assert_eq!(fx.scenario.endpoint().requests().len(), 2);
         assert!(matches!(
@@ -2787,6 +2844,7 @@ async fn ambiguous_write_and_crash_before_accounting_never_resend_the_native_inp
                 .exists(),
             "fault really fired"
         );
+        feed.close().await;
         fx.close();
     }
 }
@@ -4070,6 +4128,7 @@ async fn native_history(fx: &Fixture, session: &str, round: &str, text: &str, ro
         .arg("--session")
         .arg(session)
         .arg("--history")
+        .arg("--themes")
         .arg("--round")
         .arg(round)
         .arg("--text")
@@ -4110,6 +4169,7 @@ async fn settings_native_window_changes_model_effort_and_title_through_nd_wire()
             "--session",
             &session,
             "--settings",
+            "--themes",
         ])
         .output()
         .await

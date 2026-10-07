@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut socket = None;
     let mut state_path = None;
     let mut seconds = None::<u64>;
+    let mut themes_path = None;
     #[cfg(feature = "scenarios")]
     let mut scenario_create = None::<serde_json::Value>;
     #[cfg(feature = "scenarios")]
@@ -15,11 +16,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "scenarios")]
     let mut scenario_draft = None::<serde_json::Value>;
     #[cfg(feature = "scenarios")]
+    let mut scenario_theme_controls = None::<PathBuf>;
+    #[cfg(feature = "scenarios")]
     let mut scenario_history = None::<serde_json::Value>;
     #[cfg(feature = "scenarios")]
     let mut scenario_controls = None::<PathBuf>;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            #[cfg(feature = "scenarios")]
+            "--scenario-theme-controls" => {
+                scenario_theme_controls = Some(PathBuf::from(
+                    args.next().ok_or("missing theme controls path")?,
+                ))
+            }
             #[cfg(feature = "scenarios")]
             "--scenario-controls" => {
                 scenario_controls = Some(args.next().ok_or("missing controls")?.into())
@@ -49,6 +58,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?)
             }
             "--socket" => socket = Some(PathBuf::from(args.next().ok_or("--socket needs a path")?)),
+            "--themes" => {
+                themes_path = Some(PathBuf::from(args.next().ok_or("--themes needs a path")?))
+            }
             "--state" => {
                 state_path = Some(PathBuf::from(args.next().ok_or("--state needs a path")?))
             }
@@ -56,7 +68,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 seconds = Some(args.next().ok_or("--quit-after needs seconds")?.parse()?)
             }
             "--help" => {
-                println!("nd-desktop [--socket PATH] [--state PATH] [--quit-after SECONDS]");
+                println!(
+                    "nd-desktop [--socket PATH] [--state PATH] [--themes DIRECTORY] [--quit-after SECONDS]"
+                );
                 return Ok(());
             }
             _ => return Err(format!("unknown argument: {arg}").into()),
@@ -78,6 +92,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .join("new-desktop/ui.json"),
     };
     let file = ViewStateFile::open(&state_path)?;
+    let themes_path = match themes_path {
+        Some(path) => path,
+        None => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .ok_or("HOME missing; use --themes")?
+            .join("new-desktop/themes"),
+    };
+    let themes_path = std::path::absolute(themes_path)?;
     let (state, warning) = match file.load() {
         Ok(state) => (state, None),
         Err(e) => (
@@ -121,8 +144,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gpui_kit::open_window(options, cx, move |window, cx| {
                 window.set_window_title("New Desktop");
                 cx.new(|cx| {
-                    let desktop = Desktop::new(socket, state, save, warning, window, cx)
-                        .expect("start nd-wire worker");
+                    let desktop =
+                        Desktop::new(socket, state, save, warning, themes_path, window, cx)
+                            .expect("start nd-wire worker");
+                    #[cfg(feature = "scenarios")]
+                    if let Some(path) = scenario_theme_controls {
+                        Desktop::scenario_theme_controls(path, window, cx);
+                    }
                     #[cfg(feature = "scenarios")]
                     if let Some(plan) = scenario_settings {
                         Desktop::scenario_settings(plan, window, cx);
