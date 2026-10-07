@@ -619,6 +619,7 @@ fn stopping_one_scope_leaves_unrelated_registrations_and_restarts_cross_scope_co
             "unrelated",
         ))
         .unwrap();
+    let external = kernel.require(service.clone());
     let baseline = kernel.snapshot();
     let _provider = kernel
         .provide(service.clone(), Arc::<str>::from("old"))
@@ -634,7 +635,9 @@ fn stopping_one_scope_leaves_unrelated_registrations_and_restarts_cross_scope_co
             "consumer:release"
         ]
     );
+    assert!(external.with(str::to_owned).is_none());
     let _new_provider = kernel.provide(service, Arc::<str>::from("new")).unwrap();
+    assert_eq!(external.with(str::to_owned).as_deref(), Some("new"));
     block_on(kernel.reconcile(Duration::from_secs(1)));
     assert!(matches!(
         kernel.state("consumer"),

@@ -504,7 +504,10 @@ impl Kernel {
             .unwrap()
             .entries
             .iter()
-            .filter_map(|(id, entry)| (entry.scope() == scope).then_some(*id))
+            .filter_map(|(id, entry)| {
+                (entry.scope() == scope && !matches!(entry, registry::Entry::Dependency(_)))
+                    .then_some(*id)
+            })
             .collect();
         self.begin_stop(affected, extra);
         self.drive_stop().await;
