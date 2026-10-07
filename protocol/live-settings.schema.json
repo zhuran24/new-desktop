@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LiveSettings",
+  "type": "object",
+  "properties": {
+    "applied": {
+      "$ref": "#/$defs/EffectiveSettings",
+      "default": {
+        "effort": null,
+        "model": null,
+        "ultracode": null,
+        "ultracode_requested": null
+      }
+    },
+    "caps": {
+      "$ref": "#/$defs/SettingCaps",
+      "default": {
+        "effort": false,
+        "model": false,
+        "permission_mode": false,
+        "ultracode": false
+      }
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "models": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Model"
+      }
+    },
+    "permission_labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
+    },
+    "permission_mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "permission_modes": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "EffectiveSettings": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "ultracode": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "ultracode_requested": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        }
+      }
+    },
+    "Model": {
+      "description": "后端实时给出的模型选项；value 原样用于 session.create，不从显示名称推导。",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "default": ""
+        },
+        "disabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "effort_levels": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "label": {
+          "type": "string",
+          "default": ""
+        },
+        "resolved_model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "value": {
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "SettingCaps": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": "boolean",
+          "default": false
+        },
+        "model": {
+          "type": "boolean",
+          "default": false
+        },
+        "permission_mode": {
+          "type": "boolean",
+          "default": false
+        },
+        "ultracode": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+  }
+}

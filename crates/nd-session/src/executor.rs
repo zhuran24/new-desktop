@@ -679,8 +679,9 @@ impl Executor {
                 if matches!(setting, nd_wire::LiveSetting::Ultracode(_))
                     && nd_backend::session_capabilities(
                         &self.core.meta().kind,
-                        &self.core.meta().settings["caps"],
-                    )["ultracode"]
+                        &self.core.meta().settings.caps,
+                    )
+                    .ultracode
                         != true
                 {
                     return Ok(rejected(
@@ -812,7 +813,7 @@ impl Executor {
                 model: optional("model"),
                 effort: None,
                 permission_mode: optional("permission_mode"),
-                settings: Value::Null,
+                settings: nd_backend::LiveSettings::default(),
                 title: Some(text.trim().chars().take(60).collect()),
                 title_source: Some("summary".into()),
                 title_seed: (text.trim().chars().count() >= 10
@@ -1350,6 +1351,9 @@ impl Executor {
                         self.show_invoke(tx, fx, &invoke, "running", None)?;
                     }
                 }
+                FactBody::SettingsObserved { settings } => {
+                    self.core.meta.as_mut().unwrap().settings = settings;
+                }
                 FactBody::CapsChanged {
                     readiness,
                     features,
@@ -1516,6 +1520,7 @@ impl Executor {
                             interaction,
                             adopt,
                             features,
+                            settings,
                             ..
                         },
                 },
@@ -1530,12 +1535,10 @@ impl Executor {
                     c.checkpoint = None;
                     c.turn_running = false;
                 }
-                if let Some(settings) = adopt.get("settings") {
-                    let meta = self.core.meta.as_mut().unwrap();
-                    meta.settings = settings.clone();
-                    if let Some(mode) = settings["permission_mode"].as_str() {
-                        meta.permission_mode = Some(mode.into());
-                    }
+                let meta = self.core.meta.as_mut().unwrap();
+                meta.settings = settings.clone();
+                if let Some(mode) = &settings.permission_mode {
+                    meta.permission_mode = Some(mode.clone());
                 }
                 self.ensure_lineage(carrier)?;
             }
@@ -1569,10 +1572,10 @@ impl Executor {
                     }
                     _ => {}
                 }
-                let models = meta.settings["models"].clone();
+                let models = meta.settings.models.clone();
                 meta.settings = settings.clone();
-                meta.settings["models"] = models;
-                meta.settings["permission_mode"] = json!(meta.permission_mode);
+                meta.settings.models = models;
+                meta.settings.permission_mode = meta.permission_mode.clone();
             }
             (Act::End { carrier, .. }, Outcome::Ok { .. }) => {
                 if let Some(c) = self.core.carriers.get_mut(carrier) {
@@ -3284,7 +3287,7 @@ pub(crate) fn header(core: &Core) -> Value {
         "permission_mode": meta.permission_mode,
         "pending_setting": core.ops.values().find(|op| matches!(op.spec,OpSpec::Configure(_))).map(|op| if matches!(&op.spec, OpSpec::Configure(op) if matches!(op.setting, nd_wire::LiveSetting::Model(_))) && carrier.is_some_and(|c| c.turn_running) {"模型将在本回合结束后生效"} else {"正在应用设置"}),
         "settings": meta.settings,
-        "caps": nd_backend::session_capabilities(&meta.kind, &meta.settings["caps"]),
+        "caps": nd_backend::session_capabilities(&meta.kind, &meta.settings.caps),
         "note": meta.note,
         "irreversible": meta.irreversible,
         "process": carrier.map(|c| json!({

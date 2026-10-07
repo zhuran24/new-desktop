@@ -577,10 +577,15 @@ impl Inner {
                     initial_control(&mut claude_run, json!({"subtype":"get_settings"}))
                         .await
                         .map(settings_with_caps)
-                        .unwrap_or_else(|why| json!({"caps":{},"error":why}));
-                settings["models"] = claude_run.ready().initialize["models"].clone();
-                settings["permission_mode"] =
-                    claude_run.ready().initialize["current_permission_mode"].clone();
+                        .unwrap_or_else(|why| nd_wire::LiveSettings {
+                            error: Some(why),
+                            ..Default::default()
+                        });
+                settings.models =
+                    crate::models::decode(&claude_run.ready().initialize).unwrap_or_default();
+                settings.permission_mode = claude_run.ready().initialize["current_permission_mode"]
+                    .as_str()
+                    .map(str::to_owned);
                 let ready = claude_run.ready().clone();
                 self.observe(Observed::Up {
                     run: run.0.clone(),
@@ -595,8 +600,7 @@ impl Inner {
                     ClaudeReadiness::Full => Readiness::Full,
                     ClaudeReadiness::ChatOnly { why } => Readiness::ChatOnly { why: why.clone() },
                 };
-                let mut adopt = serde_json::to_value(&ready.caps).unwrap_or(Value::Null);
-                adopt["settings"] = settings;
+                let adopt = serde_json::to_value(&ready.caps).unwrap_or(Value::Null);
                 self.start_actor(
                     issued.session.clone(),
                     carrier.clone(),
@@ -613,6 +617,7 @@ impl Inner {
                             &issued.ticket,
                             Outcome::Ok {
                                 done: Done::Opened {
+                                    settings,
                                     bs,
                                     run: run.clone(),
                                     readiness,
@@ -950,6 +955,14 @@ impl Inner {
             self.deliver_facts(session, &record.carrier, facts).await;
             return;
         };
+        if let Some(legacy) = record.adopt.get("settings") {
+            facts.push(fact(
+                format!("legacy-settings:{run}"),
+                FactBody::SettingsObserved {
+                    settings: settings_with_caps(legacy.clone()),
+                },
+            ));
+        }
         let (cursor, convo) = match &record.checkpoint {
             Some(Checkpoint(value)) => (
                 value["seq"].as_u64().unwrap_or(0),
@@ -2367,17 +2380,41 @@ impl BackendAdapter for ClaudeBackend {
     }
 }
 
-fn settings_with_caps(mut settings: Value) -> Value {
-    if !settings.is_object() {
-        settings = json!({});
+fn settings_with_caps(settings: Value) -> nd_wire::LiveSettings {
+    let applied = &settings["applied"];
+    let ultracode = applied["ultracodeAvailable"] == true
+        && applied["ultracodeRequested"].is_boolean()
+        && applied["ultracode"].is_boolean();
+    let modes = [
+        ("default", "默认审批"),
+        ("acceptEdits", "允许编辑"),
+        ("plan", "计划"),
+        ("dontAsk", "不询问"),
+        ("auto", "自动"),
+        ("bypassPermissions", "跳过审批"),
+    ];
+    nd_wire::LiveSettings {
+        applied: nd_wire::EffectiveSettings {
+            model: applied["model"].as_str().map(str::to_owned),
+            effort: applied["effort"].as_str().map(str::to_owned),
+            ultracode: applied["ultracode"].as_bool(),
+            ultracode_requested: applied["ultracodeRequested"].as_bool(),
+        },
+        caps: nd_wire::SettingCaps {
+            model: applied["model"].is_string(),
+            effort: applied.is_object(),
+            permission_mode: applied.is_object(),
+            ultracode,
+        },
+        permission_modes: modes.iter().map(|(value, _)| (*value).into()).collect(),
+        permission_labels: modes
+            .into_iter()
+            .map(|(value, label)| (value.into(), label.into()))
+            .collect(),
+        permission_mode: settings["permission_mode"].as_str().map(str::to_owned),
+        models: crate::models::decode(&json!({"models":settings["models"]})).unwrap_or_default(),
+        ..Default::default()
     }
-    // 缺字段即不可用；ACK 不能代替实际状态。Codex 适配没有这个能力。
-    let ultra = settings["applied"]["ultracodeAvailable"] == true
-        && settings["applied"]["ultracodeRequested"].is_boolean()
-        && settings["applied"]["ultracode"].is_boolean();
-    settings = json!({"applied":settings["applied"],"permission_modes":["default","acceptEdits","plan","dontAsk","auto","bypassPermissions"]});
-    settings["caps"] = json!({"model":settings["applied"]["model"].is_string(),"effort":settings["applied"].is_object(),"permission_mode":settings["applied"].is_object(),"ultracode":ultra});
-    settings
 }
 
 fn setting_request(setting: &nd_wire::LiveSetting) -> Value {

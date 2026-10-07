@@ -3,6 +3,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&directory)?;
     for (name, schema) in [
         (
+            "live-settings.schema.json",
+            schemars::schema_for!(nd_wire::LiveSettings),
+        ),
+        (
             "configure-session.schema.json",
             schemars::schema_for!(nd_wire::ConfigureSession),
         ),

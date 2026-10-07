@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+mod settings;
+pub use settings::{EffectiveSettings, LiveSettings, SettingCaps};
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// 会话持久草稿；光标、选区和输入法组词不在此协议中。
@@ -113,12 +116,15 @@ pub struct Invoked {
 }
 
 /// 后端实时给出的模型选项；value 原样用于 session.create，不从显示名称推导。
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(default)]
 pub struct Model {
     pub value: String,
     pub label: String,
     pub description: String,
     pub disabled: bool,
+    pub resolved_model: Option<String>,
+    pub effort_levels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]

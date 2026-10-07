@@ -70,26 +70,7 @@ pub(crate) async fn query(
                     return Err("模型目录初始化失败".into());
                 }
                 let response = &frame["response"]["response"];
-                let values = response["models"].as_array().ok_or("后端未提供模型列表")?;
-                let mut models = Vec::new();
-                for (values, unavailable) in [
-                    (Some(values), false),
-                    (response["unavailable_models"].as_array(), true),
-                ] {
-                    for model in values.into_iter().flatten() {
-                        let value = model["value"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                            .ok_or("后端模型缺少 value")?;
-                        models.push(nd_wire::Model {
-                            value: value.into(),
-                            label: model["displayName"].as_str().unwrap_or(value).into(),
-                            description: model["description"].as_str().unwrap_or_default().into(),
-                            disabled: unavailable || model["disabled"].as_bool().unwrap_or(false),
-                        });
-                    }
-                }
-                return Ok(models);
+                return decode(response);
             }
             Err("辅助进程没有返回模型列表".into())
         };
@@ -110,4 +91,36 @@ pub(crate) async fn query(
     .await;
     claude.channel().unregister(&run);
     result
+}
+
+/// Both model queries and live settings use the same neutral catalog.
+pub(crate) fn decode(response: &Value) -> crate::Result<Vec<nd_wire::Model>> {
+    let values = response["models"].as_array().ok_or("后端未提供模型列表")?;
+    let mut models = Vec::new();
+    for (values, unavailable) in [
+        (Some(values), false),
+        (response["unavailable_models"].as_array(), true),
+    ] {
+        for model in values.into_iter().flatten() {
+            let value = model["value"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("后端模型缺少 value")?;
+            models.push(nd_wire::Model {
+                resolved_model: model["resolvedModel"].as_str().map(str::to_owned),
+                effort_levels: model["supportedEffortLevels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect(),
+                value: value.into(),
+                label: model["displayName"].as_str().unwrap_or(value).into(),
+                description: model["description"].as_str().unwrap_or_default().into(),
+                disabled: unavailable || model["disabled"].as_bool().unwrap_or(false),
+            });
+        }
+    }
+
+    Ok(models)
 }

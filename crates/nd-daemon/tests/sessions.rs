@@ -3937,7 +3937,7 @@ async fn settings_effort_and_ultracode_follow_cli_availability_and_preserve_effo
             assert_eq!(header(&s)["settings"]["applied"]["effort"], "high");
             assert_eq!(header(&s)["caps"]["ultracode"], true);
             assert_eq!(
-                header(&s)["settings"]["applied"]["ultracodeRequested"],
+                header(&s)["settings"]["applied"]["ultracode_requested"],
                 expected
             );
         }

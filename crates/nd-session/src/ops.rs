@@ -113,8 +113,11 @@ impl Create {
                     carrier: carrier.clone(),
                     run: run.clone(),
                     spec: OpenSpec {
-                        live_settings: v.meta().settings["applied"]["ultracodeRequested"]
-                            .as_bool()
+                        live_settings: v
+                            .meta()
+                            .settings
+                            .applied
+                            .ultracode_requested
                             .map(nd_wire::LiveSetting::Ultracode)
                             .into_iter()
                             .collect(),
@@ -200,8 +203,11 @@ impl Launch {
                     carrier: self.carrier.clone(),
                     run: run.clone(),
                     spec: OpenSpec {
-                        live_settings: v.meta().settings["applied"]["ultracodeRequested"]
-                            .as_bool()
+                        live_settings: v
+                            .meta()
+                            .settings
+                            .applied
+                            .ultracode_requested
                             .map(nd_wire::LiveSetting::Ultracode)
                             .into_iter()
                             .collect(),
@@ -288,7 +294,7 @@ impl Configure {
         match outcome {
             Outcome::Ok {
                 done: Done::Configured { settings },
-            } => Ok(settings),
+            } => Ok(serde_json::to_value(settings).expect("neutral settings")),
             other => Err(j.fail(other.reason())),
         }
     }

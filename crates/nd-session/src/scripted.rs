@@ -80,7 +80,7 @@ struct Inner {
     live: HashMap<CarrierId, RunId>,
     drain: Option<Drain>,
     acks: usize,
-    initial_settings: serde_json::Value,
+    initial_settings: nd_backend::LiveSettings,
 }
 
 /// 重启之间留着的后端状态。
@@ -140,7 +140,7 @@ impl ScriptedAdapter {
     pub fn set_drain(&self, drain: Drain) {
         self.inner.lock().unwrap().drain = Some(drain);
     }
-    pub fn set_initial_settings(&self, settings: serde_json::Value) {
+    pub fn set_initial_settings(&self, settings: nd_backend::LiveSettings) {
         self.inner.lock().unwrap().initial_settings = settings;
     }
     pub fn received(&self) -> Vec<(Ticket, Act)> {
@@ -290,6 +290,7 @@ impl ScriptedAdapter {
                 vec![
                     done(Outcome::Ok {
                         done: Done::Opened {
+                            settings,
                             bs: spec.origin.backend_session().clone(),
                             run: run.clone(),
                             readiness: Readiness::Full,
@@ -306,7 +307,7 @@ impl ScriptedAdapter {
                                 immediate_preserves_mcp: false,
                                 rewind_menu: true,
                             },
-                            adopt: json!({"scripted": true, "settings":settings}),
+                            adopt: json!({"scripted": true}),
                             features: vec![],
                         },
                     }),
@@ -400,7 +401,7 @@ impl ScriptedAdapter {
                 let applied = serde_json::to_value(setting).unwrap();
                 vec![done(Outcome::Ok {
                     done: Done::Configured {
-                        settings: json!({"applied":applied}),
+                        settings: serde_json::from_value(json!({"applied":applied})).unwrap(),
                     },
                 })]
             }

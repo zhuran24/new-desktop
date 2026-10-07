@@ -4,6 +4,7 @@
 //! 生产实现是 Claude 适配（`nd-claude`），以后加 Codex；测试另有脚本化实现。
 //! 动作与事实只加不改：执行器把它们存进发件箱和操作账，跨版本读回。
 pub use nd_claims::{BackendKind, BackendSessionId};
+pub use nd_wire::{LiveSettings, SettingCaps};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
@@ -413,9 +414,11 @@ pub enum Done {
         title: Option<String>,
     },
     Configured {
-        settings: Value,
+        settings: LiveSettings,
     },
     Opened {
+        #[serde(default)]
+        settings: LiveSettings,
         bs: BackendSessionId,
         run: RunId,
         readiness: Readiness,
@@ -472,6 +475,9 @@ pub struct Fact {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "fact", rename_all = "snake_case")]
 pub enum FactBody {
+    SettingsObserved {
+        settings: LiveSettings,
+    },
     CanCancelQueued {
         available: bool,
     },
@@ -734,11 +740,8 @@ impl Backends {
 
 /// 承载位报告的能力经过后端端口的硬约束，再交给所有界面。
 /// 缺字段一律不开放 ultracode；Codex 无论报告内容如何都不可用。
-pub fn session_capabilities(kind: &BackendKind, reported: &Value) -> Value {
-    let mut caps = reported.as_object().cloned().unwrap_or_default();
-    caps.insert(
-        "ultracode".into(),
-        Value::Bool(*kind == BackendKind::Claude && reported["ultracode"] == true),
-    );
-    Value::Object(caps)
+pub fn session_capabilities(kind: &BackendKind, reported: &SettingCaps) -> SettingCaps {
+    let mut caps = reported.clone();
+    caps.ultracode &= *kind == BackendKind::Claude;
+    caps
 }

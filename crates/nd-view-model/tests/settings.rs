@@ -16,7 +16,7 @@ fn settings_controls_follow_capabilities_and_the_backend_model_catalog() {
                 title: "会话".into(),
                 text: "".into(),
             },
-            data: json!({"session":"s","status":"active","backend":"claude","model":"opus","title":"标题","caps":{"model":true,"effort":true,"permission_mode":true,"ultracode":true},"settings":{"applied":{"model":"claude-opus-5-5","effort":"high","ultracode":true,"ultracodeRequested":true},"models":[{"value":"opus","displayName":"Opus","resolvedModel":"claude-opus-5-5","supportedEffortLevels":["low","high","xhigh"]}]}}),
+            data: json!({"session":"s","status":"active","backend":"claude","model":"opus","title":"标题","caps":{"model":true,"effort":true,"permission_mode":true,"ultracode":true},"settings":{"applied":{"model":"claude-opus-5-5","effort":"high","ultracode":true,"ultracode_requested":true},"models":[{"value":"opus","label":"Opus","resolved_model":"claude-opus-5-5","effort_levels":["low","high","xhigh"]}]}}),
         }],
     };
     let view = session_settings(&snapshot);

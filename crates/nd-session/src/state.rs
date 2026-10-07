@@ -50,8 +50,8 @@ pub struct Meta {
     #[serde(default)]
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
-    #[serde(default)]
-    pub settings: Value,
+    #[serde(default, deserialize_with = "read_settings")]
+    pub settings: nd_backend::LiveSettings,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -436,4 +436,10 @@ pub fn listed(store: &nd_store::Store) -> nd_store::Result<Vec<Core>> {
         out.push(serde_json::from_str(&row?).map_err(corrupt)?);
     }
     Ok(out)
+}
+
+fn read_settings<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<nd_backend::LiveSettings, D::Error> {
+    Ok(Option::<nd_backend::LiveSettings>::deserialize(de)?.unwrap_or_default())
 }

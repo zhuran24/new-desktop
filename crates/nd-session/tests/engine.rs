@@ -416,8 +416,9 @@ async fn reclaim_does_not_promote_a_model_default_effort_into_a_user_override() 
     let mut cfg = config();
     cfg.idle_reclaim = std::time::Duration::from_millis(60);
     let h = Harness::new(cfg).await;
-    h.adapter
-        .set_initial_settings(serde_json::json!({"applied":{"effort":"medium"}}));
+    h.adapter.set_initial_settings(
+        serde_json::from_value(serde_json::json!({"applied":{"effort":"medium"}})).unwrap(),
+    );
     let session = accepted_session(&h.create("default-effort", "first").await);
     h.wait(&session, "reclaimed", |s| {
         header(s)["status"] == "active" && header(s)["process"]["alive"] == false
