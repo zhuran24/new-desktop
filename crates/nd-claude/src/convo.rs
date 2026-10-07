@@ -65,7 +65,7 @@ pub enum Convo {
         ok: bool,
         body: Value,
     },
-    /// CLI 发来、等宿主回答的请求（审批、提问……）。
+    /// CLI 发来、等守护进程（经界面）回答的请求（审批、提问……）。
     Asked {
         request_id: String,
         subtype: String,

@@ -8,7 +8,7 @@ pub enum ThemeMode {
     Dark,
 }
 
-/// 颜色均为 RRGGBBAA；尺寸为逻辑像素。文件加载由主题组件提供。
+/// 颜色均为 RRGGBBAA；尺寸为逻辑像素。文件格式与校验见 ThemeDocument::parse；目录读取见 ThemeCatalog::read，桌面层的 ThemeFeed 负责监视与热加载。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Theme {

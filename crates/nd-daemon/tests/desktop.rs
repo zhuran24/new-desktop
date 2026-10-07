@@ -47,7 +47,7 @@ async fn desktop_cold_reopen_and_daemon_restart_match_authoritative_snapshot_wit
 }
 
 #[tokio::test]
-async fn closing_a_backpressured_desktop_feed_does_not_wait_for_the_ui_or_stop_the_daemon() {
+async fn closing_a_backpressured_desktop_feed_does_not_wait_for_the_desktop_or_stop_the_daemon() {
     let daemon = support::Daemon::start().await;
     let mut feed = ReplicaFeed::start(&daemon.socket, "global").unwrap();
     snapshot(&mut feed).await;

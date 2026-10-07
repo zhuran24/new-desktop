@@ -91,14 +91,14 @@ def inner():
         assert renewed["epoch"] != first["epoch"] and renewed["cursor"] == 0
         assert renewed == authoritative()
         assert app.wait(timeout=12) == 0
-        results.append("zero-event UI SIGKILL/reopen and live daemon SIGKILL/restart match nd-wire snapshot")
+        results.append("zero-event desktop SIGKILL/reopen and live daemon SIGKILL/restart match nd-wire snapshot")
         (root / "state/ui.json").write_text(json.dumps({"theme": "light", "components": {"overview": False}}))
         app = start_app("after-restart", 4)
         assert rendered(app) == renewed
         screenshot("light")
         assert app.wait(timeout=8) == 0
         assert authoritative() == renewed
-        results.append("cold reopen after daemon restart; graceful UI close leaves daemon alive")
+        results.append("cold reopen after daemon restart; graceful desktop close leaves daemon alive")
         for name in ["cold", "reopened", "after-restart"]:
             protocol = (out / f"{name}.log").read_text()
             assert re.search(r"wl_surface#\d+\.attach\(wl_buffer#", protocol), name

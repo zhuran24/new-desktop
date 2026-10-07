@@ -15,7 +15,7 @@
 | 晚绑定与冲突 | `fresh_reservations_bind_independently_and_conflicts_pause_both_runs_without_overwriting`；两个 Codex 未命名预留分别绑定，冲突暂停双方、不覆盖原租约 |
 | 两层恢复 | `recovery_requires_identities_then_a_complete_scan_and_excludes_own_pid_before_holding`；身份阶段不报外部，第一扫前不放行，自己的身份即使尚未 Holding 也不误判为外部 |
 | 同 id 外部进程 | `a_second_process_with_the_same_session_id_blocks_even_an_already_admitted_write`；展示隐藏该 id，冲突仍拦，外部退出后恢复 |
-| 无 pid | `real_background_job_without_a_pid_blocks_even_when_no_one_is_listing_external_sessions`；未经改动的真后台 `state.json` 触发 ExternalUnverified；脚本化列表同样保守 |
+| 无 pid | `real_cli_background_session_without_a_pid_blocks_even_when_no_one_is_listing_external_sessions`；未经改动的真后台 `state.json` 触发 ExternalUnverified；脚本化列表同样保守 |
 | 坏文件、旧 PID、异命名空间 | `unverified_entries_and_incomplete_registry_reads_never_mean_no_external_writer`、`stale_local_pids_are_ignored_but_foreign_pid_namespaces_remain_unverified`；半文件/缺 id 不放行，完整重扫可恢复；旧 ticks 不借用活 PID，旧启动时间/异 PID 域不猜身份 |
 | 常开检测与卸载 | `detection_keeps_running_without_a_list_subscriber_and_stops_without_releasing_leases`；无列表兴趣仍检测，Drop 不停止后端、不释放租约 |
 | 提交与恢复重算 | `subscribers_wake_only_for_committed_claim_changes`、`only_proven_unsent_grants_are_rechecked_after_restart_and_never_opened_is_observation`、`cause_identity_is_stable_while_waiting_and_readmit_revokes_an_unsent_grant`；回滚不通知，Withheld 重算，已交付不明的授予留存 |
@@ -33,7 +33,7 @@
 - 真实 `--bg` 生成 `jobs/<short>/state.json`。该环境没有登录，条目状态为 blocked/login required 且无 pid；验证的是无 pid 格式及保守阻塞，不是后台对话、接管或元数据完整性。
 - `probe.txt` 的 `own: PASS`、`duplicate: PASS` 是实际公开接口断言；模型请求仅来自本地替代端点，不涉及真模型质量或 API 兼容验收。
 
-最终现场证据：`/mnt/wd_external/nd-build/tmp/ticket-12-delivery-final/`，包含原始注册表、记录、agents 输出、进程身份、两条 CLI 的流水、probe、后台作业状态、manifest、isolation。manifest 对每个文件列 SHA-256，并记录临时目录删除及服务/slice 不活跃。
+最终现场证据：`/mnt/wd_external/nd-build/tmp/ticket-12-delivery-final/`，包含原始注册表、记录、agents 输出、进程身份、两条 CLI 的流水、probe、CLI 后台会话状态、manifest、isolation。manifest 对每个文件列 SHA-256，并记录临时目录删除及服务/slice 不活跃。
 
 默认夹具分别来自 `ticket-12-registry/` 与 `ticket-12-registry-bg3/`，清单在 `tests/fixtures/manifest.json`、`background-manifest.json`。副本变形测试明确只改变必要字段；实际 CLI 格式契约由现场脚本验证。
 
