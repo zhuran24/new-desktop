@@ -3,6 +3,52 @@ use nd_session::history::History;
 use nd_wire::{Fallback, Item, PageReq};
 use serde_json::json;
 
+#[test]
+fn queued_messages_and_pending_controls_stay_visible_outside_the_body_window() {
+    let mut history = History::new("session/queue".into());
+    history.insert(item(
+        "prompt/queued",
+        "prompt",
+        1,
+        json!({"message":"queued","state":"withdrawing","text":"return me"}),
+    ));
+    history.insert(item(
+        "control/esc",
+        "control",
+        2,
+        json!({"state":"pending"}),
+    ));
+    for n in 3..103 {
+        history.insert(item(
+            &format!("block/{n}"),
+            "text",
+            n,
+            json!({"text":"body","complete":true}),
+        ));
+    }
+    let snapshot = history.snapshot();
+    assert!(snapshot.iter().any(|i| i.id == "prompt/queued"));
+    assert!(snapshot.iter().any(|i| i.id == "control/esc"));
+    history.insert(item(
+        "prompt/queued",
+        "prompt",
+        1,
+        json!({"message":"queued","state":"withdrawn","text":"return me"}),
+    ));
+    history.insert(item(
+        "control/esc",
+        "control",
+        2,
+        json!({"state":"acknowledged"}),
+    ));
+    assert!(
+        !history
+            .snapshot()
+            .iter()
+            .any(|i| matches!(i.id.as_str(), "prompt/queued" | "control/esc"))
+    );
+}
+
 fn item(id: &str, kind: &str, seq: u64, data: serde_json::Value) -> Item {
     let mut data = data;
     data["seq"] = json!(seq);

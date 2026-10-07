@@ -96,14 +96,14 @@ impl Desktop {
                         if same_view {
                             this.restore_draft(window, cx);
                         }
-                        if let Some((target, text, revision)) = this.queued_send.clone()
+                        if let Some((target, text, revision, intent)) = this.queued_send.clone()
                             && target == session
                             && this.drafts[&key].is_saved()
                         {
                             this.queued_send = None;
                             this.refresh_send(cx);
                             if same_view && this.drafts[&key].revision() == revision {
-                                this.send_text(text, window, cx);
+                                this.send_text_intent(text, intent, window, cx);
                             } else {
                                 this.warning = Some("草稿已变化，请核对后重新发送".into());
                             }

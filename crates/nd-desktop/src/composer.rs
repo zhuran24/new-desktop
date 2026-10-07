@@ -132,6 +132,20 @@ impl Composer {
         self.dispatch(InputEvent::Submit, window, cx);
     }
 
+    #[cfg(feature = "scenarios")]
+    pub fn scenario_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        self.dispatch(
+            InputEvent::KeyDown {
+                key: Key::Escape,
+                modifiers: Modifiers::default(),
+                held: false,
+            },
+            window,
+            cx,
+        );
+    }
+
     /// 固定 GPUI 的 Wayland clipboard 只解文本/图片；文件 MIME 在这里补上。
     /// 查询在后台限时执行，普通文本/图片仍由 Kit 的原生 Paste 处理。
     fn paste(

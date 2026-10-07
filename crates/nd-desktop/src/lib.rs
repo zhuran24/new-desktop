@@ -2,6 +2,7 @@
 mod attachments;
 mod chat;
 pub mod composer;
+mod controls;
 mod drafts;
 mod history;
 mod settings;
@@ -35,6 +36,7 @@ pub struct Desktop {
     directory: Entity<InputState>,
     title_editor: Entity<InputState>,
     settings_open: bool,
+    auxiliary_escape_held: bool,
     settings_sending: bool,
     models: Vec<nd_wire::Model>,
     model: Option<String>,
@@ -43,11 +45,14 @@ pub struct Desktop {
     model_loading: bool,
     creating: bool,
     sending: bool,
+    send_intent: String,
+    escape: nd_view_model::EscapeState,
+    started: std::time::Instant,
     uploading: usize,
     images: std::collections::BTreeMap<String, Option<std::sync::Arc<Image>>>,
     device: String,
     draft_writes: std::collections::BTreeSet<String>,
-    queued_send: Option<(String, String, u64)>,
+    queued_send: Option<(String, String, u64, String)>,
     drafts: std::collections::BTreeMap<Option<String>, nd_view_model::Draft>,
     subscriptions: Vec<Subscription>,
     composer: Entity<composer::Composer>,
@@ -187,6 +192,7 @@ impl Desktop {
             directory,
             title_editor: cx.new(|cx| InputState::new(window, cx).placeholder("会话标题")),
             settings_open: false,
+            auxiliary_escape_held: false,
             settings_sending: false,
             models: vec![],
             model: None,
@@ -195,6 +201,9 @@ impl Desktop {
             model_loading: false,
             creating: state.selected_session.is_none(),
             sending: false,
+            send_intent: "fold".into(),
+            escape: Default::default(),
+            started: std::time::Instant::now(),
             uploading: 0,
             images: Default::default(),
             device: format!("desktop-{}", uuid::Uuid::new_v4()),
@@ -228,6 +237,7 @@ impl Desktop {
             #[cfg(feature = "scenarios")]
             last_theme_report: None,
         };
+        this.install_auxiliary_escape(window, cx);
         this.connect_chat(window, cx);
         this.subscriptions
             .push(cx.observe_window_appearance(window, |this, window, cx| {
@@ -381,6 +391,7 @@ impl Render for Desktop {
         }
         let chat_sidebar = self.chat_sidebar(cx);
         let chat_content = self.chat_content(window, cx);
+        let controls = self.chat_controls(cx);
         let navigation = self.navigation(cx);
         let history_controls = self.history_controls(cx);
         let attachments = self.draft_attachments(cx);
@@ -388,6 +399,17 @@ impl Render for Desktop {
         let draft_panel = (!self.creating).then(|| self.draft_panel(window, cx));
         let theme = &self.theme;
         div()
+            .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| {
+                if event.keystroke.key == "escape" {
+                    this.auxiliary_escape_held = false;
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && !event.is_held {
+                    this.escape_pressed(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -476,6 +498,7 @@ impl Render for Desktop {
                                         },
                                     ))
                                     .p(px(theme.spacing.medium))
+                                    .child(controls)
                                     .child(attachments)
                                     .children(draft_panel)
                                     .child(self.composer.clone()),

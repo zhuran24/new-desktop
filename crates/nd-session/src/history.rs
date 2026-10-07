@@ -103,11 +103,16 @@ impl History {
         });
         items.extend(page.items);
         // 进行中的条目必须在冷快照里保留完整累计内容，即使较新的条目超过一页。
-        for item in self
-            .items
-            .values()
-            .filter(|i| i.data["complete"] == false && !control(i))
-        {
+        for item in self.items.values().filter(|i| {
+            !control(i)
+                && (i.data["complete"] == false
+                    || (i.kind == "control" && i.data["state"] == "pending")
+                    || (i.kind == "prompt"
+                        && matches!(
+                            i.data["state"].as_str(),
+                            Some("held" | "waiting" | "pending" | "written" | "withdrawing")
+                        )))
+        }) {
             if !items.iter().any(|i| i.id == item.id) {
                 items.push(item.clone());
             }

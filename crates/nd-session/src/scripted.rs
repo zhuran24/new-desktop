@@ -18,6 +18,7 @@ use std::{
 /// 一张票的脚本：成功、明确失败、交付不明，或扣住等测试放行。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
+    Busy,
     Ok,
     Fail(String),
     Unknown(String),
@@ -30,6 +31,8 @@ pub enum ActKind {
     Open,
     End,
     Send,
+    Interrupt,
+    Withdraw,
     Configure,
     Title,
 }
@@ -38,6 +41,8 @@ fn kind_of(act: &Act) -> ActKind {
         Act::Open { .. } => ActKind::Open,
         Act::End { .. } => ActKind::End,
         Act::Send { .. } => ActKind::Send,
+        Act::Interrupt { .. } => ActKind::Interrupt,
+        Act::Withdraw { .. } => ActKind::Withdraw,
         Act::Configure { .. } => ActKind::Configure,
         Act::Invoke { .. } => ActKind::Title,
     }
@@ -240,6 +245,7 @@ impl ScriptedAdapter {
             )
         };
         let facts = match (&act, reply) {
+            (_, Reply::Busy) => unreachable!("Busy is an admission, never a terminal result"),
             (_, Reply::Hold) => {
                 self.inner.lock().unwrap().held.push((issued, act));
                 return;
@@ -262,6 +268,19 @@ impl ScriptedAdapter {
                             bs: spec.origin.backend_session().clone(),
                             run: run.clone(),
                             readiness: Readiness::Full,
+                            interaction: nd_backend::InteractionCaps {
+                                send_intents: vec![
+                                    nd_backend::Intent::Fold,
+                                    nd_backend::Intent::AfterTurn,
+                                    nd_backend::Intent::Interrupting,
+                                ],
+                                withdraw: true,
+                                interrupt: true,
+                                cancel_queued: true,
+                                interrupt_spares_background: true,
+                                immediate_preserves_mcp: false,
+                                rewind_menu: true,
+                            },
                             adopt: json!({"scripted": true}),
                         },
                     }),
@@ -304,6 +323,35 @@ impl ScriptedAdapter {
                     .applied
                     .push(format!("send?:{}", msg.text));
                 vec![done(Outcome::Unknown { evidence: why })]
+            }
+            (Act::Withdraw { send, .. }, Reply::Ok) => {
+                let mut inner = self.inner.lock().unwrap();
+                let before = inner.held.len();
+                inner.held.retain(|(issued, _)| &issued.ticket != send);
+                let ok = before != inner.held.len();
+                inner.applied.push(format!("withdraw:{ticket}"));
+                vec![done(Outcome::Ok {
+                    done: Done::Withdrawn { ok },
+                })]
+            }
+            (Act::Interrupt { queued, .. }, Reply::Ok) => {
+                let mut inner = self.inner.lock().unwrap();
+                inner.applied.push(format!("interrupt:{ticket}"));
+                let cancelled = if *queued == nd_backend::QueuedPolicy::Cancel {
+                    let ids = inner
+                        .held
+                        .iter()
+                        .filter(|(_, a)| matches!(a,Act::Send { to,.. } if to == &carrier))
+                        .map(|(i, _)| i.ticket.clone())
+                        .collect::<Vec<_>>();
+                    inner.held.retain(|(i, _)| !ids.contains(&i.ticket));
+                    ids
+                } else {
+                    vec![]
+                };
+                vec![done(Outcome::Ok {
+                    done: Done::Interrupted { cancelled },
+                })]
             }
             (Act::Configure { setting, .. }, Reply::Ok) => {
                 self.inner
@@ -487,12 +535,18 @@ impl BackendAdapter for ScriptedAdapter {
                     may_be_unknown: true,
                 };
             }
-            inner.received.push((issued.ticket.clone(), act.clone()));
-            inner
+            let reply = inner
                 .script
                 .get_mut(&kind_of(&act))
                 .and_then(VecDeque::pop_front)
-                .unwrap_or(Reply::Ok)
+                .unwrap_or(Reply::Ok);
+            if reply == Reply::Busy {
+                return Admit::Rejected {
+                    reject: nd_backend::Reject::Busy,
+                };
+            }
+            inner.received.push((issued.ticket.clone(), act.clone()));
+            reply
         };
         self.perform(issued, act, reply);
         Admit::Accepted {
