@@ -3179,6 +3179,7 @@ async fn settings_native_window_changes_model_effort_and_title_through_nd_wire()
             "--session",
             &session,
             "--settings",
+            "--themes",
         ])
         .output()
         .await

@@ -85,13 +85,27 @@ def inner():
 
     try:
         if settings.get('session_settings'):
-            Path('/sandbox/state/ui.json').write_text(json.dumps({'selected_session': settings['session']}))
+            Path('/sandbox/state/ui.json').write_text(json.dumps({'selected_session': settings['session'], **({'theme_selection': {'kind': 'file', 'file': 'ocean.json'}} if settings.get('themes') else {})}))
             app = start('settings')
             def configured(s):
                 h = next((i['data'] for i in s['items'] if i['kind'] == 'header'), {})
                 return h.get('model') == 'opus' and h.get('settings', {}).get('applied', {}).get('effort') == 'high' and h.get('title') == '原生设置标题'
             value = wait('settings', configured)
             screenshot('settings-dark')
+            if settings.get('themes'):
+                theme_file.write_text(theme_source.replace('#123456ff', '#26384aff').replace('"body": 18', '"body": 20'))
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    events = [json.loads(line) for line in (out / 'settings.jsonl').read_text().splitlines()]
+                    theme_events = [e['rendered_theme'] for e in events if 'rendered_theme' in e]
+                    sessions = [e['rendered_session'] for e in events if 'rendered_session' in e]
+                    if theme_events and theme_events[-1]['theme']['colors']['background'] == '#26384aff':
+                        assert configured(sessions[-1]), 'theme change altered session settings/title'
+                        break
+                    time.sleep(.05)
+                else:
+                    raise AssertionError('settings theme never updated')
+                screenshot('settings-new-theme')
             (out / 'result.json').write_text(json.dumps({'pass': True, 'session': value}, ensure_ascii=False))
             return
         if settings.get('history'):
