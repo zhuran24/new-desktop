@@ -841,7 +841,7 @@ async fn a_bang_running_across_a_daemon_restart_settles_once_from_the_mod_result
     fx.turn(&session, "在").await;
     let mut fifo = fx.scenario.fifo("hold").unwrap();
     let command = format!(
-        "head -n 1 {} && echo AFTER_RESTART >> /sandbox/project/ran.log",
+        "echo BANG_STARTED > /sandbox/project/started.log; head -n 1 {} && echo AFTER_RESTART >> /sandbox/project/ran.log",
         fifo.sandbox_path().display()
     );
     let ui_command = Command {
@@ -861,7 +861,19 @@ async fn a_bang_running_across_a_daemon_restart_settles_once_from_the_mod_result
             item(s, "invoke/br-1").is_some_and(|i| i.data["state"] == "running")
         })
         .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // running 只证明请求已写给 mod；等真实 Bash 的外部效果再杀守护进程。
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if std::fs::read_to_string(fx.root().join("project/started.log"))
+                .is_ok_and(|text| text == "BANG_STARTED\n")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the real Bash must start before the daemon restarts");
     fx.scenario.kill_daemon().unwrap();
     assert_ne!(
         fx.peek(&session).await.epoch,
