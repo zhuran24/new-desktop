@@ -704,7 +704,8 @@ async fn a_bang_running_across_a_daemon_restart_settles_once_from_the_mod_result
     };
     let mut ui = fx.ui().await;
     let waiting = tokio::spawn(async move {
-        ui.command_waiting(&ui_command, Duration::from_secs(5)).await
+        ui.command_waiting(&ui_command, Duration::from_secs(5))
+            .await
     });
     let running = fx
         .wait(&session, "the bang is running", |s| {
@@ -727,7 +728,10 @@ async fn a_bang_running_across_a_daemon_restart_settles_once_from_the_mod_result
         if let Ok(nd_wire::ReceiptLookup::Found { receipt }) = ui.receipt("br-1").await {
             break receipt;
         }
-        assert!(tokio::time::Instant::now() < deadline, "no receipt after restart");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no receipt after restart"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     let Receipt::Done { value } = &receipt else {
@@ -740,7 +744,11 @@ async fn a_bang_running_across_a_daemon_restart_settles_once_from_the_mod_result
     assert_eq!(item(&after, "invoke/br-1").unwrap().data["state"], "done");
     // 同 id 重发拿原收据，不再跑。
     let again = fx
-        .deliver("br-1", "session.shell", json!({"session":session,"command":command}))
+        .deliver(
+            "br-1",
+            "session.shell",
+            json!({"session":session,"command":command}),
+        )
         .await;
     assert_eq!(again, CommandReply::Receipt { receipt });
     let ran = std::fs::read_to_string(fx.root().join("project/ran.log")).unwrap();

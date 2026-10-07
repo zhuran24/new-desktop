@@ -652,7 +652,10 @@ async fn summarize_from_here_backfills_the_draft_once_at_every_commit_point() {
             let saved = d["saved"].as_array().unwrap();
             assert_eq!(saved.len(), 1, "{d}");
             assert_eq!(saved[0]["text"], "旧稿");
-            assert_eq!(item(s, "lineage").data["summarized"], json!(["matrix-sum-send"]));
+            assert_eq!(
+                item(s, "lineage").data["summarized"],
+                json!(["matrix-sum-send"])
+            );
             let nd_wire::Receipt::Done { value } = receipt(h, "matrix-sum") else {
                 panic!("compact receipt is not Done");
             };
@@ -722,7 +725,11 @@ async fn a_subtask_dispatches_one_fork_subagent_at_every_commit_point() {
             let nd_wire::Receipt::Done { value } = receipt(h, "matrix-fork") else {
                 panic!("subtask receipt is not Done");
             };
-            assert!(value["agent"].as_str().is_some_and(|a| a.starts_with("agent-")));
+            assert!(
+                value["agent"]
+                    .as_str()
+                    .is_some_and(|a| a.starts_with("agent-"))
+            );
         },
     })
     .await;
