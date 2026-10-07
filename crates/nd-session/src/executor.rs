@@ -990,10 +990,16 @@ impl Executor {
             Ok(r) => r,
             Err(receipt) => return Ok(receipt),
         };
-        if let Some(send) = &message.ticket {
+        let original = if let Some(send) = &message.ticket {
             let Some(original) = self.core.outbox.get(send).cloned() else {
                 return Ok(rejected("not_withdrawable", json!({"message":id})));
             };
+            Some(original)
+        } else {
+            None
+        };
+        if let Some(original) = original.filter(|row| row.handed) {
+            let send = message.ticket.as_ref().expect("handed send has a ticket");
             self.pin_return(tx, &command.id, &restore, true)?;
             let ticket = Ticket(format!("control:{}", command.id));
             self.core.outbox.insert(
