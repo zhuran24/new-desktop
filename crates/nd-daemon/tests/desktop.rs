@@ -23,13 +23,13 @@ async fn desktop_cold_reopen_and_daemon_restart_match_authoritative_snapshot_wit
     ))
     .await
     .unwrap();
-    let mut feed = ReplicaFeed::start(&daemon.socket(), "global").unwrap();
+    let mut feed = ReplicaFeed::start(daemon.socket(), "global").unwrap();
     let first = snapshot(&mut feed).await;
     assert_eq!(first.cursor, 0);
     assert!(!first.items.is_empty());
     // 故障从外面造：丢掉整个界面同步副本，保留的视图状态不能补事实。
     drop(feed);
-    let mut feed = ReplicaFeed::start(&daemon.socket(), "global").unwrap();
+    let mut feed = ReplicaFeed::start(daemon.socket(), "global").unwrap();
     assert_eq!(snapshot(&mut feed).await, first);
     for kill in [true, false] {
         if kill {
@@ -42,7 +42,7 @@ async fn desktop_cold_reopen_and_daemon_restart_match_authoritative_snapshot_wit
         assert_eq!(changed.cursor, 0);
         let mut reference = SyncReplica::connect(&daemon.socket()).await.unwrap();
         assert_eq!(changed, reference.subscribe("global").await.unwrap());
-        let mut reopened = ReplicaFeed::start(&daemon.socket(), "global").unwrap();
+        let mut reopened = ReplicaFeed::start(daemon.socket(), "global").unwrap();
         assert_eq!(snapshot(&mut reopened).await, changed);
         reopened.close().await;
     }
@@ -59,7 +59,7 @@ async fn closing_a_backpressured_desktop_feed_does_not_wait_for_the_desktop_or_s
     ))
     .await
     .unwrap();
-    let mut feed = ReplicaFeed::start(&daemon.socket(), "global").unwrap();
+    let mut feed = ReplicaFeed::start(daemon.socket(), "global").unwrap();
     snapshot(&mut feed).await;
     let mut writer = SyncReplica::connect(&daemon.socket()).await.unwrap();
     for revision in 0..8 {
@@ -78,7 +78,7 @@ async fn closing_a_backpressured_desktop_feed_does_not_wait_for_the_desktop_or_s
     tokio::time::timeout(Duration::from_secs(1), feed.close())
         .await
         .unwrap();
-    let mut reopened = ReplicaFeed::start(&daemon.socket(), "global").unwrap();
+    let mut reopened = ReplicaFeed::start(daemon.socket(), "global").unwrap();
     let current = snapshot(&mut reopened).await;
     let mut reference = SyncReplica::connect(&daemon.socket()).await.unwrap();
     assert_eq!(current, reference.subscribe("global").await.unwrap());

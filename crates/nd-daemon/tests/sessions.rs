@@ -63,7 +63,7 @@ async fn backend_exit_ends_the_running_round_before_the_next_prompt_resumes() {
     fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
     fx.scenario.endpoint().enqueue(
         fx.main(),
-        ModelReply::streaming_text(&"unfinished".repeat(100), 1, 30),
+        ModelReply::streaming_text("unfinished".repeat(100), 1, 30),
     );
     fx.send("interrupted-round", &session, "second").await;
     fx.scenario

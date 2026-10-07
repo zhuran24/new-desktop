@@ -5,10 +5,12 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 branch=$(git branch --show-current)
 case "$branch" in
   ticket/*) build_name="ticket-${branch#ticket/}" ;;
+  review/fixes) build_name=review-fixes ;;
   *) build_name=v1 ;;
 esac
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/mnt/wd_external/nd-build/target/$build_name}"
 export CARGO_BUILD_JOBS=6
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-4}"
 limited() {
   systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- "$@"
 }

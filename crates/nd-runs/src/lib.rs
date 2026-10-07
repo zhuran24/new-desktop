@@ -402,7 +402,7 @@ impl Watchdogs {
         let saved = std::fs::read(directory.join("hello.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<Hello>(&b).ok());
-        let group = self.unit_group(&run);
+        let group = self.unit_group(run);
         let state = match (&saved, &group) {
             (Some(h), Ok(Some(group)))
                 if h.identity.alive()

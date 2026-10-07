@@ -12,7 +12,7 @@
 scripts/test-scenarios.sh
 ```
 
-脚本先构建真 nd-watchdog 和带 `scenarios` 的 nd-daemon，再运行 #3/#4/#7 的场景回归和本库场景。构建目录默认按当前 `ticket/N` 分支选择 E 盘 `target/ticket-N`；build/test 各用 12 GiB、零 swap 的独立 scope、6 个构建 jobs。`CARGO_TARGET_DIR` 可显式指定 BUILD.md 允许的退路。所有模型请求留在离线伪端点内，不消费真实模型额度。
+脚本先构建真 nd-watchdog 和带 `scenarios` 的 nd-daemon，再运行 #3/#4/#7 的场景回归和本库场景。构建目录默认按当前 `ticket/N` 或 `review/fixes` 分支选择 E 盘对应目录；build/test 各用 12 GiB、零 swap 的独立 scope、6 个构建 jobs；场景测试默认 4 个并发线程，可用 `RUST_TEST_THREADS` 调整。`CARGO_TARGET_DIR` 可显式指定 BUILD.md 允许的退路。所有模型请求留在离线伪端点内，不消费真实模型额度。
 
 `cargo test --workspace` 包含端点 HTTP 行为测试。需要开发机 systemd 和固定 CLI 的场景由 `nd-testkit/scenarios` 启用；直接运行时还须设置 `ND_TEST_DAEMON` 为带故障点的 nd-daemon 绝对路径，以及 `ND_TEST_WATCHDOG` 为看守绝对路径。缺依赖时报错，不把跳过当通过。
 
