@@ -56,6 +56,7 @@ impl Desktop {
                     nd_wire::ReceiptLookup::Found { receipt } => CommandReply::Receipt { receipt },
                     nd_wire::ReceiptLookup::Conflict => CommandReply::Conflict,
                     nd_wire::ReceiptLookup::Expired => CommandReply::Expired,
+                    nd_wire::ReceiptLookup::Other => CommandReply::Other,
                     nd_wire::ReceiptLookup::Missing => {
                         missing = true;
                         CommandReply::DeliveryUnknown
@@ -79,7 +80,9 @@ impl Desktop {
                 let uncertain = query_receipt
                     || matches!(
                         &result,
-                        Ok(CommandReply::DeliveryUnknown | CommandReply::Receipt { .. })
+                        Ok(CommandReply::DeliveryUnknown
+                            | CommandReply::Other
+                            | CommandReply::Receipt { .. })
                     );
                 let saved = match result {
                     Ok(CommandReply::Receipt {

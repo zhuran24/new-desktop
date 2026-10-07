@@ -24,3 +24,17 @@ fn published_schema_matches_rust_and_future_items_keep_fallback() {
     assert_eq!(snapshot.items[0].data["new_enum"], "future-value");
     assert_eq!(snapshot.items[0].fallback.text, "仍能读到这条内容");
 }
+
+#[test]
+fn future_receipt_and_reply_states_do_not_turn_valid_frames_into_disconnects() {
+    for text in [
+        r#"{"type":"command_reply","id":1,"result":{"status":"receipt","receipt":{"status":"absorbed","future":true}}}"#,
+        r#"{"type":"command_reply","id":2,"result":{"status":"refused","future":true}}"#,
+        r#"{"type":"receipt_reply","id":3,"result":{"status":"pending","future":true}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<nd_wire::Response>(text).is_ok(),
+            "future state invalidated the frame: {text}"
+        );
+    }
+}

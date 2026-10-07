@@ -183,6 +183,7 @@ impl SyncReplica {
                             }
                             Ok(nd_wire::ReceiptLookup::Conflict) => nd_wire::CommandReply::Conflict,
                             Ok(nd_wire::ReceiptLookup::Expired) => nd_wire::CommandReply::Expired,
+                            Ok(nd_wire::ReceiptLookup::Other) => nd_wire::CommandReply::Other,
                             _ => nd_wire::CommandReply::DeliveryUnknown,
                         },
                     );

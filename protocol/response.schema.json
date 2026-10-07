@@ -292,6 +292,19 @@
           "required": [
             "status"
           ]
+        },
+        {
+          "description": "A newer peer returned a status this version does not interpret.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "other"
+            }
+          },
+          "required": [
+            "status"
+          ]
         }
       ]
     },
@@ -441,6 +454,19 @@
             "status",
             "now"
           ]
+        },
+        {
+          "description": "A newer peer returned a status this version does not interpret.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "other"
+            }
+          },
+          "required": [
+            "status"
+          ]
         }
       ]
     },
@@ -512,6 +538,19 @@
           "required": [
             "status",
             "reason"
+          ]
+        },
+        {
+          "description": "A newer peer returned a status this version does not interpret.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "other"
+            }
+          },
+          "required": [
+            "status"
           ]
         }
       ]

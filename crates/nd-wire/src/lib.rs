@@ -306,6 +306,9 @@ pub enum Receipt {
     Unknown {
         now: Value,
     },
+    /// A newer peer returned a status this version does not interpret.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -332,16 +335,26 @@ pub enum CommandReply {
     },
     /// 仅同步副本产生：断线后查不到收据，不能自动重发正文。
     DeliveryUnknown,
+    /// A newer peer returned a status this version does not interpret.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReceiptLookup {
     Conflict,
-    Found { receipt: Receipt },
+    Found {
+        receipt: Receipt,
+    },
     Missing,
     Expired,
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
+    /// A newer peer returned a status this version does not interpret.
+    #[serde(other)]
+    Other,
 }
 
 impl Command {
