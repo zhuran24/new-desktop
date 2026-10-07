@@ -847,7 +847,6 @@ impl Desktop {
                     kind: message.kind,
                     title: message.title,
                     text: message.text,
-                    selected: false,
                 };
                 items.push(render(
                     &Presentation {
@@ -865,18 +864,9 @@ impl Desktop {
                 .flex()
                 .flex_col()
                 .gap(px(t.spacing.small))
-                .children(
-                    (if message.kind == "op" {
-                        vec![nd_view_model::MessageBlock::Plain(message.text.clone())]
-                    } else {
-                        message.blocks
-                    })
-                    .into_iter()
-                    .enumerate()
-                    .map(|(n, block)| {
-                        render_block(format!("{}/{}/{n}", snapshot.stream, message.id), block, t)
-                    }),
-                )
+                .children(message.blocks.into_iter().enumerate().map(|(n, block)| {
+                    render_block(format!("{}/{}/{n}", snapshot.stream, message.id), block, t)
+                }))
                 .children(
                     message
                         .attachments

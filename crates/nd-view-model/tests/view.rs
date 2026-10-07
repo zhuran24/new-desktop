@@ -72,8 +72,8 @@ fn optional_slots_unmount_synchronously_and_can_be_registered_again() {
 }
 
 #[test]
-fn unknown_items_have_readable_fallback_and_theme_changes_leave_facts_untouched() {
-    use nd_view_model::{Theme, ThemeMode, project};
+fn unknown_items_have_readable_fallback_in_the_conversation() {
+    use nd_view_model::conversation;
     let snapshot = nd_wire::Snapshot {
         stream: "global".into(),
         epoch: "e".into(),
@@ -89,18 +89,9 @@ fn unknown_items_have_readable_fallback_and_theme_changes_leave_facts_untouched(
             },
         }],
     };
-    let state = ViewState::default();
-    let light = Theme::builtin(ThemeMode::Light);
-    let dark = Theme::builtin(ThemeMode::Dark);
-    let view = project(&snapshot, &state);
-    assert_eq!(view.items[0].title, "未来功能");
-    assert_eq!(view.items[0].text, "仍然能读到这段文字");
-    assert_ne!(light.colors.background, dark.colors.background);
-    assert_ne!(light.colors.foreground, dark.colors.foreground);
-    let mut selected = state;
-    selected.selected_session = Some("one".into());
-    assert!(project(&snapshot, &selected).items[0].selected);
-    assert!(!view.items[0].selected);
+    let view = conversation(&snapshot);
+    assert_eq!(view.messages[0].title, "未来功能");
+    assert_eq!(view.messages[0].text, "仍然能读到这段文字");
 }
 
 #[test]

@@ -300,6 +300,21 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                         attachments: vec![],
                     };
                 }
+                let text: String = if i.kind == "op" {
+                    i.data["reason"]
+                        .as_str()
+                        .unwrap_or(match i.data["phase"].as_str() {
+                            Some("running") => "进行中",
+                            Some("compensated") => "已撤销",
+                            Some("partial") => "部分完成",
+                            Some("unresolved") => "等待处理",
+                            Some("rejected") => "未受理",
+                            _ => &i.fallback.text,
+                        })
+                } else {
+                    i.data["text"].as_str().unwrap_or(&i.fallback.text)
+                }
+                .into();
                 MessageView {
                     summarize: (i.kind == "prompt" && abilities.summarize)
                         .then(|| i.data["message"].as_str())
@@ -319,21 +334,7 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                     } else {
                         i.fallback.title.clone()
                     },
-                    text: if i.kind == "op" {
-                        i.data["reason"]
-                            .as_str()
-                            .unwrap_or(match i.data["phase"].as_str() {
-                                Some("running") => "进行中",
-                                Some("compensated") => "已撤销",
-                                Some("partial") => "部分完成",
-                                Some("unresolved") => "等待处理",
-                                Some("rejected") => "未受理",
-                                _ => &i.fallback.text,
-                            })
-                    } else {
-                        i.data["text"].as_str().unwrap_or(&i.fallback.text)
-                    }
-                    .into(),
+                    text: text.clone(),
                     markdown: i.kind == "text",
                     withdraw: (header.is_some_and(|h| h.data["interaction"]["withdraw"] == true)
                         && i.kind == "prompt"
@@ -347,11 +348,7 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                     resend: (i.kind == "prompt" && i.data["state"] == "not_delivered")
                         .then(|| i.data["message"].as_str().map(str::to_owned))
                         .flatten(),
-                    blocks: crate::message_blocks(
-                        &i.kind,
-                        i.data["text"].as_str().unwrap_or(&i.fallback.text),
-                        &i.data["raw"],
-                    ),
+                    blocks: crate::message_blocks(&i.kind, &text, &i.data["raw"]),
                     attachments: serde_json::from_value(i.data["attachments"].clone())
                         .unwrap_or_default(),
                     status: if i.kind == "prompt" {

@@ -18,27 +18,6 @@ pub struct ItemView {
     pub kind: String,
     pub title: String,
     pub text: String,
-    pub selected: bool,
-}
-#[derive(Clone, Debug, PartialEq)]
-pub struct View {
-    pub items: Vec<ItemView>,
-}
-/// 未识别条目始终保留后备文字；渲染器可按 kind 覆盖呈现。
-pub fn project(snapshot: &nd_wire::Snapshot, state: &ViewState) -> View {
-    View {
-        items: snapshot
-            .items
-            .iter()
-            .map(|item| ItemView {
-                id: item.id.clone(),
-                kind: item.kind.clone(),
-                title: item.fallback.title.clone(),
-                text: item.fallback.text.clone(),
-                selected: state.selected_session.as_ref() == Some(&item.id),
-            })
-            .collect(),
-    }
 }
 
 mod diff;
