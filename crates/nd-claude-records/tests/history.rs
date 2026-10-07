@@ -357,13 +357,14 @@ fn parallel_assistant_blocks_and_sibling_tool_results_are_not_lost() {
         a1,
         a2,
         r1,
+        json!({"type":"attachment","uuid":"date","parentUuid":"r1","attachment":{"type":"date","date":"2026-10-07"}}),
         r2,
         message("done", Some("r2"), "assistant", "done"),
     ]);
     let index = RecordIndex::parse(&data).unwrap();
     assert_eq!(
         index.current().unwrap().ids().collect::<Vec<_>>(),
-        ["u", "a1", "a2", "r1", "r2", "done"]
+        ["u", "a1", "a2", "r1", "date", "r2", "done"]
     );
 }
 

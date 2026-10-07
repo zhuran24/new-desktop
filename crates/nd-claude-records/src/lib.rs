@@ -530,6 +530,13 @@ impl<'a> RecordIndex<'a> {
                 }
             }
         }
+        let selected: HashSet<_> = path.iter().map(|n| &n.id).collect();
+        let mut children: HashMap<&str, Vec<&Node>> = HashMap::new();
+        for node in self.nodes.iter().filter(|n| n.active) {
+            if let Some(parent) = node.parent.as_deref() {
+                children.entry(parent).or_default().push(node);
+            }
+        }
         let mut output = Vec::new();
         let mut emitted = HashSet::new();
         for node in path {
@@ -554,6 +561,46 @@ impl<'a> RecordIndex<'a> {
                                 r.sidechain == node.sidechain && r.agent_id == node.agent_id
                             }),
                     );
+                }
+                let members = batch.clone();
+                for member in members
+                    .iter()
+                    .filter(|m| !m.tool_uses.is_empty() || m.tool_result)
+                {
+                    for child in children
+                        .get(member.id.as_str())
+                        .into_iter()
+                        .flatten()
+                        .filter(|n| !selected.contains(&n.id))
+                    {
+                        let mut chain = Vec::new();
+                        let mut next = Some(*child);
+                        let mut seen = HashSet::new();
+                        while let Some(node) = next {
+                            if !node.transparent
+                                || node.sidechain != member.sidechain
+                                || selected.contains(&node.id)
+                                || !seen.insert(&node.id)
+                            {
+                                chain.clear();
+                                break;
+                            }
+                            chain.push(node);
+                            let remaining: Vec<_> = children
+                                .get(node.id.as_str())
+                                .into_iter()
+                                .flatten()
+                                .filter(|n| !selected.contains(&n.id))
+                                .copied()
+                                .collect();
+                            if remaining.len() > 1 {
+                                chain.clear();
+                                break;
+                            }
+                            next = remaining.first().copied();
+                        }
+                        batch.extend(chain);
+                    }
                 }
                 batch.sort_by_key(|n| self.by_id[&n.id]);
                 for member in batch {
