@@ -874,7 +874,7 @@ impl Inner {
         let invokes: BTreeMap<String, PendingInvoke> = pending
             .iter()
             .filter_map(|p| match &p.act {
-                Act::Invoke { invocation, .. } if !titles(invocation) => {
+                Act::Invoke { invocation, .. } if !p.unknown && !titles(invocation) => {
                     let op_id = native_uuid(&p.issued.ticket);
                     let approval = match saved.get(&op_id) {
                         Some(known) => known.approval.clone(),
