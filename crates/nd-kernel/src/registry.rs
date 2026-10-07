@@ -124,17 +124,18 @@ impl Entry {
 pub(crate) struct Registry {
     pub entries: BTreeMap<u64, Entry>,
     pub hidden: BTreeSet<u64>,
-    pub revision: u64,
+    pub epoch: crate::RegistryEpoch,
     waiters: BTreeMap<u64, Waker>,
 }
 
 pub(crate) fn changed(registry: &Arc<Mutex<Registry>>) {
     let waiters = {
         let mut state = registry.lock().unwrap();
-        state.revision = state
-            .revision
+        state.epoch.0 = state
+            .epoch
+            .0
             .checked_add(1)
-            .expect("registry revision exhausted");
+            .expect("registry epoch exhausted");
         std::mem::take(&mut state.waiters)
     };
     for waker in waiters.into_values() {
@@ -145,12 +146,12 @@ pub(crate) fn changed(registry: &Arc<Mutex<Registry>>) {
 /// 可取消的变化通知，不绑定任何 async runtime，不借用 Kernel。
 pub struct Changed {
     registry: Arc<Mutex<Registry>>,
-    after: u64,
+    after: crate::RegistryEpoch,
     id: u64,
 }
 
 impl Changed {
-    pub(crate) fn new(registry: Arc<Mutex<Registry>>, after: u64) -> Self {
+    pub(crate) fn new(registry: Arc<Mutex<Registry>>, after: crate::RegistryEpoch) -> Self {
         Self {
             registry,
             after,
@@ -160,12 +161,12 @@ impl Changed {
 }
 
 impl Future for Changed {
-    type Output = u64;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
+    type Output = crate::RegistryEpoch;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<crate::RegistryEpoch> {
         let mut state = self.registry.lock().unwrap();
-        if state.revision != self.after {
+        if state.epoch != self.after {
             state.waiters.remove(&self.id);
-            Poll::Ready(state.revision)
+            Poll::Ready(state.epoch)
         } else {
             state.waiters.insert(self.id, cx.waker().clone());
             Poll::Pending

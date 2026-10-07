@@ -383,7 +383,7 @@ fn registry_changes_wake_the_driver_without_polling_or_a_lost_wakeup() {
     }
     let kernel = Kernel::new();
     let scope = kernel.scope();
-    let before = kernel.revision();
+    let before = kernel.change_count();
     let mut changes = Box::pin(kernel.changed_since(before));
     let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
     let waker = waker(wakes.clone());
@@ -721,10 +721,10 @@ fn failed_initialization_does_not_spin_on_its_own_registration_notifications() {
         })
         .unwrap();
     block_on(kernel.reconcile(Duration::ZERO));
-    let revision = kernel.revision();
+    let revision = kernel.change_count();
     block_on(kernel.reconcile(Duration::from_secs(1)));
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(kernel.revision(), revision);
+    assert_eq!(kernel.change_count(), revision);
     kernel
         .configure(&[ConfigChange::new("fails", true, 1)])
         .unwrap();

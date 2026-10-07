@@ -51,20 +51,33 @@ impl ComponentSpec {
     }
 }
 
+/// 组件配置修订号；变化时重建实例。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConfigRevision(pub u64);
+impl From<u64> for ConfigRevision {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// revision 只标记必须重建的配置；可原位更新的字段由提供者自己更新。
 #[derive(Clone, Debug)]
 pub struct ConfigChange {
     pub component: String,
     pub enabled: bool,
-    pub revision: u64,
+    pub revision: ConfigRevision,
 }
 
 impl ConfigChange {
-    pub fn new(component: impl Into<String>, enabled: bool, revision: u64) -> Self {
+    pub fn new(
+        component: impl Into<String>,
+        enabled: bool,
+        revision: impl Into<ConfigRevision>,
+    ) -> Self {
         Self {
             component: component.into(),
             enabled,
-            revision,
+            revision: revision.into(),
         }
     }
 }
@@ -124,14 +137,14 @@ pub struct Mount {
     spec: ComponentSpec,
     bindings: BTreeMap<ServiceKey, u64>,
     generation: Generation,
-    revision: u64,
+    revision: ConfigRevision,
 }
 
 impl Mount {
     pub fn generation(&self) -> Generation {
         self.generation
     }
-    pub fn revision(&self) -> u64 {
+    pub fn revision(&self) -> ConfigRevision {
         self.revision
     }
     pub fn register(
@@ -192,14 +205,14 @@ pub(crate) struct Component {
     state: ComponentState,
     instance: Option<Instance>,
     enabled: bool,
-    revision: u64,
+    revision: ConfigRevision,
     waiting_since: Option<Duration>,
     failed_attempt: Option<Attempt>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct Attempt {
-    revision: u64,
+    revision: ConfigRevision,
     bindings: BTreeMap<ServiceKey, u64>,
 }
 
@@ -242,7 +255,7 @@ impl Kernel {
                 },
                 instance: None,
                 enabled: true,
-                revision: 0,
+                revision: ConfigRevision::default(),
                 waiting_since: None,
                 failed_attempt: None,
             },

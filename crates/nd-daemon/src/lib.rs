@@ -662,10 +662,10 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     let monitor_state = state.clone();
     let monitor = tokio::spawn(async move {
         loop {
-            // 先记 revision 再 reconcile，避免漏掉挂载期间发生的变化。
+            // 先记登记变化计数再 reconcile，避免漏掉挂载期间发生的变化。
             let (changed, deadline) = {
                 let mut engine = monitor_state.lock().await;
-                let revision = engine.kernel.revision();
+                let revision = engine.kernel.change_count();
                 let now = engine.started.elapsed();
                 engine.kernel.reconcile(now).await;
                 engine.publish(&config);
