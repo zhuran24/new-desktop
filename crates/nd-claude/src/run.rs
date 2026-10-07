@@ -282,7 +282,7 @@ impl Claude {
                 _ => previous,
             };
             let cursor = link.hello.high;
-            let next_in = link.hello.written + 1;
+            let next_in = link.hello.accepted.max(link.hello.written) + 1;
             Ok(ClaudeRun {
                 ready: Ready {
                     run: run.to_owned(),
@@ -397,14 +397,23 @@ impl ClaudeRun {
     /// 写一行 stdin，返回看守分配的输入序号。
     pub async fn write(&mut self, frame: &Value) -> Result<u64> {
         let seq = self.next_in;
-        self.link.write(seq, &frame.to_string()).await?;
         self.next_in += 1;
+        self.retry_write(seq, frame).await?;
         Ok(seq)
     }
     /// 看守连接断了（传输错误后连接作废）：换一条新连接，输入序号接着看守报的已写高水位。
     pub fn relink(&mut self, link: WatchLink) {
-        self.next_in = link.hello.written + 1;
+        self.next_in = self
+            .next_in
+            .max(link.hello.accepted.max(link.hello.written) + 1);
         self.link = link;
+    }
+    /// 只重试同一帧的同一序号；不得为后续新帧复用一次失败写入的序号。
+    pub async fn retry_write(&mut self, seq: u64, frame: &Value) -> Result<()> {
+        self.link.write(seq, &frame.to_string()).await
+    }
+    pub fn written_through(&self) -> u64 {
+        self.link.hello.written
     }
     /// 下一行 stdin 的输入序号。看守按输入序号去重：同一序号重写不会写两次。
     pub fn next_input(&self) -> u64 {

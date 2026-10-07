@@ -203,7 +203,7 @@ impl Watchdogs {
         }
         let response: Response =
             tokio::time::timeout(Duration::from_secs(3), recv(&mut socket)).await??;
-        let Response::Hello { hello } = response else {
+        let Response::Hello { mut hello } = response else {
             return Err("missing watchdog hello".into());
         };
         if hello.version != VERSION
@@ -214,6 +214,27 @@ impl Watchdogs {
             || !hello.watchdog.alive()
         {
             return Err("IdentityMismatch".into());
+        }
+        // 旧看守尚无 accepted；从保留流水补齐在途输入，不能只信 written。
+        if hello.accepted == 0 {
+            hello.accepted = hello.written;
+            let mut cursor = 0;
+            loop {
+                let rows = read_records(&directory, cursor, MAX_RECORDS_PER_READ)?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in &rows {
+                    match row.event {
+                        Event::In { in_seq, .. } => hello.accepted = hello.accepted.max(in_seq),
+                        Event::Gap {
+                            reason: GapReason::LostLines,
+                        } => return Err("legacy watchdog input watermark unavailable".into()),
+                        _ => {}
+                    }
+                    cursor = row.end_seq;
+                }
+            }
         }
         Ok(WatchLink {
             socket: Some(socket),

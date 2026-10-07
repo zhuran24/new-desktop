@@ -659,3 +659,69 @@ async fn n7_disk_page_cache_reaches_slice_limit_without_any_oom_kill() {
     scenario.close().unwrap();
     assert!(!disk.exists());
 }
+
+#[tokio::test]
+async fn reconnect_allocates_after_an_input_that_is_still_blocked_in_the_pipe() {
+    use nd_watchdog_proto::Event;
+    let scenario = Scenario::start(options("accepted-input")).await.unwrap();
+    let script = "import pathlib,time,sys\nwhile not pathlib.Path('/sandbox/read-now').exists(): time.sleep(.01)\nfor line in sys.stdin:\n print(line[0]+':'+str(len(line.strip())),flush=True)";
+    let spec = scenario
+        .watchdog_spec("blocked", "/usr/bin/python3", &["-u", "-c", script])
+        .unwrap();
+    let runs = scenario.watchdogs().unwrap();
+    runs.launch("blocked", spec).await.unwrap();
+    let mut old = runs.link("blocked").await.unwrap();
+    let first = tokio::spawn(async move { old.write(1, &"A".repeat(200_000)).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runs
+                .records("blocked", 0, 100)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r.event, Event::In { in_seq: 1, .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut new = runs.link("blocked").await.unwrap();
+    assert_eq!(new.hello.written, 0, "first write is blocked");
+    let accepted = serde_json::to_value(&new.hello).unwrap()["accepted"]
+        .as_u64()
+        .unwrap_or(new.hello.written);
+    assert_eq!(
+        accepted, 1,
+        "reconnected controller must reserve the in-flight input sequence"
+    );
+    std::fs::write(scenario.root().join("read-now"), "").unwrap();
+    new.write(accepted + 1, "B").await.unwrap();
+    let _ = first.await.unwrap();
+    let rows = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = new.read(0, 100).await.unwrap();
+            if rows
+                .iter()
+                .filter(|r| matches!(r.event, Event::Out { .. }))
+                .count()
+                == 2
+            {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let output: Vec<_> = rows
+        .iter()
+        .filter_map(|r| match &r.event {
+            Event::Out { line } => Some(line.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(output, ["A:200000", "B:1"]);
+    scenario.close().unwrap();
+}

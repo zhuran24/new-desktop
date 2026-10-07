@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
         watchdog: Identity::read(std::process::id())?,
         high: 0,
         written: 0,
+        accepted: 0,
         exit: None,
     };
     private_json(&spec.directory.join("hello.json"), &hello)?;
@@ -147,11 +148,6 @@ async fn main() -> Result<()> {
             let result = async {
                 match request {
                     Request::Write { in_seq, line } => {
-                        if line.contains('\n') || line.len() > MAX_FRAME / 4 || in_seq == 0 {
-                            return Err(
-                                "input must be one bounded line with nonzero sequence".into()
-                            );
-                        }
                         if failed_input.is_some_and(|failed| in_seq >= failed) {
                             return Err("previous input write incomplete; delivery unknown".into());
                         }
@@ -248,7 +244,18 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            Request::Write { .. } => {
+                            Request::Write { in_seq, ref line } => {
+                                if line.contains('\n') || line.len() > MAX_FRAME / 4 || in_seq == 0
+                                {
+                                    return Err(
+                                        "input must be one bounded line with nonzero sequence"
+                                            .into(),
+                                    );
+                                }
+                                {
+                                    let mut state = state.lock().await;
+                                    state.hello.accepted = state.hello.accepted.max(in_seq);
+                                }
                                 let (tx, rx) = oneshot::channel();
                                 inputs.send((request, tx)).await?;
                                 Ok(rx.await?)

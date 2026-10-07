@@ -108,6 +108,9 @@ pub struct Hello {
     pub watchdog: Identity,
     pub high: u64,
     pub written: u64,
+    /// 已接受的输入高水位，包括排队中和正在写的行。旧看守缺省为 0。
+    #[serde(default)]
+    pub accepted: u64,
     pub exit: Option<i32>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

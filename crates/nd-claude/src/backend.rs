@@ -1202,11 +1202,11 @@ impl Actor {
                 if !self.relink().await {
                     return Err(error.to_string());
                 }
-                if self.run.next_input() > seq {
+                if self.run.written_through() >= seq {
                     return Ok(());
                 }
                 self.run
-                    .write(frame)
+                    .retry_write(seq, frame)
                     .await
                     .map(|_| ())
                     .map_err(|e| e.to_string())
@@ -1359,18 +1359,22 @@ impl Actor {
                         .await;
                     return;
                 }
+                let seq = self.run.next_input();
                 if let Err(error) = self.run.write(&frame).await {
                     // 传输出错（例如别处接管了看守连接）：换连接后按看守报的已写高水位定，
                     // 没写过就同一行再写一次（传输层重发，uuid 与输入序号都不变）。
                     let mut failure = Some(error.to_string());
-                    let seq = self.run.next_input();
                     if self.relink().await {
                         // 新连接报的已写高水位越过了这一行的序号：写过了。否则用同一个序号再写，
                         // 旧连接上已受理的那次若也落了地，看守按序号去重。
-                        failure = if self.run.next_input() > seq {
+                        failure = if self.run.written_through() >= seq {
                             None
                         } else {
-                            self.run.write(&frame).await.err().map(|e| e.to_string())
+                            self.run
+                                .retry_write(seq, &frame)
+                                .await
+                                .err()
+                                .map(|e| e.to_string())
                         };
                     }
                     if let Some(error) = failure {
@@ -1475,7 +1479,8 @@ impl Actor {
                 let seq = self.run.next_input();
                 if let Err(error) = self.run.write(&frame).await {
                     let recovered = self.relink().await
-                        && (self.run.next_input() > seq || self.run.write(&frame).await.is_ok());
+                        && (self.run.written_through() >= seq
+                            || self.run.write(&frame).await.is_ok());
                     if !recovered {
                         // 保留请求配对，迟到回应仍可澄清原 Unknown；writes 才是写出证据。
                         self.inner
