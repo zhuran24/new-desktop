@@ -359,26 +359,26 @@ impl Executor {
         if self.fault(Fault::AfterCommit) {
             return Flow::Died;
         }
+        // 受理了、收据等动作有结果：先挂着。结果可能就在这个事务里定了（例如当场被拒），
+        // 所以挂在交出回应之前，结果入账的事务提交后统一回。
+        let mut reply = reply;
+        if value.is_none()
+            && let Some(id) = deferred.filter(|id| {
+                self.core.invokes.contains_key(id) || fx.replies.iter().any(|(r, _)| r == id)
+            })
+            && let Some(reply) = reply.take()
+        {
+            self.waiters.entry(id).or_default().push(reply);
+        }
         // 提交之后：先追加事件、交出发件，命令的回应最后给（C1）。
         self.after_commit(fx, live);
         if self.fault(Fault::AfterHandoff) {
             return Flow::Died;
         }
         if let Some(reply) = reply {
-            match (value, deferred) {
-                (Some(value), _) => {
-                    let _ = reply.send(value);
-                }
-                // 受理了、收据等动作有结果：先挂着，结果入账的事务提交后再回。
-                (None, Some(id)) if self.core.invokes.contains_key(&id) => {
-                    self.waiters.entry(id).or_default().push(reply);
-                }
-                (None, _) => {
-                    let _ = reply.send(CommandReply::Unavailable {
-                        reason: "no reply".into(),
-                    });
-                }
-            }
+            let _ = reply.send(value.unwrap_or(CommandReply::Unavailable {
+                reason: "no reply".into(),
+            }));
         }
         Flow::Continue
     }
