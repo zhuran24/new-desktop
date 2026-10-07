@@ -76,7 +76,7 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
 
 最终运行耗时 **75.31 秒**，stdout **35 行 / 50,789 B**；其中 stream_event **12 行 / 3,379 B**，占行数 **34.29%**、原始 stdout 字节 **6.65%**。带看守信封和两条输入后的保留流水 **57,964 B**，溢出 0 B、LostLines=false。CLI 的子代理模型 SSE 并不全部出现在主 stdout；测量以真实看守读到的行为为准，不能用伪模型发出的 12,288 个增量冒充流水行数。
 
-这是一条约 75 秒、六个子代理的离线长 Workflow 样本，不是数小时真服务压测。样本远低于默认软限，当前阈值无需降低；未来版本或实际任务体积增长仍按相同的软限丢增量、硬限转存、真损失 Unknown 规则处理。另有明确的低阈值场景覆盖所有溢出分支。
+这是一条约 75 秒、六个子代理的离线长 Workflow 样本，不是数小时真服务压测。样本远低于默认软限，不能支持保留或调整容量阈值的结论；64/256 MiB 继续作为待测的暂定配置。实际任务体积增长时仍按软限丢增量、硬限转存、真损失 Unknown 的规则处理。另有明确的低阈值场景覆盖所有溢出分支。
 
 当前仓库夹具是同一脚本另一次约 75 秒运行的完整录制范围（从 initialize 到 Workflow 完成，CLI 此时仍活着），含 36 条看守记录。文件：`crates/nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl`；SHA-256 `8045853deb421e3a4685143150bbc401d1166fd75056bbb89289b148f629d09c`。首行的 count/first_seq/last_seq 可检出末尾整行缺失，连续性检查可检出中间漏行；默认纯回归验证六个子代理完成。最终场景生成的另一个原始录制和统计在日志根目录的 `v6-workflow.jsonl`、`v6-stats.json`。
 
