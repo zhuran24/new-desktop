@@ -4958,3 +4958,111 @@ async fn messages_held_during_creation_reach_the_real_cli_in_arrival_order() {
     assert_eq!(written, ["hold first", "second", "third"]);
     fx.close();
 }
+
+#[tokio::test]
+async fn legacy_ultracode_settings_survive_upgrade_after_idle_reclaim() {
+    for requested in [true, false] {
+        let fx = Fixture::start("legacy-ultracode", 900).await;
+        fx.scenario
+            .endpoint()
+            .enqueue(fx.main(), ModelReply::text("ready"));
+        let session = fx
+            .create("legacy-create", "/sandbox/project", "hello")
+            .await;
+        fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
+        let mut watcher = fx.ui().await;
+        watcher
+            .subscribe(&format!("session/{session}"))
+            .await
+            .unwrap();
+        for (id, setting) in [
+            ("opus", json!({"model":"opus"})),
+            ("ultra", json!({"ultracode":requested})),
+        ] {
+            let reply = fx
+                .command(
+                    id,
+                    "session.configure",
+                    json!({"session":session,"setting":setting}),
+                )
+                .await;
+            assert!(
+                matches!(
+                    reply,
+                    CommandReply::Receipt {
+                        receipt: Receipt::Accepted { .. }
+                    }
+                ),
+                "{reply:?}"
+            );
+            fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+        }
+        watcher.close().await.unwrap();
+        fx.wait(&session, "reclaimed", |s| {
+            header(s)["process"]["alive"] == false && header(s)["op"].is_null()
+        })
+        .await;
+        fx.scenario.stop_daemon().unwrap();
+        // Upgrade fixture: exactly the former opaque settings shape in real
+        // SQLite, while no adapter exists to perform the live adopt migration.
+        let store = nd_store::Store::open(fx.scenario.root().join("state.sqlite"), 2).unwrap();
+        store
+            .write(|tx| {
+                let text: String =
+                    tx.query_row("SELECT core FROM sessions WHERE id=?1", [&session], |r| {
+                        r.get(0)
+                    })?;
+                let mut core: Value = serde_json::from_str(&text).unwrap();
+                let settings = &mut core["meta"]["settings"];
+                let applied = settings["applied"].as_object_mut().unwrap();
+                assert_eq!(
+                    applied.remove("ultracode_requested"),
+                    Some(json!(requested))
+                );
+                applied.insert("ultracodeRequested".into(), json!(requested));
+                applied.insert("ultracodeAvailable".into(), json!(true));
+                settings
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("permission_labels");
+                tx.execute(
+                    "UPDATE sessions SET core=?1 WHERE id=?2",
+                    nd_store::params![core.to_string(), session],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        fx.scenario.start_daemon().unwrap();
+        let upgraded = fx.peek(&session).await;
+        assert_eq!(
+            header(&upgraded)["settings"]["applied"]["ultracode_requested"],
+            requested
+        );
+        fx.scenario.endpoint().enqueue(
+            Route::new(None, "claude-opus-5-5"),
+            ModelReply::text("restored"),
+        );
+        fx.send("legacy-resume", &session, "continue").await;
+        let restored = fx
+            .wait(&session, "restored", |s| {
+                texts(s).contains(&"restored".into())
+            })
+            .await;
+        assert_eq!(
+            header(&restored)["settings"]["applied"]["ultracode_requested"],
+            requested
+        );
+        assert_eq!(
+            header(&restored)["settings"]["applied"]["ultracode"],
+            requested
+        );
+        fx.scenario.restart_daemon().unwrap();
+        let reopened = fx.peek(&session).await;
+        assert_eq!(
+            header(&reopened)["settings"]["applied"]["ultracode_requested"],
+            requested
+        );
+        fx.close();
+    }
+}

@@ -499,7 +499,15 @@ pub fn listed(store: &nd_store::Store) -> nd_store::Result<Vec<Core>> {
 fn read_settings<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> Result<nd_backend::LiveSettings, D::Error> {
-    Ok(Option::<nd_backend::LiveSettings>::deserialize(de)?.unwrap_or_default())
+    let mut value = Option::<Value>::deserialize(de)?.unwrap_or_else(|| serde_json::json!({}));
+    // Before neutral settings, the persisted applied object used the CLI key.
+    // Migrate on every load, including carriers with no live process to adopt.
+    if let Some(applied) = value.get_mut("applied").and_then(Value::as_object_mut)
+        && let Some(requested) = applied.remove("ultracodeRequested")
+    {
+        applied.entry("ultracode_requested").or_insert(requested);
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 /// Gone 流水回收的持久引用屏障，包括未结和交付不明的 Open 票。
