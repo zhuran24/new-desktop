@@ -231,13 +231,13 @@ async fn backend_exit_cleans_descendants_even_without_daemon_and_watchdog_never_
             .any(|r| matches!(r.event, nd_watchdog_proto::Event::Exit { code: 7 }))
     );
     assert_eq!(
-        runs.collect_unused(&std::collections::BTreeSet::from(["exit".to_owned()]))
+        runs.collect_unused(|| Ok(std::collections::BTreeSet::from(["exit".to_owned()])))
             .unwrap(),
         0,
         "a committed reference keeps the unread tail"
     );
     assert!(runs.directory("exit").unwrap().exists());
-    assert_eq!(runs.collect_unused(&Default::default()).unwrap(), 1);
+    assert_eq!(runs.collect_unused(|| Ok(Default::default())).unwrap(), 1);
     assert!(!runs.directory("exit").unwrap().exists());
     assert!(!overflow.exists());
     assert_eq!(
@@ -973,5 +973,48 @@ async fn a_failed_gap_extension_preserves_the_entire_previous_gap_range() {
     .unwrap();
     assert_eq!((recovered[0].seq, recovered[0].end_seq), (1, 10));
     assert!(matches!(&recovered[1].event, Event::Out { line } if line == "recovered"));
+    scenario.close().unwrap();
+}
+
+#[tokio::test]
+async fn collection_cannot_remove_a_run_waiting_for_its_launch_lock() {
+    let scenario = Scenario::start(options("launch-collection")).await.unwrap();
+    let runs = scenario.watchdogs().unwrap();
+    let directory = runs.directory("starting").unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    let lock = std::fs::File::create(directory.join("launch.lock")).unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let spec = scenario
+        .watchdog_spec("starting", "/usr/bin/cat", &[])
+        .unwrap();
+    let launching = {
+        let runs = runs.clone();
+        tokio::spawn(async move { runs.launch("starting", spec).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !launching.is_finished(),
+        "launch is held before spec publication"
+    );
+    let collected = {
+        let runs = runs.clone();
+        tokio::task::spawn_blocking(move || runs.collect_unused(|| Ok(Default::default())))
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    fs2::FileExt::unlock(&lock).unwrap();
+    let launched = launching.await.unwrap();
+    assert_eq!(
+        collected, 0,
+        "an in-flight launch must survive a stale reference snapshot"
+    );
+    assert!(launched.is_ok(), "{launched:?}");
+    runs.link("starting")
+        .await
+        .unwrap()
+        .write(1, "still here")
+        .await
+        .unwrap();
     scenario.close().unwrap();
 }

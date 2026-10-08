@@ -166,8 +166,24 @@ impl Watchdogs {
         self.directory(run)?;
         Ok(format!("{}-{run}.service", self.config.unit_prefix))
     }
+    fn lifecycle_lock(&self) -> Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        Ok(std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(self.config.root.join("lifecycle.lock"))?)
+    }
     pub async fn launch(&self, run: &str, spec: LaunchSpec) -> Result<Launched> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let lock = self.lifecycle_lock()?;
+        let _lifecycle = tokio::task::spawn_blocking(move || {
+            fs2::FileExt::lock_shared(&lock)?;
+            Ok::<_, std::io::Error>(lock)
+        })
+        .await??;
         let directory = self.directory(run)?;
         if self.archive(run)?.exists() {
             return Err("run already collected; cannot replay launch".into());
@@ -443,12 +459,25 @@ impl Watchdogs {
             exit: saved.and_then(|h| h.exit),
         }))
     }
-    /// 调用方提供持久会话状态的引用集合；仅回收已 Gone 且无人引用的流水。
+    /// 在排除并发启动后读取持久引用；仅回收已 Gone 且无人引用的流水。
     /// 小墓碑保留诊断和 run 幂等性；它不需要 systemctl，也不保存流水。
-    pub fn collect_unused(&self, referenced: &std::collections::BTreeSet<String>) -> Result<usize> {
+    pub fn collect_unused(
+        &self,
+        references: impl FnOnce() -> Result<std::collections::BTreeSet<String>>,
+    ) -> Result<usize> {
+        let lock = self.lifecycle_lock()?;
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
+            Err(e) => return Err(e.into()),
+        }
+        // Enumerate before the fresh reference read. A newly committed Open
+        // cannot publish a directory while collection holds this lock.
+        let candidates =
+            std::fs::read_dir(&self.config.root)?.collect::<std::io::Result<Vec<_>>>()?;
+        let referenced = references()?;
         let mut collected = 0;
-        for entry in std::fs::read_dir(&self.config.root)? {
-            let entry = entry?;
+        for entry in candidates {
             if !entry.file_type()?.is_dir() {
                 continue;
             }

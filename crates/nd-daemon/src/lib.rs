@@ -514,7 +514,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
             let sessions = collection_sessions.clone();
             let runs = runs.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<()> {
-                runs.collect_unused(&sessions.referenced_runs()?)?;
+                runs.collect_unused(|| Ok(sessions.referenced_runs()?))?;
                 Ok(())
             })
             .await;
