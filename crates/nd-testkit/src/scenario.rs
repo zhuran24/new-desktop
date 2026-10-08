@@ -127,6 +127,16 @@ pub struct ResourceLimits {
     pub memory_swap_max: u64,
 }
 
+/// Observable cleanup boundaries for terminating a scenario driver mid-close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupStage {
+    BeforeSliceStop,
+    SliceStopped,
+    RuntimeRemoved,
+    DiskRemoved,
+    ExpiryStopped,
+}
+
 pub struct ScenarioOptions {
     pub name: String,
     pub daemon: PathBuf,
@@ -138,6 +148,7 @@ pub struct ScenarioOptions {
     pub watchdog: Option<PathBuf>,
     pub disk_scratch: bool,
     pub default_paths: bool,
+    pub cleanup_observer: Option<fn(CleanupStage)>,
 }
 impl ScenarioOptions {
     pub fn new(name: &str, daemon: impl Into<PathBuf>) -> Self {
@@ -151,6 +162,7 @@ impl ScenarioOptions {
             watchdog: None,
             disk_scratch: false,
             default_paths: false,
+            cleanup_observer: None,
         }
     }
     pub fn config(mut self, config: &str) -> Self {
@@ -172,6 +184,7 @@ pub struct Scenario {
     default_paths: bool,
     timeout: Duration,
     expiry: Option<String>,
+    cleanup_observer: Option<fn(CleanupStage)>,
     endpoint: Option<ClaudeEndpoint>,
     watchdog_config: Option<nd_runs::Config>,
 }
@@ -261,6 +274,7 @@ impl Scenario {
             default_paths: options.default_paths,
             timeout: options.timeout,
             expiry: None,
+            cleanup_observer: options.cleanup_observer,
             endpoint: None,
             watchdog_config: None,
         };
@@ -756,10 +770,28 @@ impl Scenario {
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
             .unwrap_or_default()
     }
+    fn cleanup_stage(&self, stage: CleanupStage) {
+        if let Some(observer) = self.cleanup_observer {
+            observer(stage);
+        }
+    }
     fn cleanup(&mut self) -> Result<()> {
         if self.dir.is_none() {
             return Ok(());
         }
+        self.cleanup_stage(CleanupStage::BeforeSliceStop);
+        // Stopping the slice also kills any descendant unit launched by the product.
+        checked("systemctl", &["--user", "stop", &self.slice])?;
+        self.cleanup_stage(CleanupStage::SliceStopped);
+        self.endpoint.take();
+        self.dir.take().unwrap().close()?;
+        self.cleanup_stage(CleanupStage::RuntimeRemoved);
+        if let Some(disk) = self.disk.take() {
+            disk.close()?;
+        }
+        self.cleanup_stage(CleanupStage::DiskRemoved);
+        // Keep the independent deadline armed until every resource is gone.
+        // SIGKILL at any earlier boundary must still finish cleanup externally.
         if let Some(expiry) = self.expiry.take() {
             // The expiry units may already have run and been collected.
             let _ = command("systemctl")
@@ -771,13 +803,8 @@ impl Scenario {
                 ])
                 .output()?;
         }
-        // Stopping the slice also kills any descendant unit launched by the product.
-        checked("systemctl", &["--user", "stop", &self.slice])?;
-        self.endpoint.take();
-        self.dir.take().unwrap().close()?;
-        if let Some(disk) = self.disk.take() {
-            disk.close()?;
-        }
+        self.cleanup_stage(CleanupStage::ExpiryStopped);
+
         Ok(())
     }
     pub fn close(mut self) -> Result<()> {

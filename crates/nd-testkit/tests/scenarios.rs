@@ -400,6 +400,20 @@ async fn orphan_scenario_child() {
     let mut opts = options("orphan-expiry");
     opts.max_lifetime = Duration::from_secs(3);
     opts.disk_scratch = true;
+    if std::env::var_os("ND_TEST_CLEANUP_STAGE").is_some() {
+        opts.cleanup_observer = Some(|stage| {
+            if std::env::var("ND_TEST_CLEANUP_STAGE").unwrap() == format!("{stage:?}") {
+                std::fs::write(
+                    std::env::var_os("ND_TEST_CLEANUP_MARKER").unwrap(),
+                    b"paused",
+                )
+                .unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+        });
+    }
     let mut scenario = Scenario::start(opts).await.unwrap();
     scenario.kill_daemon().unwrap();
     scenario.connect().await.unwrap().close().await.unwrap();
@@ -421,21 +435,49 @@ async fn orphan_scenario_child() {
         .output()
         .unwrap();
     std::fs::write(manifest, json!({"root":scenario.root(), "disk":scenario.disk_root(), "units":scenario.units(), "cgroup":String::from_utf8_lossy(&output.stdout).trim()}).to_string()).unwrap();
-    std::future::pending::<()>().await;
-    drop(scenario);
+    if std::env::var_os("ND_TEST_CLEANUP_STAGE").is_some() {
+        scenario.close().unwrap();
+    } else {
+        std::future::pending::<()>().await;
+        drop(scenario);
+    }
 }
 
 #[tokio::test]
 async fn killed_test_process_cannot_leave_a_restarting_daemon_or_slice() {
+    orphan_expiry(None).await;
+}
+
+#[tokio::test]
+async fn killed_cleanup_process_cannot_cancel_its_only_remaining_safeguard() {
+    for stage in [
+        "ExpiryStopped",
+        "BeforeSliceStop",
+        "SliceStopped",
+        "RuntimeRemoved",
+        "DiskRemoved",
+    ] {
+        orphan_expiry(Some(stage)).await;
+    }
+}
+
+async fn orphan_expiry(stage: Option<&str>) {
     let dir = tempfile::tempdir().unwrap();
     let manifest = dir.path().join("orphan.json");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    let marker = dir.path().join("cleanup-paused");
+    if let Some(stage) = stage {
+        command
+            .env("ND_TEST_CLEANUP_STAGE", stage)
+            .env("ND_TEST_CLEANUP_MARKER", &marker);
+    }
+    let mut child = command
         .args(["--exact", "orphan_scenario_child", "--nocapture"])
         .env("ND_TEST_ORPHAN_MANIFEST", &manifest)
         .spawn()
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while !manifest.exists() {
+    while !manifest.exists() || (stage.is_some() && !marker.exists()) {
         assert!(
             child.try_wait().unwrap().is_none(),
             "orphan fixture exited before ready"
