@@ -567,20 +567,47 @@ impl<'a> RecordIndex<'a> {
                     .iter()
                     .filter(|m| !m.tool_uses.is_empty() || m.tool_result)
                 {
-                    for child in children
-                        .get(member.id.as_str())
-                        .into_iter()
-                        .flatten()
-                        .filter(|n| !selected.contains(&n.id))
-                    {
+                    let mut pending = vec![*member];
+                    let mut seen = HashSet::new();
+                    while let Some(parent) = pending.pop() {
+                        if !seen.insert(&parent.id) {
+                            continue;
+                        }
+                        let descendants: Vec<_> = children
+                            .get(parent.id.as_str())
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|n| {
+                                n.transparent
+                                    && n.sidechain == member.sidechain
+                                    && n.agent_id == member.agent_id
+                            })
+                            .collect();
+                        // Selected metadata still leads to attachments beside the
+                        // selected continuation. Do not guess an unselected fork.
+                        for child in &descendants {
+                            if selected.contains(&child.id) {
+                                batch.push(*child);
+                                pending.push(*child);
+                            }
+                        }
                         let mut chain = Vec::new();
-                        let mut next = Some(*child);
-                        let mut seen = HashSet::new();
+                        let mut next = descendants
+                            .into_iter()
+                            .filter(|n| !selected.contains(&n.id));
+                        let first = next.next();
+                        if next.next().is_some() {
+                            continue;
+                        }
+                        let mut next = first;
+                        let mut chain_seen = HashSet::new();
                         while let Some(node) = next {
                             if !node.transparent
                                 || node.sidechain != member.sidechain
+                                || node.agent_id != member.agent_id
                                 || selected.contains(&node.id)
-                                || !seen.insert(&node.id)
+                                || !chain_seen.insert(&node.id)
                             {
                                 chain.clear();
                                 break;
@@ -590,8 +617,8 @@ impl<'a> RecordIndex<'a> {
                                 .get(node.id.as_str())
                                 .into_iter()
                                 .flatten()
-                                .filter(|n| !selected.contains(&n.id))
                                 .copied()
+                                .filter(|n| !selected.contains(&n.id))
                                 .collect();
                             if remaining.len() > 1 {
                                 chain.clear();

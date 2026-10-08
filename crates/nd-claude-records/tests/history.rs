@@ -582,3 +582,27 @@ fn real_cli_prefixes_select_rewind_and_new_branch_before_compaction() {
     }
     panic!("missing real CLI compact boundary");
 }
+
+#[test]
+fn attachments_below_selected_tool_metadata_are_recovered() {
+    let mut call = message("a", Some("u"), "assistant", "");
+    call["message"]["id"] = json!("reply");
+    call["message"]["content"] = json!([{"type":"tool_use","id":"t","name":"Read","input":{}}]);
+    let mut result = message("r", Some("a"), "user", "");
+    result["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"t","content":"ok"}]);
+    let mut meta = message("meta", Some("r"), "user", "metadata");
+    meta["isMeta"] = json!(true);
+    let data = transcript(&[
+        message("u", None, "user", "read"),
+        call,
+        result,
+        meta,
+        json!({"type":"attachment","uuid":"date","parentUuid":"meta","attachment":{"type":"date","date":"2026-10-07"}}),
+        message("done", Some("meta"), "assistant", "done"),
+    ]);
+    let index = RecordIndex::parse(&data).unwrap();
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        ["u", "a", "r", "meta", "date", "done"]
+    );
+}
