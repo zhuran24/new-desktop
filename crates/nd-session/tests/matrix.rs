@@ -1135,6 +1135,7 @@ async fn shell_during_pending_title_recovers_at_every_commit_point() {
     matrix(Scenario {
         prepare: |h| {
             let adapter = h.adapter.clone();
+            let store = h.store.clone();
             tokio::spawn(async move {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 while !adapter.received().iter().any(|(_, act)| {
@@ -1149,7 +1150,27 @@ async fn shell_during_pending_title_recovers_at_every_commit_point() {
                     assert!(tokio::time::Instant::now() < deadline);
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-                adapter.release(Reply::Ok);
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+                while !matches!(
+                    nd_ledger::lookup(&store, "matrix-title-shell", None).unwrap(),
+                    nd_wire::ReceiptLookup::Found {
+                        receipt: nd_wire::Receipt::Done { .. }
+                    }
+                ) {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "shell must return Done while the title is still held"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(adapter.held().iter().any(|(_, act)| matches!(
+                    act,
+                    nd_backend::Act::Invoke {
+                        invocation: nd_backend::Invocation::GenerateTitle { .. },
+                        ..
+                    }
+                )));
+                assert!(adapter.release(Reply::Ok));
             });
         },
         observe_ms: 0,
