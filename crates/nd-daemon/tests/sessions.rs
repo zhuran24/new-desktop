@@ -5714,3 +5714,231 @@ async fn busy_inputs_start_a_fresh_idle_interval_without_waiting_for_a_tick() {
     assert!(finished.elapsed() >= Duration::from_millis(1400));
     fx.close();
 }
+
+#[tokio::test]
+async fn bypass_legacy_launch_authorization_is_recovered_for_the_same_process() {
+    bypass_catalog_after_legacy_adoption(true, false).await;
+}
+
+#[tokio::test]
+async fn legacy_default_launch_does_not_gain_bypass_from_changed_configuration() {
+    bypass_catalog_after_legacy_adoption(false, false).await;
+}
+
+#[tokio::test]
+async fn bypass_launch_checkpoint_preserves_config_grant_when_caps_lack_the_field() {
+    bypass_catalog_after_legacy_adoption(true, true).await;
+}
+
+async fn bypass_catalog_after_legacy_adoption(authorized: bool, from_config: bool) {
+    let fx = Fixture::start("legacy-permission-caps", 3_600_000).await;
+    if from_config {
+        std::fs::write(
+            fx.scenario.root().join("claude/settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+    }
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let reply = fx
+        .command(
+            "create",
+            "session.create",
+            json!({
+                "cwd":"/sandbox/project","text":"hello","model":MODEL,
+                "permission_mode": if from_config { None } else if authorized { Some("bypassPermissions") } else { Some("default") }
+            }),
+        )
+        .await;
+    let CommandReply::Receipt {
+        receipt: Receipt::Accepted {
+            stream: Some(stream),
+            ..
+        },
+    } = reply
+    else {
+        panic!("{reply:?}")
+    };
+    let session = stream.trim_start_matches("session/");
+    let initial = fx
+        .wait(session, "ready", |s| {
+            texts(s) == ["ready"] && header(s)["op"].is_null()
+        })
+        .await;
+    let pid = cli_pid(&fx, &initial).await;
+    // Changing disk settings after launch must neither grant nor revoke the
+    // existing process's startup authorization.
+    std::fs::write(
+        fx.scenario.root().join("claude/settings.json"),
+        json!({"permissions":{"defaultMode":if authorized {"default"} else {"bypassPermissions"}}})
+            .to_string(),
+    )
+    .unwrap();
+    for (round, mode) in [
+        "default",
+        "bypassPermissions",
+        "default",
+        "bypassPermissions",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if !authorized && mode == "bypassPermissions" {
+            continue;
+        }
+        if round > 0 {
+            fx.scenario.stop_daemon().unwrap();
+            let store = nd_store::Store::open(fx.scenario.root().join("state.sqlite"), 2).unwrap();
+            store
+                .write(|tx| {
+                    let text: String =
+                        tx.query_row("SELECT core FROM sessions WHERE id=?1", [session], |r| {
+                            r.get(0)
+                        })?;
+                    let mut core: Value = serde_json::from_str(&text).unwrap();
+                    for carrier in core["carriers"].as_object_mut().unwrap().values_mut() {
+                        carrier["adopt"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("bypass_permissions");
+                        if !from_config {
+                            // Reproduce a fully old checkpoint as well as old Caps.
+                            carrier["checkpoint"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("bypass_permissions");
+                        }
+                    }
+                    tx.execute(
+                        "UPDATE sessions SET core=?1 WHERE id=?2",
+                        nd_store::params![core.to_string(), session],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            drop(store);
+            fx.scenario.start_daemon().unwrap();
+            fx.wait(session, "adopted", |s| header(s)["recovering"] == false)
+                .await;
+        }
+        let reply = fx
+            .command(
+                &format!("mode-{round}"),
+                "session.configure",
+                json!({"session":session,"setting":{"permission_mode":mode}}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        let changed = fx.wait(session, mode, |s| header(s)["op"].is_null()).await;
+        assert_eq!(header(&changed)["permission_mode"], mode);
+        assert_eq!(cli_pid(&fx, &changed).await, pid);
+        assert_eq!(
+            header(&changed)["settings"]["permission_modes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("bypassPermissions")),
+            authorized
+        );
+        assert_eq!(
+            header(&changed)["settings"]["permission_labels"]["bypassPermissions"].is_string(),
+            authorized
+        );
+    }
+    fx.close();
+}
+
+#[tokio::test]
+async fn bypass_from_configuration_survives_mode_changes_and_live_adoption() {
+    let fx = Fixture::start("p36-config-bypass", 3_600_000).await;
+    std::fs::write(
+        fx.scenario.root().join("claude/settings.json"),
+        r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+    )
+    .unwrap();
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let reply = fx
+        .command(
+            "bypass-create",
+            "session.create",
+            json!({
+                "cwd":"/sandbox/project","text":"hello","model":MODEL
+            }),
+        )
+        .await;
+    let CommandReply::Receipt {
+        receipt: Receipt::Accepted {
+            stream: Some(stream),
+            ..
+        },
+    } = reply
+    else {
+        panic!("{reply:?}")
+    };
+    let session = stream.trim_start_matches("session/");
+    let initial = fx
+        .wait(session, "ready", |s| {
+            texts(s) == ["ready"] && header(s)["op"].is_null()
+        })
+        .await;
+    assert_eq!(header(&initial)["permission_mode"], "bypassPermissions");
+    let pid = cli_pid(&fx, &initial).await;
+    for (id, mode, restart) in [
+        ("default", "default", false),
+        ("bypass", "bypassPermissions", true),
+        ("default-again", "default", false),
+        ("bypass-again", "bypassPermissions", false),
+    ] {
+        if restart {
+            fx.scenario.restart_daemon().unwrap();
+            fx.wait(session, "adopted", |s| header(s)["recovering"] == false)
+                .await;
+        }
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":{"permission_mode":mode}}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        let changed = fx.wait(session, mode, |s| header(s)["op"].is_null()).await;
+        assert_eq!(header(&changed)["permission_mode"], mode);
+        assert!(
+            header(&changed)["settings"]["permission_modes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("bypassPermissions"))
+        );
+        assert!(header(&changed)["settings"]["permission_labels"]["bypassPermissions"].is_string());
+        assert_eq!(cli_pid(&fx, &changed).await, pid);
+    }
+    let final_state = fx.peek(session).await;
+    assert!(
+        header(&final_state)["settings"]["permission_modes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("bypassPermissions")),
+        "successful bypass controls must retain the authorized catalog"
+    );
+    fx.close();
+}

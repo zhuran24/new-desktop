@@ -107,6 +107,9 @@ struct PendingInvoke {
 /// 适配器私有检查点。每个字段独立开放解码；缺失的旧版写入索引不冒充空索引。
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct ClaudeCheckpoint {
+    /// Immutable launch authorization, retained beyond watchdog log collection.
+    #[serde(default, deserialize_with = "checkpoint_field")]
+    bypass_permissions: Option<bool>,
     #[serde(default, deserialize_with = "checkpoint_field")]
     seq: u64,
     #[serde(default, deserialize_with = "checkpoint_field")]
@@ -640,7 +643,12 @@ impl Inner {
                 let mut settings =
                     initial_control(&mut claude_run, json!({"subtype":"get_settings"}))
                         .await
-                        .map(|s| settings_with_caps(s, claude_run.ready().caps.bypass_permissions))
+                        .map(|s| {
+                            settings_with_caps(
+                                s,
+                                claude_run.ready().caps.bypass_permissions == Some(true),
+                            )
+                        })
                         .unwrap_or_else(|why| nd_wire::LiveSettings {
                             error: Some(why),
                             ..Default::default()
@@ -889,7 +897,10 @@ impl Inner {
                 _ => None,
             })
             .collect();
-        let caps: Option<Caps> = serde_json::from_value(record.adopt.clone()).ok();
+        let mut caps: Option<Caps> = serde_json::from_value(record.adopt.clone()).ok();
+        if let Some(caps) = &mut caps {
+            caps.bypass_permissions = caps.bypass_permissions.or(checkpoint.bypass_permissions);
+        }
         let bs = record.bs.as_ref().map(|b| b.id.clone()).unwrap_or_default();
         let mut delay = Duration::from_millis(50);
         let adopted = loop {
@@ -1554,6 +1565,7 @@ impl Actor {
 
     fn checkpoint(&self, through: u64) -> Checkpoint {
         ClaudeCheckpoint {
+            bypass_permissions: self.run.ready().caps.bypass_permissions,
             seq: through,
             convo: self.convo.clone(),
             writes: Some(self.writes.clone()),
@@ -1969,7 +1981,8 @@ impl Actor {
                                         done: Done::Configured {
                                             settings: settings_with_caps(
                                                 body["response"].clone(),
-                                                self.run.ready().caps.bypass_permissions,
+                                                self.run.ready().caps.bypass_permissions
+                                                    == Some(true),
                                             ),
                                         },
                                     },

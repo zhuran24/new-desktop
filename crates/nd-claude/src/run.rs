@@ -104,7 +104,7 @@ pub enum Availability {
 pub struct Caps {
     /// Permission to re-enter bypass is fixed by this process launch.
     #[serde(default)]
-    pub bypass_permissions: bool,
+    pub bypass_permissions: Option<bool>,
     pub readiness: Readiness,
     pub features: BTreeMap<Feature, Availability>,
     /// Esc（`interrupt`）不停后台的子代理与 Workflow：声明了 perTaskStopAffordance 且 stdin 开着。
@@ -223,8 +223,10 @@ impl Claude {
         let (initialize, cursor) = await_response(&mut link, &id, self.config.init_timeout).await?;
         self.channel.settle(run);
         let mut capabilities = caps(readiness, init.per_task_stop_affordance);
+        // The CLI resolves all settings sources before replying to initialize.
+        // Preserve the resolved launch mode, including permissions.defaultMode.
         capabilities.bypass_permissions =
-            open.permission_mode.as_deref() == Some("bypassPermissions");
+            Some(initialize["current_permission_mode"] == "bypassPermissions");
         if capabilities.readiness == Readiness::Full {
             let listed = |field: &str, name: &str| {
                 initialize[field]
@@ -279,7 +281,52 @@ impl Claude {
                 .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
                 .await
                 .ok_or("run unregistered while waiting for hellos")?;
-            let bypass_permissions = previous.bypass_permissions;
+            let bypass_permissions = match previous.bypass_permissions {
+                Some(authorized) => Some(authorized),
+                None => {
+                    // Old Caps did not record the launch authorization. Use the
+                    // immutable watchdog launch record, never today's config or
+                    // the process's current (possibly switched) permission mode.
+                    let path = self.watchdogs.directory(run)?.join("spec.json");
+                    let spec: nd_watchdog_proto::WatchSpec =
+                        serde_json::from_slice(&std::fs::read(path)?)?;
+                    let explicit = spec.launch.argv.iter().any(|arg| {
+                        matches!(
+                            arg.as_str(),
+                            "--dangerously-skip-permissions"
+                                | "--allow-dangerously-skip-permissions"
+                        )
+                    }) || spec
+                        .launch
+                        .argv
+                        .windows(2)
+                        .any(|args| args == ["--permission-mode", "bypassPermissions"]);
+                    if explicit {
+                        Some(true)
+                    } else {
+                        // Legacy config-based launches have no granting argv.
+                        // Recover the CLI's original initialize response from
+                        // retained watchdog output, not changed settings files.
+                        self.watchdogs
+                            .records(run, 0, 1000)?
+                            .iter()
+                            .find_map(|record| {
+                                let Event::Out { line } = &record.event else {
+                                    return None;
+                                };
+                                let frame: Value = serde_json::from_str(line).ok()?;
+                                (frame["type"] == "control_response"
+                                    && frame["response"]["request_id"] == format!("nd-init-{run}"))
+                                .then(|| {
+                                    frame["response"]["response"]["current_permission_mode"]
+                                        .as_str()
+                                        .map(|mode| mode == "bypassPermissions")
+                                })
+                                .flatten()
+                            })
+                    }
+                }
+            };
             let mut caps = match readiness(&binding, session, self.config.hello_timeout) {
                 Readiness::ChatOnly { why } if previous.readiness == Readiness::Full => caps(
                     Readiness::ChatOnly { why },
@@ -349,7 +396,7 @@ fn caps(readiness: Readiness, interrupt_spares_background: bool) -> Caps {
         })
         .collect();
     Caps {
-        bypass_permissions: false,
+        bypass_permissions: None,
         readiness,
         features,
         interrupt_spares_background,
