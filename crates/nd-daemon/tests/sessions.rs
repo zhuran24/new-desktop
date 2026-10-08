@@ -5426,3 +5426,72 @@ async fn mcp_task_background_switch_controls_inflight_task_handles() {
         fx.close();
     }
 }
+
+#[tokio::test]
+async fn bypass_launch_authorization_survives_mode_changes_and_live_adoption() {
+    let fx = Fixture::start("bypass-authorized", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let reply = fx.command("bypass-create", "session.create", json!({
+        "cwd":"/sandbox/project","text":"hello","model":MODEL,"permission_mode":"bypassPermissions"
+    })).await;
+    let CommandReply::Receipt {
+        receipt: Receipt::Accepted {
+            stream: Some(stream),
+            ..
+        },
+    } = reply
+    else {
+        panic!("{reply:?}")
+    };
+    let session = stream.trim_start_matches("session/");
+    let initial = fx
+        .wait(session, "ready", |s| {
+            texts(s) == ["ready"] && header(s)["op"].is_null()
+        })
+        .await;
+    let pid = cli_pid(&fx, &initial).await;
+    for (id, mode, restart) in [
+        ("default", "default", false),
+        ("bypass", "bypassPermissions", true),
+        ("default-again", "default", false),
+        ("bypass-again", "bypassPermissions", false),
+    ] {
+        if restart {
+            fx.scenario.restart_daemon().unwrap();
+            fx.wait(session, "adopted", |s| header(s)["recovering"] == false)
+                .await;
+        }
+        let before = fx.peek(session).await;
+        assert!(
+            header(&before)["settings"]["permission_modes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("bypassPermissions")),
+            "authorized catalog: {}",
+            header(&before)["settings"]
+        );
+        assert!(header(&before)["settings"]["permission_labels"]["bypassPermissions"].is_string());
+        let reply = fx
+            .command(
+                id,
+                "session.configure",
+                json!({"session":session,"setting":{"permission_mode":mode}}),
+            )
+            .await;
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Accepted { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        let changed = fx.wait(session, mode, |s| header(s)["op"].is_null()).await;
+        assert_eq!(header(&changed)["permission_mode"], mode);
+        assert_eq!(cli_pid(&fx, &changed).await, pid);
+    }
+    fx.close();
+}

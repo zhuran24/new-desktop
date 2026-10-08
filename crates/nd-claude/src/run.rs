@@ -102,6 +102,9 @@ pub enum Availability {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Caps {
+    /// Permission to re-enter bypass is fixed by this process launch.
+    #[serde(default)]
+    pub bypass_permissions: bool,
     pub readiness: Readiness,
     pub features: BTreeMap<Feature, Availability>,
     /// Esc（`interrupt`）不停后台的子代理与 Workflow：声明了 perTaskStopAffordance 且 stdin 开着。
@@ -220,6 +223,8 @@ impl Claude {
         let (initialize, cursor) = await_response(&mut link, &id, self.config.init_timeout).await?;
         self.channel.settle(run);
         let mut capabilities = caps(readiness, init.per_task_stop_affordance);
+        capabilities.bypass_permissions =
+            open.permission_mode.as_deref() == Some("bypassPermissions");
         if capabilities.readiness == Readiness::Full {
             let listed = |field: &str, name: &str| {
                 initialize[field]
@@ -274,13 +279,15 @@ impl Claude {
                 .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
                 .await
                 .ok_or("run unregistered while waiting for hellos")?;
-            let caps = match readiness(&binding, session, self.config.hello_timeout) {
+            let bypass_permissions = previous.bypass_permissions;
+            let mut caps = match readiness(&binding, session, self.config.hello_timeout) {
                 Readiness::ChatOnly { why } if previous.readiness == Readiness::Full => caps(
                     Readiness::ChatOnly { why },
                     previous.interrupt_spares_background,
                 ),
                 _ => previous,
             };
+            caps.bypass_permissions = bypass_permissions;
             let cursor = link.hello.high;
             let next_in = link
                 .hello
@@ -342,6 +349,7 @@ fn caps(readiness: Readiness, interrupt_spares_background: bool) -> Caps {
         })
         .collect();
     Caps {
+        bypass_permissions: false,
         readiness,
         features,
         interrupt_spares_background,

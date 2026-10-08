@@ -640,7 +640,7 @@ impl Inner {
                 let mut settings =
                     initial_control(&mut claude_run, json!({"subtype":"get_settings"}))
                         .await
-                        .map(settings_with_caps)
+                        .map(|s| settings_with_caps(s, claude_run.ready().caps.bypass_permissions))
                         .unwrap_or_else(|why| nd_wire::LiveSettings {
                             error: Some(why),
                             ..Default::default()
@@ -983,7 +983,10 @@ impl Inner {
             facts.push(fact(
                 format!("legacy-settings:{run}"),
                 FactBody::SettingsObserved {
-                    settings: settings_with_caps(legacy.clone()),
+                    settings: settings_with_caps(
+                        legacy.clone(),
+                        claude_run.ready().caps.bypass_permissions,
+                    ),
                 },
             ));
         }
@@ -1975,7 +1978,10 @@ impl Actor {
                                     &ticket,
                                     Outcome::Ok {
                                         done: Done::Configured {
-                                            settings: settings_with_caps(body["response"].clone()),
+                                            settings: settings_with_caps(
+                                                body["response"].clone(),
+                                                self.run.ready().caps.bypass_permissions,
+                                            ),
                                         },
                                     },
                                 ));
@@ -2331,18 +2337,21 @@ impl BackendAdapter for ClaudeBackend {
     }
 }
 
-fn settings_with_caps(settings: Value) -> nd_wire::LiveSettings {
+fn settings_with_caps(settings: Value, bypass_permissions: bool) -> nd_wire::LiveSettings {
     let applied = &settings["applied"];
     let ultracode = applied["ultracodeAvailable"] == true
         && applied["ultracodeRequested"].is_boolean()
         && applied["ultracode"].is_boolean();
-    let modes = [
+    let mut modes = vec![
         ("default", "默认审批"),
         ("acceptEdits", "允许编辑"),
         ("plan", "计划"),
         ("dontAsk", "不询问"),
         ("auto", "自动"),
     ];
+    if bypass_permissions {
+        modes.push(("bypassPermissions", "跳过权限检查"));
+    }
     nd_wire::LiveSettings {
         applied: nd_wire::EffectiveSettings {
             model: applied["model"].as_str().map(str::to_owned),
