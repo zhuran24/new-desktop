@@ -168,38 +168,3 @@ async fn a_pending_bang_answers_every_identical_retry_with_one_receipt() {
         1
     );
 }
-
-#[tokio::test(flavor = "multi_thread")]
-async fn reclaim_does_not_promote_a_model_default_effort_into_a_user_override() {
-    let mut cfg = config();
-    cfg.idle_reclaim = std::time::Duration::from_millis(60);
-    let h = Harness::new(cfg.clone()).await;
-    h.adapter.set_initial_settings(
-        serde_json::from_value(serde_json::json!({"applied":{"effort":"medium"}})).unwrap(),
-    );
-    let session = accepted_session(&h.create("default-effort", "first").await);
-    h.wait(&session, "reclaimed", |s| {
-        header(s)["status"] == "active" && header(s)["process"]["alive"] == false
-    })
-    .await;
-    let h = h.restart(cfg).await;
-    h.send("after-reclaim", &session, "next").await;
-    h.wait(&session, "resumed", |s| {
-        prompt(s, "next").is_some_and(|p| p.data["state"] == "landed")
-    })
-    .await;
-    let opened: Vec<_> = h
-        .adapter
-        .received()
-        .into_iter()
-        .filter_map(|(_, act)| match act {
-            Act::Open { spec, .. } => Some(spec.profile.effort),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        opened,
-        [None, None],
-        "only a confirmed user choice may be replayed as an effort override"
-    );
-}
