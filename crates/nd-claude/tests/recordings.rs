@@ -1,8 +1,7 @@
 //! 录制回归：主接缝场景录下的 mod 往返，喂给协议状态机，得到同样的归一化事实。
-use nd_claude::{Fact, ModEvent, ModState, fixture};
-use nd_mod_proto::{
-    Action, Command, Hello, HelloCause, ModName, NextQuery, Outcome, Rejection, ResultPost,
-};
+use nd_claude::{Fact, fixture};
+use nd_mod_proto::{ModName, Outcome, Rejection};
+
 use std::path::Path;
 
 fn recorded(name: &str) -> std::path::PathBuf {
@@ -66,97 +65,55 @@ fn a_fixture_with_a_missing_or_reordered_line_is_rejected() {
     assert!(fixture::read_fixture(&truncated).is_err());
 }
 
-/// 构造的输入（不是录制）：命令已交给 mod、还没回结果时，mod 重载换了代次。
+/// 真 CLI 和真实 mod 的在途重载录制；只按可观察事实断言，不检查内部队列。
 #[test]
-fn a_resendable_command_lost_with_a_reloaded_mod_is_resent_under_the_same_op_id() {
-    let hello = |mod_gen: &str, cause| Hello {
-        proto: 1,
-        run: "r".into(),
-        module: ModName::Actions,
-        mod_version: "0.1.0".into(),
-        mod_gen: mod_gen.into(),
-        backend_session_id: "s".into(),
-        cli_version: "2.1.289".into(),
-        cause,
-    };
-    let poll = |mod_gen: &str| ModEvent::Poll {
-        query: NextQuery {
-            run: "r".into(),
-            module: ModName::Actions,
-            mod_gen: mod_gen.into(),
-            backend_session_id: "s".into(),
-        },
-    };
-    let mut state = ModState::new("s");
-    state.apply(&ModEvent::Hello {
-        hello: hello("g1", HelloCause::Start),
-    });
-    state.apply(&ModEvent::Settled);
-    state.apply(&ModEvent::Send {
-        module: ModName::Actions,
-        command: Command {
-            op_id: "op".into(),
-            expected_backend_session_id: "s".into(),
-            expected_mod_gen: "g1".into(),
-            action: Action::Ping,
-        },
-    });
-    assert_eq!(
-        state.apply(&poll("g1")),
-        vec![Fact::Delivered {
-            module: ModName::Actions,
-            op_id: "op".into()
-        }]
-    );
-    let facts = state.apply(&ModEvent::Hello {
-        hello: hello("g2", HelloCause::Start),
-    });
-    assert!(facts.contains(&Fact::Reloaded {
-        module: ModName::Actions,
-        from_gen: "g1".into(),
-        to_gen: "g2".into()
-    }));
-    assert!(facts.contains(&Fact::Resent {
-        module: ModName::Actions,
-        op_id: "op".into()
-    }));
-    assert_eq!(
-        state.deliverable(ModName::Actions)[0].expected_mod_gen,
-        "g2"
-    );
-    assert_eq!(
-        state.apply(&poll("g1")),
-        vec![Fact::Rehello {
-            module: ModName::Actions
-        }]
-    );
-    assert_eq!(
-        state.apply(&poll("g2")),
-        vec![Fact::Delivered {
-            module: ModName::Actions,
-            op_id: "op".into()
-        }]
-    );
-    let done = Outcome::Done {
-        value: serde_json::json!({"backend_session_id":"s","mod_gen":"g2"}),
-    };
-    assert_eq!(
-        state.apply(&ModEvent::Result {
-            op_id: "op".into(),
-            post: ResultPost {
-                run: "r".into(),
-                module: ModName::Actions,
-                mod_gen: "g2".into(),
-                backend_session_id: "s".into(),
-                outcome: done.clone(),
-            },
-        }),
-        vec![Fact::Finished {
-            module: ModName::Actions,
-            op_id: "op".into(),
-            outcome: done
-        }]
-    );
+fn recorded_reloads_preserve_unsent_work_and_the_original_session_target() {
+    for name in ["reload-pending.jsonl", "reload-rebind.jsonl"] {
+        let (_, session, records) = fixture::read_fixture(&recorded(name)).unwrap();
+        let replayed = fixture::replay(&session, &records);
+        assert_eq!(
+            replayed,
+            records.iter().map(|r| r.facts.clone()).collect::<Vec<_>>()
+        );
+        let facts: Vec<_> = replayed.iter().flatten().collect();
+        assert!(facts.iter().any(|f| matches!(f, Fact::Resent { .. })));
+        if name == "reload-rebind.jsonl" {
+            assert_eq!(
+                facts
+                    .iter()
+                    .filter(|f| matches!(
+                        f,
+                        Fact::Finished {
+                            outcome: Outcome::Rejected {
+                                reason: Rejection::StaleSession { .. }
+                            },
+                            ..
+                        }
+                    ))
+                    .count(),
+                2
+            );
+        } else {
+            assert!(!facts.iter().any(|f| matches!(f, Fact::Unknown { .. })));
+            let resent = facts.iter().enumerate().find_map(|(at, f)| match f {
+                Fact::Resent { op_id, .. } if facts[..at].iter().any(|earlier|
+                    matches!(earlier, Fact::Delivered { op_id: sent, .. } if sent == op_id)) => Some(op_id),
+                _ => None,
+            }).expect("an already delivered op must be resent");
+            assert_eq!(
+                facts
+                    .iter()
+                    .filter(|f| matches!(f, Fact::Delivered { op_id, .. } if op_id == resent))
+                    .count(),
+                2
+            );
+
+            assert!(facts.iter().enumerate().any(|(at, f)| match f {
+                Fact::Resent { op_id, .. } => facts[..at].iter().any(|earlier| matches!(earlier, Fact::Delivered { op_id: sent, .. } if sent == op_id)),
+                _ => false,
+            }), "recording must include a delivered Ping whose result was in flight at reload");
+        }
+    }
 }
 
 /// 真 CLI 录下的 `!`、总结（定位不到）、fork 型子代理的往返：重放事实一致；三种命令都不可重发；
@@ -216,6 +173,8 @@ fn recorded_invocations_replay_and_none_of_them_is_resendable() {
     let compact = Invocation::Compact {
         scope: CompactScope::From,
         anchor: Anchor {
+            candidates: vec![],
+            selected: 0,
             text: "NOT_IN_THE_CONVERSATION".into(),
             attachments: vec![],
             nth: 1,

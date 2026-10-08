@@ -4,5 +4,7 @@ mod endpoint;
 pub use endpoint::{ClaudeEndpoint, ModelReply, ModelRequest, ResponseGate, Route};
 mod scenario;
 pub use scenario::{
-    CommandFault, Fifo, Process, Program, ResourceLimits, Scenario, ScenarioOptions,
+    CleanupStage, CommandFault, Fifo, Process, Program, ResourceLimits, Scenario, ScenarioOptions,
 };
+
+pub mod isolation;

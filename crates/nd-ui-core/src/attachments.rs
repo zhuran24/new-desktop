@@ -1,5 +1,4 @@
 use nd_wire::Attachment;
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 
@@ -20,11 +19,11 @@ impl AttachmentSource {
                 if !metadata.is_file() {
                     return Err("附件必须是普通文件".into());
                 }
-                if metadata.len() > 5 * 1024 * 1024 {
+                if metadata.len() > nd_wire::MAX_ATTACHMENT_BYTES {
                     return Err("单个附件不能超过 5 MiB".into());
                 }
                 let mut bytes = vec![];
-                file.take(5 * 1024 * 1024 + 1)
+                file.take(nd_wire::MAX_ATTACHMENT_BYTES + 1)
                     .read_to_end(&mut bytes)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -56,7 +55,7 @@ impl AttachmentSource {
             return Err("不支持此文件：请使用 PNG、JPEG、GIF、WebP、PDF 或 UTF-8 文本".into());
         };
         let attachment = Attachment {
-            blob: format!("{:x}", Sha256::digest(&bytes)),
+            blob: nd_wire::BlobId::of(&bytes),
             name,
             media_type: media_type.into(),
             size: bytes.len() as u64,

@@ -50,6 +50,7 @@ async fn confirmed_queue_cancellation_returns_an_unknown_send_and_revokes_resend
         &control,
         Outcome::Ok {
             done: Done::Interrupted {
+                already_ended: false,
                 cancelled: vec![original.clone()],
             },
         },
@@ -249,4 +250,88 @@ async fn a_busy_send_waits_while_interrupt_is_still_accepted() {
         prompt(s, "wait for room").is_some_and(|i| i.data["state"] == "landed")
     })
     .await;
+}
+
+#[tokio::test]
+async fn permission_and_title_controls_remain_reachable_when_writes_are_fenced() {
+    let h = Harness::new(config()).await;
+    let session = accepted_session(&h.create("fenced-settings", "ready").await);
+    let ready = h
+        .wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    h.claims
+        .observe(nd_claims::Observed::IdentityMismatch {
+            run: header(&ready)["process"]["run"].as_str().unwrap().into(),
+        })
+        .unwrap();
+    h.sessions
+        .execute(&command(
+            "mode",
+            "session.configure",
+            json!({"session":session,"setting":{"permission_mode":"acceptEdits"}}),
+        ))
+        .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        h.wait(&session, "permission changed", |s| {
+            header(s)["permission_mode"] == "acceptEdits" && header(s)["op"].is_null()
+        }),
+    )
+    .await
+    .unwrap();
+    h.sessions
+        .execute(&command(
+            "rename",
+            "session.rename",
+            json!({"session":session,"title":"control still works"}),
+        ))
+        .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        h.wait(&session, "title changed", |s| {
+            header(s)["title"] == "control still works" && header(s)["op"].is_null()
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn withdrawing_a_send_refused_as_busy_returns_it_locally_without_a_backend_cancel() {
+    let mut cfg = config();
+    cfg.tick = std::time::Duration::from_secs(30);
+    let h = Harness::new(cfg).await;
+    let session = accepted_session(&h.create("busy-withdraw", "ready").await);
+    h.wait(&session, "active", |s| header(s)["status"] == "active")
+        .await;
+    for _ in 0..100 {
+        h.adapter.script(ActKind::Send, Reply::Busy);
+    }
+    h.send("busy-message", &session, "never handed to backend")
+        .await;
+    h.sessions
+        .execute(&command(
+            "withdraw-busy",
+            "session.withdraw",
+            json!({"session":session,"message":"busy-message"}),
+        ))
+        .await;
+    let s = h
+        .wait(&session, "withdrawn", |s| {
+            prompt(s, "never handed to backend").is_some_and(|p| p.data["state"] == "withdrawn")
+        })
+        .await;
+    assert_eq!(item(&s, "draft").data["text"], "never handed to backend");
+    assert!(
+        !h.adapter
+            .received()
+            .iter()
+            .any(|(_, a)| matches!(a, nd_backend::Act::Withdraw { .. }))
+    );
+    assert!(
+        !h.adapter
+            .applied()
+            .iter()
+            .any(|a| a == "send:never handed to backend")
+    );
 }

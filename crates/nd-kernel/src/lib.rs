@@ -31,7 +31,11 @@
 
 mod component;
 mod registry;
-pub use component::ConfigChange;
+pub use component::{ConfigChange, ConfigRevision};
+
+/// 登记表变化计数；只用于等待登记变化，与配置修订号互不兼容。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RegistryEpoch(u64);
 pub use component::{
     ComponentSpec, ComponentState, Generation, Lifecycle, Mount, StopFuture, StopPhase, StopWhy,
 };
@@ -96,12 +100,12 @@ impl Kernel {
         self.registry.lock().unwrap().snapshot()
     }
 
-    pub fn revision(&self) -> u64 {
-        self.registry.lock().unwrap().revision
+    pub fn change_count(&self) -> RegistryEpoch {
+        self.registry.lock().unwrap().epoch
     }
 
-    pub fn changed_since(&self, revision: u64) -> Changed {
-        Changed::new(self.registry.clone(), revision)
+    pub fn changed_since(&self, epoch: RegistryEpoch) -> Changed {
+        Changed::new(self.registry.clone(), epoch)
     }
 }
 

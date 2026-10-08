@@ -27,8 +27,8 @@
 ## 生命周期驱动
 
 1. 定义全部组件；配置模块先校验整份配置的值，再把启停与需要重建的修订号交给 `configure`。依赖关系固定在 `ComponentSpec`，安装定义时校验整张图。
-2. 在一次驱动开始前记录 `revision()`，然后 `reconcile(now).await`。`now` 用本进程单调时钟的经过时间。
-3. 等待 `changed_since(记录的 revision)` 或 `next_deadline()` 到期，再驱动。必须在 reconcile **之前**记录 revision，防止其间的撤销被漏过。内核自身变化可能让等待立即返回一次。
+2. 在一次驱动开始前记录 `change_count()`，然后 `reconcile(now).await`。`now` 用本进程单调时钟的经过时间。
+3. 等待 `changed_since(记录的 RegistryEpoch)` 或 `next_deadline()` 到期，再驱动。必须在 reconcile **之前**记录 RegistryEpoch，防止其间的撤销被漏过。内核自身变化可能让等待立即返回一次。
 4. 缺依赖从首次发现时计时；超时后 `Unavailable` 仍等待提供者恢复。初始化返回错误进入 `Failed`；相同配置修订和依赖代次不会自动重试，以免被自身登记撤销的通知唤醒后忙循环。配置修订、启停或所需提供者代次改变后重试。
 
 工厂同步建立本地登记，不能阻塞等待外部 I/O。`Lifecycle` 的异步阶段返回标准 `Future`，可在任何支持 `Send` future 的运行时上驱动。提供者和生命周期句柄需 `Send + Sync` / `Send`；GPUI 组件通过发回 UI 线程的轻量句柄接入，不能把 GPUI App 上下文放进内核。

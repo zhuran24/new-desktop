@@ -31,7 +31,10 @@ pub enum Convo {
     Echo {
         uuid: String,
     },
-    TurnStarted,
+    TurnStarted {
+        #[serde(default)]
+        turn: Option<String>,
+    },
     /// 实际回合的提示集合；同一回合可包含多条 user，工具调用不另开轮。
     TurnMapped {
         turn: String,
@@ -65,7 +68,7 @@ pub enum Convo {
         ok: bool,
         body: Value,
     },
-    /// CLI 发来、等宿主回答的请求（审批、提问……）。
+    /// CLI 发来、等守护进程（经界面）回答的请求（审批、提问……）。
     Asked {
         request_id: String,
         subtype: String,
@@ -89,6 +92,8 @@ pub struct Conversation {
     /// 主对话当前流式输出的消息 id（`message_start` 给的）。
     streaming: Option<String>,
     tasks: BTreeSet<String>,
+    #[serde(default)]
+    tasks_unknown: bool,
     schedules: bool,
     lost: bool,
     reported: Option<Drain>,
@@ -140,6 +145,9 @@ fn block_text(block: &Value) -> (ItemKind, String) {
 }
 
 impl Conversation {
+    pub fn current_turn(&self) -> Option<&str> {
+        self.running.then_some(self.turn_key.as_deref()).flatten()
+    }
     pub fn can_cancel_queued(&self) -> bool {
         self.cancel_queued
     }
@@ -153,6 +161,10 @@ impl Conversation {
         if self.lost {
             Drain::Unknown {
                 why: "看守流水丢过重建不出的行".into(),
+            }
+        } else if self.tasks_unknown {
+            Drain::Unknown {
+                why: "后端任务整表缺失或格式无法识别".into(),
             }
         } else if self.schedules {
             Drain::Unknown {
@@ -403,7 +415,9 @@ impl Conversation {
             Some("system") => match frame["subtype"].as_str() {
                 Some("init") if main => {
                     self.running = true;
-                    out.push(Convo::TurnStarted);
+                    out.push(Convo::TurnStarted {
+                        turn: self.turn_key.clone(),
+                    });
                 }
                 Some("task_started") => {
                     if let Some(id) = frame["task_id"].as_str() {
@@ -428,15 +442,24 @@ impl Conversation {
                     self.drain_changed(out);
                 }
                 Some("background_tasks_changed") => {
-                    self.tasks = frame["tasks"]
-                        .as_array()
-                        .map(|tasks| {
+                    let tasks: Option<BTreeSet<String>> =
+                        frame["tasks"].as_array().and_then(|tasks| {
                             tasks
                                 .iter()
-                                .filter_map(|t| t["task_id"].as_str().map(str::to_owned))
+                                .map(|t| {
+                                    t["task_id"]
+                                        .as_str()
+                                        .filter(|id| !id.is_empty())
+                                        .map(str::to_owned)
+                                })
                                 .collect()
-                        })
-                        .unwrap_or_default();
+                        });
+                    if let Some(tasks) = tasks {
+                        self.tasks = tasks;
+                        self.tasks_unknown = false;
+                    } else {
+                        self.tasks_unknown = true;
+                    }
                     self.drain_changed(out);
                 }
                 _ => {}

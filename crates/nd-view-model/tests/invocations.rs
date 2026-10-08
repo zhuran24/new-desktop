@@ -190,3 +190,21 @@ fn invocation_items_show_what_ran_and_how_it_ended() {
     );
     assert_eq!(fork.status, "已派出");
 }
+
+#[test]
+fn successful_shell_output_that_was_not_appended_says_it_is_absent_from_the_conversation() {
+    let view = conversation(&snapshot(vec![
+        header(json!({"turn_running":false}), Value::Null),
+        item(
+            "invoke/no-append",
+            "shell",
+            json!({"seq":2,"command":"pwd","state":"done","exit":0,"stdout":"/p","appended":false}),
+        ),
+    ]));
+    let shell = view
+        .messages
+        .iter()
+        .find(|m| m.id == "invoke/no-append")
+        .unwrap();
+    assert!(format!("{}{}", shell.status, shell.detail).contains("输出没有进对话"));
+}

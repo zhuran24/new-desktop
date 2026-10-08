@@ -18,7 +18,6 @@ nd-session.workspace = true
 nd-backend.workspace = true
 nd-claims.workspace = true
 nd-claude.workspace = true
-sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

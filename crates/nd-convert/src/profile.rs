@@ -53,6 +53,46 @@ pub struct MappedProfile {
     pub loss: LossReport,
 }
 
+struct PermissionMapping {
+    permission: Permission,
+    claude: &'static str,
+    approval: &'static str,
+    sandbox: &'static str,
+}
+const PERMISSIONS: &[PermissionMapping] = &[
+    PermissionMapping {
+        permission: Permission::Prompt,
+        claude: "default",
+        approval: "untrusted",
+        sandbox: "workspace-write",
+    },
+    PermissionMapping {
+        permission: Permission::AcceptEdits,
+        claude: "acceptEdits",
+        approval: "on-request",
+        sandbox: "workspace-write",
+    },
+    PermissionMapping {
+        permission: Permission::ReadOnly,
+        claude: "plan",
+        approval: "on-request",
+        sandbox: "read-only",
+    },
+    PermissionMapping {
+        permission: Permission::Unrestricted,
+        claude: "bypassPermissions",
+        approval: "never",
+        sandbox: "danger-full-access",
+    },
+];
+const EFFORTS: &[(Effort, &str)] = &[
+    (Effort::Low, "low"),
+    (Effort::Medium, "medium"),
+    (Effort::High, "high"),
+    (Effort::ExtraHigh, "xhigh"),
+    (Effort::Maximum, "max"),
+];
+
 pub fn decode_profile(native: &NativeProfile) -> Result<Profile, ConvertError> {
     if !native.settings.is_object() {
         return Err(ConvertError::Invalid(
@@ -60,34 +100,29 @@ pub fn decode_profile(native: &NativeProfile) -> Result<Profile, ConvertError> {
         ));
     }
     let s = &native.settings;
-    let permission = match native.backend {
-        BackendKind::Claude => match s["permissionMode"].as_str() {
-            None if s["permissionMode"].is_null() => Permission::Default,
-            Some("default") => Permission::Prompt,
-            Some("acceptEdits") => Permission::AcceptEdits,
-            Some("plan") => Permission::ReadOnly,
-            Some("bypassPermissions") => Permission::Unrestricted,
-            _ => Permission::Unmapped,
-        },
-        BackendKind::Codex => match (s["approvalPolicy"].as_str(), s["sandbox"].as_str()) {
-            (None, None) if s["approvalPolicy"].is_null() && s["sandbox"].is_null() => {
-                Permission::Default
-            }
-            (Some("untrusted"), Some("workspace-write")) => Permission::Prompt,
-            (Some("on-request"), Some("workspace-write")) => Permission::AcceptEdits,
-            (Some("on-request"), Some("read-only")) => Permission::ReadOnly,
-            (Some("never"), Some("danger-full-access")) => Permission::Unrestricted,
-            _ => Permission::Unmapped,
-        },
+    let uses_defaults = match native.backend {
+        BackendKind::Claude => s["permissionMode"].is_null(),
+        BackendKind::Codex => s["approvalPolicy"].is_null() && s["sandbox"].is_null(),
     };
-    let effort = match s["effort"].as_str() {
-        Some("low") => Some(Effort::Low),
-        Some("medium") => Some(Effort::Medium),
-        Some("high") => Some(Effort::High),
-        Some("xhigh") => Some(Effort::ExtraHigh),
-        Some("max") => Some(Effort::Maximum),
-        _ => None,
+    let permission = if uses_defaults {
+        Permission::Default
+    } else {
+        PERMISSIONS
+            .iter()
+            .find(|mapping| match native.backend {
+                BackendKind::Claude => s["permissionMode"].as_str() == Some(mapping.claude),
+                BackendKind::Codex => {
+                    s["approvalPolicy"].as_str() == Some(mapping.approval)
+                        && s["sandbox"].as_str() == Some(mapping.sandbox)
+                }
+            })
+            .map(|m| m.permission.clone())
+            .unwrap_or(Permission::Unmapped)
     };
+    let effort = EFFORTS
+        .iter()
+        .find(|(_, name)| s["effort"].as_str() == Some(*name))
+        .map(|(effort, _)| effort.clone());
     Ok(Profile {
         cwd: native.cwd.clone(),
         permission,
@@ -127,30 +162,15 @@ pub fn encode_profile(
         }
     }
     if !same || profile.permission != original.permission {
-        let mapped = match target.backend {
-            BackendKind::Claude => match profile.permission {
-                Permission::Prompt => Some(json!({"permissionMode":"default"})),
-                Permission::AcceptEdits => Some(json!({"permissionMode":"acceptEdits"})),
-                Permission::ReadOnly => Some(json!({"permissionMode":"plan"})),
-                Permission::Unrestricted => Some(json!({"permissionMode":"bypassPermissions"})),
-                _ => None,
-            },
-            BackendKind::Codex => match profile.permission {
-                Permission::Prompt => {
-                    Some(json!({"approvalPolicy":"untrusted","sandbox":"workspace-write"}))
+        let mapped = PERMISSIONS
+            .iter()
+            .find(|m| m.permission == profile.permission)
+            .map(|mapping| match target.backend {
+                BackendKind::Claude => json!({"permissionMode":mapping.claude}),
+                BackendKind::Codex => {
+                    json!({"approvalPolicy":mapping.approval,"sandbox":mapping.sandbox})
                 }
-                Permission::AcceptEdits => {
-                    Some(json!({"approvalPolicy":"on-request","sandbox":"workspace-write"}))
-                }
-                Permission::ReadOnly => {
-                    Some(json!({"approvalPolicy":"on-request","sandbox":"read-only"}))
-                }
-                Permission::Unrestricted => {
-                    Some(json!({"approvalPolicy":"never","sandbox":"danger-full-access"}))
-                }
-                _ => None,
-            },
-        };
+            });
         if let Some(mapped) = mapped {
             settings
                 .as_object_mut()
@@ -181,13 +201,11 @@ pub fn encode_profile(
             }
         }
     }
-    let effort = profile.effort.as_ref().map(|e| match e {
-        Effort::Low => "low",
-        Effort::Medium => "medium",
-        Effort::High => "high",
-        Effort::ExtraHigh => "xhigh",
-        Effort::Maximum => "max",
-    });
+    let effort = profile
+        .effort
+        .as_ref()
+        .and_then(|effort| EFFORTS.iter().find(|(e, _)| e == effort))
+        .map(|(_, name)| *name);
     if let Some(e) = effort.filter(|e| target.supported_efforts.iter().any(|s| s == e)) {
         settings["effort"] = json!(e);
     } else if profile.effort.is_some() || !profile.native.settings["effort"].is_null() {

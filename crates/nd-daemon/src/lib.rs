@@ -14,14 +14,12 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use nd_config::{Config, FileSource, Section};
-use nd_kernel::{ComponentSpec, ConfigChange, Kernel, Key, Registration, RegistrationKind};
-use nd_wire::{
-    Event, Fallback, Item, PROTOCOL_VERSION, Request, Response as WireResponse, Snapshot,
-};
+use nd_kernel::{ConfigChange, Kernel};
+use nd_wire::{Fallback, Item, PROTOCOL_VERSION, ReceiptLookup, Request, Response as WireResponse};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -30,21 +28,12 @@ use tokio::sync::{Mutex, broadcast};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// 提供者由组件内核持有；撤销后不再通过旧 Arc 受理调用。
-pub trait NamespaceProvider: Send + Sync {
-    fn names(&self) -> BTreeMap<String, u32>;
-    fn snapshot(&self) -> Vec<Item>;
-    fn command(&self, name: &str) -> std::result::Result<Value, String>;
-    /// 在命令账本的同一事务内核对业务前置条件并施加效果，不得做外部 I/O。
-    fn execute(
-        &self,
-        tx: &mut nd_store::Tx<'_>,
-        command: &nd_wire::Command,
-    ) -> nd_store::Result<nd_wire::Receipt>;
-    fn page(&self, request: &nd_wire::PageReq) -> std::result::Result<nd_wire::Page, String> {
-        page_items(self.snapshot(), request)
-    }
-}
+mod namespaces;
+pub use namespaces::{
+    Execution as NamespaceExecution, NamespaceProvider, Pending as NamespaceFuture,
+    StreamError as NamespaceStreamError, Subscription as NamespaceSubscription,
+};
+use namespaces::{Providers, RunsNamespace, SessionNamespace, SystemNamespace};
 mod diagnostics;
 use diagnostics::Diagnostics;
 #[derive(Clone, Deserialize)]
@@ -61,6 +50,17 @@ struct StorageConfig {
 }
 impl Section for StorageConfig {
     const NAME: &'static str = "storage";
+    fn check(&self) -> nd_config::Result<()> {
+        if self.gc_interval_seconds == 0
+            || self.gc_interval_seconds > 86400
+            || self.blob_grace_seconds > 31536000
+        {
+            return Err(nd_config::Error::Invalid(
+                "附件清理间隔须为 1..86400 秒，宽限期须不超过一年".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Deserialize)]
 struct CommandsConfig {
@@ -68,6 +68,12 @@ struct CommandsConfig {
 }
 impl Section for CommandsConfig {
     const NAME: &'static str = "commands";
+    fn check(&self) -> nd_config::Result<()> {
+        if self.receipt_keep_ms == 0 || self.receipt_keep_ms > 31536000000 {
+            return Err(nd_config::Error::Invalid("收据保留期须为 1ms..1年".into()));
+        }
+        Ok(())
+    }
 }
 /// Claude 后端：钉住的 CLI、两个 mod、CLI 的配置目录（独占登记扫描它的注册表）。没配就没有 Claude 后端。
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -116,6 +122,14 @@ fn enabled_by_default() -> bool {
 }
 impl Section for SessionsConfig {
     const NAME: &'static str = "sessions";
+    fn check(&self) -> nd_config::Result<()> {
+        if self.idle_reclaim_ms == 0 || !(1..=60_000).contains(&self.tick_ms) {
+            return Err(nd_config::Error::Invalid(
+                "闲置回收时限须大于 0，检查间隔须为 1..60000ms".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Deserialize)]
 struct WireConfig {
@@ -124,61 +138,48 @@ struct WireConfig {
 }
 impl Section for WireConfig {
     const NAME: &'static str = "wire";
+    fn check(&self) -> nd_config::Result<()> {
+        if !(1..=4096).contains(&self.send_queue) || !(1..=60000).contains(&self.send_timeout_ms) {
+            return Err(nd_config::Error::Invalid(
+                "发送队列须为1..4096，超时须为1..60000ms".into(),
+            ));
+        }
+        Ok(())
+    }
 }
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+struct WatchdogsSection(Option<nd_runs::Config>);
+impl Section for WatchdogsSection {
+    const NAME: &'static str = "watchdogs";
+}
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+struct OptionalClaude(Option<ClaudeSection>);
+impl Section for OptionalClaude {
+    const NAME: &'static str = "claude";
+}
+
 fn validate_config(value: &Value) -> nd_config::Result<()> {
-    serde_json::from_value::<Option<nd_runs::Config>>(value["watchdogs"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    serde_json::from_value::<Option<ClaudeSection>>(value["claude"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    let sessions: SessionsConfig = serde_json::from_value(value["sessions"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    if sessions.idle_reclaim_ms == 0 || !(1..=60_000).contains(&sessions.tick_ms) {
-        return Err(nd_config::Error::Invalid(
-            "闲置回收时限须大于 0，检查间隔须为 1..60000ms".into(),
-        ));
-    }
-    serde_json::from_value::<DiagnosticsConfig>(value["diagnostics"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    let storage: StorageConfig = serde_json::from_value(value["storage"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    if storage.gc_interval_seconds == 0
-        || storage.gc_interval_seconds > 86400
-        || storage.blob_grace_seconds > 31536000
-    {
-        return Err(nd_config::Error::Invalid(
-            "附件清理间隔须为 1..86400 秒，宽限期须不超过一年".into(),
-        ));
-    }
-    let wire: WireConfig = serde_json::from_value(value["wire"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    if !(1..=4096).contains(&wire.send_queue) || !(1..=60000).contains(&wire.send_timeout_ms) {
-        return Err(nd_config::Error::Invalid(
-            "发送队列须为1..4096，超时须为1..60000ms".into(),
-        ));
-    }
-    let commands: CommandsConfig = serde_json::from_value(value["commands"].clone())
-        .map_err(|e| nd_config::Error::Invalid(e.to_string()))?;
-    if commands.receipt_keep_ms == 0 || commands.receipt_keep_ms > 31536000000 {
-        return Err(nd_config::Error::Invalid("收据保留期须为 1ms..1年".into()));
-    }
+    WatchdogsSection::parse(value)?;
+    OptionalClaude::parse(value)?;
+    SessionsConfig::parse(value)?;
+    DiagnosticsConfig::parse(value)?;
+    StorageConfig::parse(value)?;
+    WireConfig::parse(value)?;
+    CommandsConfig::parse(value)?;
     Ok(())
 }
+
 struct Engine {
-    sessions: Arc<nd_session::Sessions>,
-    runs: Option<nd_runs::Watchdogs>,
     runs_config: Option<nd_runs::Config>,
     blobs: Arc<nd_store::Blobs>,
-    store: Arc<nd_store::Store>,
     config: Arc<Config>,
-    #[cfg(feature = "scenarios")]
-    fault_root: PathBuf,
     scope: nd_kernel::ScopeId,
     kernel: Kernel,
-    diagnostics: nd_kernel::Dep<dyn NamespaceProvider>,
+    providers: Providers,
+    global: Arc<SystemNamespace>,
     started: tokio::time::Instant,
-    history: VecDeque<Event>,
-    snapshot: Snapshot,
-    events: broadcast::Sender<Event>,
     config_error: Option<String>,
 }
 impl Engine {
@@ -187,6 +188,7 @@ impl Engine {
         blobs: Arc<nd_store::Blobs>,
         store: Arc<nd_store::Store>,
         sessions: Arc<nd_session::Sessions>,
+        runs: Option<Arc<nd_runs::Watchdogs>>,
         _root: &Path,
     ) -> Result<Self> {
         store.write(|tx| {
@@ -195,81 +197,61 @@ impl Engine {
             diagnostics::migrate(tx)?;
             Ok(())
         })?;
-        let diagnostics_store = store.clone();
         let mut kernel = Kernel::new();
         let scope = kernel.scope();
-        let diagnostics = Key::<dyn NamespaceProvider>::new(scope, "diagnostics");
-        let key = diagnostics.clone();
-        kernel.install(
-            ComponentSpec::new("diagnostics", scope)
-                .optional()
-                .provides(key.erased()),
-            move |mount| {
-                mount.provide(
-                    key.clone(),
-                    Arc::new(Diagnostics {
-                        store: diagnostics_store.clone(),
-                    }) as Arc<dyn NamespaceProvider>,
-                )?;
-                mount.register(Registration::new(
-                    scope,
-                    RegistrationKind::Command,
-                    "diagnostics.inspect",
-                ))?;
-                mount.register(Registration::new(
-                    scope,
-                    RegistrationKind::Subscription,
-                    "diagnostics",
-                ))?;
-                mount.register(Registration::new(
-                    scope,
-                    RegistrationKind::Command,
-                    "diagnostics.set_note",
-                ))?;
-                Ok(Box::new(Diagnostics {
-                    store: diagnostics_store.clone(),
-                }))
-            },
+        let global = Arc::new(SystemNamespace::new(
+            store.clone(),
+            config.clone(),
+            _root.into(),
+        ));
+        let mut providers = Providers::default();
+        providers.install(&mut kernel, scope, "system", false, global.clone())?;
+        providers.install(
+            &mut kernel,
+            scope,
+            "sessions",
+            false,
+            Arc::new(SessionNamespace(sessions)),
         )?;
-        let diagnostics = kernel.require(diagnostics);
-        let (events, _) = broadcast::channel(128);
+        if let Some(runs) = runs {
+            providers.install(
+                &mut kernel,
+                scope,
+                "runs",
+                false,
+                Arc::new(RunsNamespace(runs)),
+            )?;
+        }
+        providers.install(
+            &mut kernel,
+            scope,
+            "diagnostics",
+            true,
+            Arc::new(Diagnostics {
+                store,
+                config: config.clone(),
+                fault_root: _root.into(),
+            }),
+        )?;
         let mut this = Self {
-            sessions,
-            runs: None,
-            runs_config: None,
+            runs_config: WatchdogsSection::parse(&config.snapshot().value)?.0,
             blobs,
-            store,
             config: config.clone(),
-            #[cfg(feature = "scenarios")]
-            fault_root: _root.to_owned(),
             scope,
             kernel,
-            diagnostics,
+            providers,
+            global,
             started: tokio::time::Instant::now(),
-            events,
-            history: VecDeque::new(),
             config_error: None,
-            snapshot: Snapshot {
-                stream: "global".into(),
-                epoch: uuid::Uuid::new_v4().to_string(),
-                cursor: 0,
-                items: vec![],
-            },
         };
         this.configure(&config).await?;
-        this.snapshot.items = this.items(&config);
+        this.global.initialize(this.items(&config));
         Ok(this)
     }
     async fn configure(&mut self, config: &Config) -> Result<()> {
-        let next: Option<nd_runs::Config> =
-            serde_json::from_value(config.snapshot().value["watchdogs"].clone())?;
+        let next: Option<nd_runs::Config> = WatchdogsSection::parse(&config.snapshot().value)?.0;
         if next != self.runs_config {
-            let runs = next.clone().map(nd_runs::Watchdogs::new).transpose()?;
-            if let Some(runs) = &runs {
-                runs.recover().await?;
-            }
-            self.runs = runs;
-            self.runs_config = next;
+            return Err("看守配置已变化，须重启守护进程才能生效".into());
         }
         let section = config.section::<DiagnosticsConfig>()?.get()?;
         self.kernel
@@ -278,22 +260,10 @@ impl Engine {
         Ok(())
     }
     fn names(&self) -> BTreeMap<String, u32> {
-        let mut names = BTreeMap::from([
-            ("system".into(), 1),
-            ("sessions".into(), 1),
-            ("session".into(), 1),
-            ("models".into(), 1),
-        ]);
-        if self.runs.is_some() {
-            names.insert("runs".into(), 1);
-        }
-        if let Some(optional) = self.diagnostics.with(|p| p.names()) {
-            names.extend(optional);
-        }
-        names
+        self.providers.names()
     }
     fn items(&self, config: &Config) -> Vec<Item> {
-        let mut items = vec![Item {
+        self.global.system(Item {
             id: "system".into(),
             namespace: "system".into(),
             kind: "status".into(),
@@ -302,93 +272,12 @@ impl Engine {
                 title: "New Desktop".into(),
                 text: self.config_error.clone().unwrap_or("守护进程已就绪".into()),
             },
-        }];
-        items.extend(self.sessions.listing().items());
-        if let Some(optional) = self.diagnostics.with(|p| p.snapshot()) {
-            items.extend(optional);
-        }
-        items
-    }
-    fn publish(&mut self, config: &Config) {
-        let items = self.items(config);
-        if items == self.snapshot.items {
-            return;
-        }
-        let event = Event {
-            stream: "global".into(),
-            epoch: self.snapshot.epoch.clone(),
-            cursor: self.snapshot.cursor + 1,
-            upsert: items
-                .iter()
-                .filter(|item| !self.snapshot.items.contains(item))
-                .cloned()
-                .collect(),
-            remove: self
-                .snapshot
-                .items
-                .iter()
-                .filter(|old| !items.iter().any(|i| i.id == old.id))
-                .map(|i| i.id.clone())
-                .collect(),
-        };
-        self.snapshot.items = items;
-        self.snapshot.cursor = event.cursor;
-        self.history.push_back(event.clone());
-        if self.history.len() > 128 {
-            self.history.pop_front();
-        }
-        let _ = self.events.send(event);
-    }
-    fn command(&self, name: &str) -> std::result::Result<Value, String> {
-        self.diagnostics
-            .with(|p| p.command(name))
-            .unwrap_or(Err("not_found".into()))
-    }
-    fn execute(&mut self, command: &nd_wire::Command) -> nd_wire::CommandReply {
-        #[cfg(feature = "scenarios")]
-        let fault = faults::Fault::take(&self.fault_root, &command.id);
-        let result = self.store.write(|tx| {
-            let reply = commands::execute(
-                tx,
-                command,
-                self.config.snapshot().value["commands"]["receipt_keep_ms"]
-                    .as_u64()
-                    .unwrap(),
-                |tx| {
-                    let receipt = self
-                        .diagnostics
-                        .with(|p| p.execute(tx, command))
-                        .unwrap_or_else(|| {
-                            Ok(nd_wire::Receipt::Rejected {
-                                code: "not_found".into(),
-                                now: Value::Null,
-                            })
-                        })?;
-                    #[cfg(feature = "scenarios")]
-                    {
-                        fault.crash("after_effect");
-                        fault.unavailable("after_effect")?;
-                    }
-                    Ok(receipt)
-                },
-            )?;
-            #[cfg(feature = "scenarios")]
-            fault.crash("before_commit");
-            Ok(reply)
         });
-        #[cfg(feature = "scenarios")]
-        if result.is_ok() {
-            fault.crash("after_commit");
-        }
-        match result {
-            Ok(result) => {
-                self.publish(&self.config.clone());
-                result
-            }
-            Err(e) => nd_wire::CommandReply::Unavailable {
-                reason: e.to_string(),
-            },
-        }
+        self.providers.snapshot()
+    }
+
+    fn publish(&self, config: &Config) {
+        self.global.publish(self.items(config));
     }
 }
 
@@ -462,20 +351,21 @@ impl Paths {
 }
 /// 组装会话组件，次序照恢复的依赖：独占登记（恢复中）→ 看守托管报身份 → 适配器与名册装载会话、
 /// 对账 → 独占登记身份已知、第一次扫描完成 → 放行。会话的命令在放行之前起操作会等着。
+struct SessionAssembly {
+    sessions: Arc<nd_session::Sessions>,
+    runs: Option<Arc<nd_runs::Watchdogs>>,
+}
 async fn assemble_sessions(
     config: &Config,
     store: &Arc<nd_store::Store>,
     blobs: &Arc<nd_store::Blobs>,
     paths: &Paths,
-) -> Result<Arc<nd_session::Sessions>> {
+) -> Result<SessionAssembly> {
     let value = config.snapshot().value;
-    let watchdogs_config: Option<nd_runs::Config> =
-        serde_json::from_value(value["watchdogs"].clone())?;
-    let claude: Option<ClaudeSection> = serde_json::from_value(value["claude"].clone())?;
-    let sessions_config: SessionsConfig = serde_json::from_value(value["sessions"].clone())?;
-    let keep: u64 = value["commands"]["receipt_keep_ms"]
-        .as_u64()
-        .unwrap_or(604800000);
+    let watchdogs_config: Option<nd_runs::Config> = WatchdogsSection::parse(&value)?.0;
+    let claude: Option<ClaudeSection> = OptionalClaude::parse(&value)?.0;
+    let sessions_config: SessionsConfig = SessionsConfig::parse(&value)?;
+    let keep = CommandsConfig::parse(&value)?.receipt_keep_ms;
     let registry_root = claude
         .as_ref()
         .map(|c| c.config_dir.clone())
@@ -494,13 +384,16 @@ async fn assemble_sessions(
         .unwrap_or_default()
         .as_millis() as u64;
     let mut backends = nd_backend::Backends::new();
-    if let Some(watchdogs_config) = watchdogs_config {
-        let watchdogs = Arc::new(nd_runs::Watchdogs::new(watchdogs_config)?);
+    let runs = watchdogs_config
+        .map(nd_runs::Watchdogs::new)
+        .transpose()?
+        .map(Arc::new);
+    if let Some(watchdogs) = &runs {
         // 看守托管先报每个还在的后端进程的身份。
         for found in watchdogs.recover().await? {
             let claims = claims.clone();
             tokio::task::spawn_blocking(move || {
-                claims.observe_watchdog(&found, generation, nd_claims::BackendKind::Claude)
+                claims.observe(found.observation(generation, nd_claims::BackendKind::Claude))
             })
             .await??;
         }
@@ -526,7 +419,7 @@ async fn assemble_sessions(
             let record = claude.record;
             let adapter = nd_claude::ClaudeBackend::new(
                 nd_claude::Claude::new(cfg, watchdogs.clone())?,
-                watchdogs,
+                watchdogs.clone(),
                 claims.clone(),
                 generation,
                 blobs.clone(),
@@ -569,7 +462,7 @@ async fn assemble_sessions(
         })
         .await;
     });
-    Ok(sessions)
+    Ok(SessionAssembly { sessions, runs })
 }
 
 pub async fn run(root: &Path) -> Result<()> {
@@ -598,17 +491,42 @@ pub async fn run_at(paths: Paths) -> Result<()> {
         paths.data.join("blobs"),
         store.clone(),
     )?);
-    let sessions = assemble_sessions(&config, &store, &blobs, &paths).await?;
+    let SessionAssembly { sessions, runs } =
+        assemble_sessions(&config, &store, &blobs, &paths).await?;
     let state = Arc::new(Mutex::new(
         Engine::open(
             config.clone(),
             blobs.clone(),
             store.clone(),
             sessions.clone(),
+            runs.clone(),
             &paths.data,
         )
         .await?,
     ));
+    let mut collection_changes = sessions.listing().changes();
+    let collection_sessions = sessions.clone();
+    let run_collector = tokio::spawn(async move {
+        let Some(runs) = runs else {
+            return;
+        };
+        loop {
+            let sessions = collection_sessions.clone();
+            let runs = runs.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                runs.collect_unused(|| Ok(sessions.referenced_runs()?))?;
+                Ok(())
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                eprintln!("看守目录回收未完成：{result:?}");
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                changed = collection_changes.changed() => { if changed.is_err() { break; } },
+            }
+        }
+    });
     let mut listing_changes = sessions.listing().changes();
     let mut storage_config = config.section::<StorageConfig>()?;
     let collector = tokio::spawn(async move {
@@ -634,10 +552,10 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     let monitor_state = state.clone();
     let monitor = tokio::spawn(async move {
         loop {
-            // 先记 revision 再 reconcile，避免漏掉挂载期间发生的变化。
+            // 先记登记变化计数再 reconcile，避免漏掉挂载期间发生的变化。
             let (changed, deadline) = {
                 let mut engine = monitor_state.lock().await;
-                let revision = engine.kernel.revision();
+                let revision = engine.kernel.change_count();
                 let now = engine.started.elapsed();
                 engine.kernel.reconcile(now).await;
                 engine.publish(&config);
@@ -684,6 +602,7 @@ pub async fn run_at(paths: Paths) -> Result<()> {
     .await?;
     monitor.abort();
     collector.abort();
+    run_collector.abort();
     receipts_gc.abort();
     let mut engine = state.lock().await;
     let scope = engine.scope;
@@ -739,13 +658,9 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
         }
     });
     let mut greeted = false;
-    let mut subscribed = false;
-    let mut events = state.lock().await.events.subscribe();
-    let sessions = state.lock().await.sessions.clone();
-    // 会话流各有一个转发任务；队列满或落后太多就断开，界面重连后恢复。
     let (overflow, mut overflowed) = tokio::sync::mpsc::channel::<()>(1);
     let mut forwards: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
-    loop {
+    'connection: loop {
         tokio::select! {
             _ = &mut writer => {
                 for forward in forwards.values() { forward.abort(); }
@@ -754,149 +669,92 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
             _ = overflowed.recv() => break,
             frame = incoming.next() => {
                 let Some(Ok(frame)) = frame else { break; };
-                let Message::Text(text) = frame else { if matches!(frame, Message::Close(_)) { break; } else { continue; } };
-                let Ok(req) = serde_json::from_str::<Request>(&text) else { break; };
-                // 会话的命令与流不经全局锁：命令要等会话执行器提交，流各自转发。
-                let req = match req {
-                    Request::Get { id, res, page } if greeted && res.starts_with("session/") => {
-                        let session = res["session/".len()..].strip_suffix("/items").unwrap_or(&res["session/".len()..]);
-                        let response = match sessions.page(&nd_backend::SessionId(session.into()), &page) {
-                            Ok(page) => WireResponse::Reply { id, value: serde_json::to_value(page).unwrap(), error: None },
-                            Err(error) => WireResponse::Reply { id, value: Value::Null, error: Some(error) },
+                let Message::Text(text) = frame else {
+                    if matches!(frame, Message::Close(_)) { break; } else { continue; }
+                };
+                let Ok(request) = serde_json::from_str::<Request>(&text) else { break; };
+                let response = match request {
+                    Request::Hello { version: PROTOCOL_VERSION, namespaces } => {
+                        greeted = true;
+                        let engine = state.lock().await;
+                        let supported = engine.names();
+                        let negotiated = if namespaces.is_empty() { supported } else {
+                            supported.into_iter().filter_map(|(name, version)| {
+                                namespaces.get(&name).copied().filter(|v| *v > 0).map(|v| (name, version.min(v)))
+                            }).collect()
                         };
-                        if !enqueue(&outgoing, response) { break; }
-                        continue;
+                        WireResponse::Hello { version: PROTOCOL_VERSION, epoch: engine.global.epoch(), namespaces: negotiated }
+                    }
+                    Request::Subscribe { stream, since } if greeted => {
+                        let subscription = state.lock().await.providers.with(&stream, |p| p.events(stream.clone(), since, config.send_queue))
+                            .unwrap_or_else(|| Err(namespaces::StreamError { code: "unsupported", message: "没有这个事件命名空间".into() }));
+                        match subscription {
+                            Err(error) => WireResponse::Error { code: error.code.into(), message: error.message },
+                            Ok(subscription) => {
+                                if let Some(old) = forwards.remove(&stream) { old.abort(); }
+                                let namespaces::Subscription { first, replay, mut events, guard } = subscription;
+                                for event in replay {
+                                    if !enqueue(&outgoing, WireResponse::Event { event }) { break 'connection; }
+                                }
+                                if !enqueue(&outgoing, first) { break; }
+                                let (queue, overflow) = (outgoing.clone(), overflow.clone());
+                                forwards.insert(stream, tokio::spawn(async move {
+                                    let _watching = guard;
+                                    loop {
+                                        match events.recv().await {
+                                            Ok(event) => if !enqueue(&queue, WireResponse::Event { event }) { let _ = overflow.try_send(()); break; },
+                                            Err(broadcast::error::RecvError::Lagged(_)) => { let _ = overflow.try_send(()); break; },
+                                            Err(broadcast::error::RecvError::Closed) => break,
+                                        }
+                                    }
+                                }));
+                                continue;
+                            }
+                        }
+                    }
+                    Request::Get { id, res, page } if greeted => {
+                        let pending = state.lock().await.providers.with(&res, |p| p.page(res.clone(), page));
+                        let result = match pending { Some(pending) => pending.await, None => Err("not_found".into()) };
+                        page_reply(id, result)
                     }
                     Request::Models { id, backend, cwd } if greeted => {
-                        let response = match sessions.models(&backend, cwd.into()).await {
-                            Ok(models) => WireResponse::Reply { id, value: serde_json::to_value(models).unwrap(), error: None },
-                            Err(error) => WireResponse::Reply { id, value: Value::Null, error: Some(error) },
+                        let pending = state.lock().await.providers.with("models", |p| p.models(backend, cwd));
+                        let result = match pending { Some(pending) => pending.await, None => Err("not_found".into()) };
+                        page_reply(id, result)
+                    }
+                    Request::Command { id, name } if greeted => {
+                        let result = state.lock().await.providers.with(&name, |p| p.command(&name)).unwrap_or(Err("not_found".into()));
+                        page_reply(id, result)
+                    }
+                    Request::Execute { id, command } if greeted => {
+                        let execution = {
+                            let engine = state.lock().await;
+                            engine.providers.with(&command.name, |p| p.execute(command.clone())).flatten()
+                                .unwrap_or_else(|| engine.global.reject(command))
                         };
-                        if !enqueue(&outgoing, response) { break; }
-                        continue;
-                    }
-                    Request::Execute { id, command } if greeted && nd_session::delivery(&command.name) => {
-                        // 收据等动作有结果（`!`、总结、fork 型子代理）：另起任务等，连接照常处理别的请求。
-                        let sessions = sessions.clone();
-                        let outgoing = outgoing.clone();
-                        tokio::spawn(async move {
-                            let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { reason: "没有这个会话命令".into() });
-                            enqueue(&outgoing, WireResponse::CommandReply { id, result });
-                        });
-                        continue;
-                    }
-                    Request::Execute { id, command } if greeted && command.name.starts_with("session.") => {
-                        let result = sessions.execute(&command).await.unwrap_or(nd_wire::CommandReply::Unavailable { reason: "没有这个会话命令".into() });
-                        if !enqueue(&outgoing, WireResponse::CommandReply { id, result }) { break; }
-                        continue;
-                    }
-                    Request::Subscribe { stream, since } if greeted && stream.starts_with("session/") => {
-                        let id = nd_backend::SessionId(stream["session/".len()..].to_owned());
-                        let subscription = match sessions.subscribe(&id, since) {
-                            Ok(Some(subscription)) => subscription,
-                            Ok(None) => {
-                                if !enqueue(&outgoing, WireResponse::Error { code: "not_found".into(), message: format!("没有会话 {id}") }) { break; }
-                                continue;
-                            }
-                            Err(e) => {
-                                if !enqueue(&outgoing, WireResponse::Error { code: "unavailable".into(), message: e.to_string() }) { break; }
-                                continue;
-                            }
+                        let detached = execution.detached;
+                        let (pending_state, queue, overflow) = (state.clone(), outgoing.clone(), overflow.clone());
+                        let finish = async move {
+                            let result = execution.result.await;
+                            let engine = pending_state.lock().await;
+                            engine.publish(&engine.config.clone());
+                            drop(engine);
+                            if !enqueue(&queue, WireResponse::CommandReply { id, result }) { let _ = overflow.try_send(()); }
                         };
-                        if let Some(old) = forwards.remove(&stream) { old.abort(); }
-                        let (first, replay, mut feed, guard) = subscription.into_parts();
-                        let mut ok = true;
-                        for event in replay {
-                            ok &= enqueue(&outgoing, WireResponse::Event { event });
-                        }
-                        ok &= enqueue(&outgoing, first);
-                        if !ok { break; }
-                        let queue = outgoing.clone();
-                        let overflow = overflow.clone();
-                        forwards.insert(stream, tokio::spawn(async move {
-                            let _watching = guard;
-                            loop {
-                                match feed.recv().await {
-                                    Ok(event) => if !enqueue(&queue, WireResponse::Event { event }) { let _ = overflow.try_send(()); break; },
-                                    Err(broadcast::error::RecvError::Lagged(_)) => { let _ = overflow.try_send(()); break; },
-                                    Err(broadcast::error::RecvError::Closed) => break,
-                                }
-                            }
-                        }));
+                        // 提供者决定收据时点；按到达次序受理的普通命令仍串行，Delivery 不阻挡控制。
+                        if detached { tokio::spawn(finish); } else { finish.await; }
                         continue;
                     }
-                    other => other,
-                };
-                let mut replay = vec![];
-                let response = {
-                    let mut engine = state.lock().await;
-                    match req {
-                        Request::Hello { version: PROTOCOL_VERSION, namespaces } => {
-                            greeted = true;
-                            let supported = engine.names();
-                            let negotiated = if namespaces.is_empty() { supported } else {
-                                supported.into_iter().filter_map(|(name, version)| {
-                                    namespaces.get(&name).copied().filter(|v| *v > 0).map(|v| (name, version.min(v)))
-                                }).collect()
-                            };
-                            WireResponse::Hello { version: PROTOCOL_VERSION, epoch: engine.snapshot.epoch.clone(), namespaces: negotiated }
-                        },
-                        Request::Subscribe { stream, since } if greeted && stream == "global" => {
-                            events = engine.events.subscribe();
-                            subscribed = true;
-                            let earliest = engine.history.front().map_or(engine.snapshot.cursor, |event| event.cursor - 1);
-                            if let Some(since) = since.filter(|c| c.epoch == engine.snapshot.epoch && c.seq >= earliest && c.seq <= engine.snapshot.cursor && engine.snapshot.cursor - c.seq < config.send_queue as u64) {
-                                replay = engine.history.iter().filter(|event| event.cursor > since.seq).cloned().collect();
-                                WireResponse::Resumed { stream, epoch: engine.snapshot.epoch.clone(), cursor: engine.snapshot.cursor }
-                            } else { WireResponse::Snapshot { snapshot: engine.snapshot.clone() } }
-                        },
-                        Request::Get { id, res, page } if greeted => {
-                            let result = if res == "sessions" {
-                                page_items(engine.sessions.listing().items(), &page)
-                            } else if res == "system" {
-                                page_items(engine.snapshot.items.iter().filter(|i| i.namespace == "system").cloned().collect(), &page)
-                            } else if res == "runs" {
-                                match &engine.runs {
-                                    Some(runs) => match runs.inspect() {
-                                        Ok(found) => page_items(found.into_iter().map(|f| Item {
-                                            id: format!("run/{}", f.run), namespace: "runs".into(), kind: "run".into(),
-                                            fallback: Fallback { title: f.run.clone(), text: f.state.clone() },
-                                            data: serde_json::to_value(f).unwrap(),
-                                        }).collect(), &page),
-                                        Err(e) => Err(e.to_string()),
-                                    },
-                                    None => Err("not_found".into()),
-                                }
-                            } else {
-                                engine.diagnostics.with(|p| {
-                                    if p.names().contains_key(&res) { p.page(&page) } else { Err("not_found".into()) }
-                                }).unwrap_or(Err("not_found".into()))
-                            };
-                            match result {
-                                Ok(page) => WireResponse::Reply { id, value: serde_json::to_value(page).unwrap(), error: None },
-                                Err(error) => WireResponse::Reply { id, value: Value::Null, error: Some(error) },
-                            }
-                        },
-                        Request::Command { id, name } if greeted => match engine.command(&name) {
-                            Ok(value) => WireResponse::Reply { id, value, error: None },
-                            Err(error) => WireResponse::Reply { id, value: Value::Null, error: Some(error) },
-                        },
-                        Request::Execute { id, command } if greeted => WireResponse::CommandReply { id, result: engine.execute(&command) },
-                        Request::Receipt { id, command_id, content_hash } if greeted => WireResponse::ReceiptReply { id,
-                            result: commands::lookup(&engine.store, &command_id, content_hash.as_deref()).unwrap_or_else(|e| nd_wire::ReceiptLookup::Unavailable { reason: e.to_string() }) },
-                        Request::Bye => break,
-                        _ => WireResponse::Error { code: "unsupported".into(), message: "请求、流或版本不支持".into() },
+                    Request::Receipt { id, command_id, content_hash } if greeted => {
+                        let result = state.lock().await.providers.with("system", |p| p.receipt(&command_id, content_hash.as_deref())).flatten()
+                            .unwrap_or(ReceiptLookup::Unavailable { reason: "收据命名空间不可用".into() });
+                        WireResponse::ReceiptReply { id, result }
                     }
+                    Request::Bye => break,
+                    _ => WireResponse::Error { code: "unsupported".into(), message: "请求、流或版本不支持".into() },
                 };
-                for event in replay {
-                    if !enqueue(&outgoing, WireResponse::Event { event }) { let _ = close.send(()); let _ = writer.await; return; }
-                }
                 if !enqueue(&outgoing, response) { break; }
             },
-            event = events.recv(), if subscribed => match event {
-                Ok(event) => if !enqueue(&outgoing, WireResponse::Event { event }) { break; },
-                Err(_) => break
-            }
         }
     }
     for (_, forward) in forwards {
@@ -906,10 +764,26 @@ async fn serve(socket: WebSocket, state: Arc<Mutex<Engine>>) {
     let _ = writer.await;
 }
 
+fn page_reply(id: u64, result: std::result::Result<Value, String>) -> WireResponse {
+    match result {
+        Ok(value) => WireResponse::Reply {
+            id,
+            value,
+            error: None,
+        },
+        Err(error) => WireResponse::Reply {
+            id,
+            value: Value::Null,
+            error: Some(error),
+        },
+    }
+}
+
 async fn get_blob(
     State(state): State<Arc<Mutex<Engine>>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> std::result::Result<Vec<u8>, axum::http::StatusCode> {
+    let id: nd_wire::BlobId = id.parse().map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
     let blobs = state.lock().await.blobs.clone();
     tokio::task::spawn_blocking(move || blobs.get(&id))
         .await
@@ -921,12 +795,14 @@ async fn put_blob(
     axum::extract::Path(id): axum::extract::Path<String>,
     bytes: axum::body::Bytes,
 ) -> std::result::Result<String, axum::http::StatusCode> {
-    use sha2::{Digest, Sha256};
-    if format!("{:x}", Sha256::digest(&bytes)) != id {
+    let id: nd_wire::BlobId = id
+        .parse()
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+    if nd_wire::BlobId::of(&bytes) != id {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
     let blobs = state.lock().await.blobs.clone();
-    tokio::task::spawn_blocking(move || blobs.put(&bytes))
+    tokio::task::spawn_blocking(move || blobs.put(&bytes).map(|id| id.to_string()))
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)

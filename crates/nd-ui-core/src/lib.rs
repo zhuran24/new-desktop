@@ -67,9 +67,7 @@ impl SyncReplica {
             }
             Response::Event { event } => {
                 let snapshot = self.replicas.get_mut(&event.stream)?;
-                if snapshot.epoch != event.epoch
-                    || snapshot.cursor.checked_add(1) != Some(event.cursor)
-                {
+                if !snapshot.position().is_followed_by(&event) {
                     return None;
                 }
                 snapshot.items.retain(|i| !event.remove.contains(&i.id));
@@ -156,7 +154,17 @@ impl SyncReplica {
         let mut attempt = 0u32;
         loop {
             match self.command_once(command, wait).await {
-                Ok(nd_wire::CommandReply::Unavailable { .. }) => {
+                Ok(result @ nd_wire::CommandReply::Unavailable { .. }) => {
+                    let recovering = matches!(
+                        &result,
+                        nd_wire::CommandReply::Unavailable {
+                            code: Some(nd_wire::UnavailableCode::Recovering),
+                            ..
+                        }
+                    );
+                    if !recovering && attempt >= 4 {
+                        return Ok(result);
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(5)))
                         .await;
                     attempt = attempt.saturating_add(1);
@@ -173,6 +181,7 @@ impl SyncReplica {
                             }
                             Ok(nd_wire::ReceiptLookup::Conflict) => nd_wire::CommandReply::Conflict,
                             Ok(nd_wire::ReceiptLookup::Expired) => nd_wire::CommandReply::Expired,
+                            Ok(nd_wire::ReceiptLookup::Other) => nd_wire::CommandReply::Other,
                             _ => nd_wire::CommandReply::DeliveryUnknown,
                         },
                     );
@@ -192,18 +201,11 @@ impl SyncReplica {
             command: command.clone(),
         })
         .await?;
-        tokio::time::timeout(wait, async {
-            loop {
-                match self.receive().await? {
-                    Response::CommandReply { id: got, result } if got == id => return Ok(result),
-                    Response::Bye { .. } => return Err("nd-wire disconnected".into()),
-                    response => {
-                        self.apply(response);
-                    }
-                }
-            }
+        self.wait_response(wait, |response| match response {
+            Response::CommandReply { id: got, result } if *got == id => Some(result.clone()),
+            _ => None,
         })
-        .await?
+        .await
     }
     /// 查询可以安全重试，但 Missing 不能变成重发正文。
     pub async fn receipt(&mut self, command_id: &str) -> Result<nd_wire::ReceiptLookup> {
@@ -234,35 +236,51 @@ impl SyncReplica {
             content_hash,
         })
         .await?;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        self.wait_response(
+            std::time::Duration::from_secs(5),
+            |response| match response {
+                Response::ReceiptReply { id: got, result } if *got == id => Some(result.clone()),
+                _ => None,
+            },
+        )
+        .await
+    }
+    async fn wait_response<T>(
+        &mut self,
+        wait: std::time::Duration,
+        select: impl Fn(&Response) -> Option<T>,
+    ) -> Result<T> {
+        tokio::time::timeout(wait, async {
             loop {
-                match self.receive().await? {
-                    Response::ReceiptReply { id: got, result } if got == id => return Ok(result),
-                    Response::Bye { .. } => return Err("nd-wire disconnected".into()),
-                    response => {
-                        self.apply(response);
-                    }
+                let response = self.receive().await?;
+                if let Some(result) = select(&response) {
+                    return Ok(result);
                 }
+                if matches!(response, Response::Bye { .. }) {
+                    return Err("nd-wire disconnected".into());
+                }
+                self.apply(response);
             }
         })
         .await?
     }
+    async fn restore_subscriptions(&mut self) -> Result<()> {
+        let mut fresh = Self::connect(&self.path).await?;
+        for (stream, snapshot) in &self.replicas {
+            fresh
+                .send(Request::Subscribe {
+                    stream: stream.clone(),
+                    since: Some(snapshot.position()),
+                })
+                .await?;
+        }
+        self.socket = fresh.socket;
+        Ok(())
+    }
     async fn reconnect(&mut self) -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let Ok(mut fresh) = Self::connect(&self.path).await {
-                    for (stream, snapshot) in &self.replicas {
-                        fresh
-                            .send(Request::Subscribe {
-                                stream: stream.clone(),
-                                since: Some(nd_wire::Cursor {
-                                    epoch: snapshot.epoch.clone(),
-                                    seq: snapshot.cursor,
-                                }),
-                            })
-                            .await?;
-                    }
-                    self.socket = fresh.socket;
+                if self.restore_subscriptions().await.is_ok() {
                     return Ok(());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -275,31 +293,17 @@ impl SyncReplica {
         loop {
             match self.receive().await {
                 Ok(Response::Bye { .. }) | Err(_) => loop {
-                    if let Ok(mut fresh) = Self::connect(&self.path).await {
-                        for stream in self.replicas.keys() {
-                            fresh
-                                .send(Request::Subscribe {
-                                    stream: stream.clone(),
-                                    since: self.replicas.get(stream).map(|s| nd_wire::Cursor {
-                                        epoch: s.epoch.clone(),
-                                        seq: s.cursor,
-                                    }),
-                                })
-                                .await?;
-                        }
-                        self.socket = fresh.socket;
+                    if self.restore_subscriptions().await.is_ok() {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 },
                 Ok(response) => {
                     let gap = match &response {
-                        Response::Event { event } => {
-                            self.replicas.get(&event.stream).is_none_or(|s| {
-                                s.epoch != event.epoch
-                                    || s.cursor.checked_add(1) != Some(event.cursor)
-                            })
-                        }
+                        Response::Event { event } => self
+                            .replicas
+                            .get(&event.stream)
+                            .is_none_or(|s| !s.position().is_followed_by(event)),
                         Response::Resumed {
                             stream,
                             epoch,
@@ -328,24 +332,16 @@ impl SyncReplica {
             }
         }
     }
-    pub async fn put_blob(&self, bytes: &[u8]) -> Result<String> {
-        use sha2::{Digest, Sha256};
-        let id = format!("{:x}", Sha256::digest(bytes));
+    pub async fn put_blob(&self, bytes: &[u8]) -> Result<nd_wire::BlobId> {
+        let id = nd_wire::BlobId::of(bytes);
         self.http("PUT", &id, bytes.to_vec()).await?;
         Ok(id)
     }
-    pub async fn get_blob(&self, id: &str) -> Result<Vec<u8>> {
+    pub async fn get_blob(&self, id: &nd_wire::BlobId) -> Result<Vec<u8>> {
         self.http("GET", id, vec![]).await
     }
-    async fn http(&self, method: &str, id: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    async fn http(&self, method: &str, id: &nd_wire::BlobId, bytes: Vec<u8>) -> Result<Vec<u8>> {
         use http_body_util::{BodyExt, Full};
-        if id.len() != 64
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("invalid SHA-256".into());
-        }
         let io = hyper_util::rt::TokioIo::new(UnixStream::connect(&self.path).await?);
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await?;
         let task = tokio::spawn(async move {

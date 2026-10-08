@@ -11,24 +11,36 @@
       "type": "object",
       "properties": {
         "description": {
-          "type": "string"
+          "type": "string",
+          "default": ""
         },
         "disabled": {
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
+        },
+        "effort_levels": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "label": {
-          "type": "string"
+          "type": "string",
+          "default": ""
+        },
+        "resolved_model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "value": {
-          "type": "string"
+          "type": "string",
+          "default": ""
         }
-      },
-      "required": [
-        "value",
-        "label",
-        "description",
-        "disabled"
-      ]
+      }
     }
   }
 }

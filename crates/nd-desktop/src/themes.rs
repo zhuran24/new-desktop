@@ -11,8 +11,8 @@ pub(crate) struct ThemeFeed {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 impl ThemeFeed {
-    pub fn start(directory: PathBuf) -> std::io::Result<Self> {
-        let (send, updates) = tokio::sync::watch::channel(ThemeCatalog::default());
+    pub fn start(directory: PathBuf, initial: ThemeCatalog) -> std::io::Result<Self> {
+        let (send, updates) = tokio::sync::watch::channel(initial);
         let (reload, mut events) = tokio::sync::mpsc::channel(1);
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let notices = reload.clone();
@@ -151,10 +151,10 @@ impl Desktop {
                 .text_color(rgba(self.theme.colors.accent))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.state.active_panel =
-                        if this.state.active_panel.as_deref() == Some("themes") {
+                        if this.state.active_panel == Some(nd_view_model::Panel::Themes) {
                             None
                         } else {
-                            Some("themes".into())
+                            Some(nd_view_model::Panel::Themes)
                         };
                     cx.notify();
                 }))
@@ -169,7 +169,7 @@ impl Desktop {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.state.active_panel.as_deref() != Some("themes") {
+        if self.state.active_panel != Some(nd_view_model::Panel::Themes) {
             return None;
         }
         let mut choices = vec![
@@ -368,6 +368,7 @@ impl Desktop {
                                 px(position[0].as_f64().unwrap() as f32),
                                 px(position[1].as_f64().unwrap() as f32),
                             );
+                            let nonce = next["nonce"].clone();
                             window.defer(cx, move |window, cx| {
                                 window.dispatch_event(
                                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -395,6 +396,7 @@ impl Desktop {
                                     }),
                                     cx,
                                 );
+                                println!("{}", serde_json::json!({"theme_input_consumed":nonce}));
                             });
                         }
                     })

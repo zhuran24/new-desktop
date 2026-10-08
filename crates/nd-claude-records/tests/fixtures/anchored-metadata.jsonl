@@ -1,0 +1,7 @@
+{"type": "user", "uuid": "u", "parentUuid": null, "isSidechain": false, "timestamp": "2026-10-08T00:00:00Z", "message": {"id": "msg_u", "role": "user", "content": "read"}}
+{"type": "assistant", "uuid": "a", "parentUuid": "u", "isSidechain": false, "timestamp": "2026-10-08T00:00:00Z", "message": {"id": "msg_a", "role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Read", "input": {}}]}}
+{"type": "user", "uuid": "r", "parentUuid": "a", "isSidechain": false, "timestamp": "2026-10-08T00:00:00Z", "message": {"id": "msg_r", "role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}
+{"type": "user", "uuid": "meta1", "parentUuid": "r", "isSidechain": false, "timestamp": "2026-10-08T00:00:00Z", "message": {"id": "msg_meta1", "role": "user", "content": "metadata1"}, "isMeta": true}
+{"type": "user", "uuid": "meta2", "parentUuid": "meta1", "isSidechain": false, "timestamp": "2026-10-08T00:00:00Z", "message": {"id": "msg_meta2", "role": "user", "content": "metadata2"}, "isMeta": true}
+{"type": "attachment", "uuid": "date", "parentUuid": "meta1", "isSidechain": false, "attachment": {"type": "date", "date": "2026-10-08"}}
+{"type": "assistant", "uuid": "done", "parentUuid": "meta2", "isSidechain": false, "timestamp": "2026-10-08T00:00:00Z", "message": {"id": "msg_done", "role": "assistant", "content": "done"}}

@@ -50,20 +50,40 @@ impl Desktop {
         let query_receipt = self.drafts[&key].needs_receipt();
         let client = self.client.clone();
         cx.spawn_in(window, async move |weak, cx| {
+            let mut missing = false;
             let result = if query_receipt {
                 client.receipt(command.id).await.map(|lookup| match lookup {
                     nd_wire::ReceiptLookup::Found { receipt } => CommandReply::Receipt { receipt },
                     nd_wire::ReceiptLookup::Conflict => CommandReply::Conflict,
                     nd_wire::ReceiptLookup::Expired => CommandReply::Expired,
-                    nd_wire::ReceiptLookup::Missing
-                    | nd_wire::ReceiptLookup::Unavailable { .. } => CommandReply::DeliveryUnknown,
+                    nd_wire::ReceiptLookup::Other => CommandReply::Other,
+                    nd_wire::ReceiptLookup::Missing => {
+                        missing = true;
+                        CommandReply::DeliveryUnknown
+                    }
+                    nd_wire::ReceiptLookup::Unavailable { .. } => CommandReply::DeliveryUnknown,
                 })
             } else {
                 client.command(command).await
             };
             let _ = weak.update_in(cx, |this, window, cx| {
                 this.draft_writes.remove(&session);
-                let uncertain = !matches!(&result, Ok(CommandReply::Unavailable { .. }));
+                let terminal = missing
+                    || matches!(
+                        &result,
+                        Ok(CommandReply::Expired
+                            | CommandReply::Conflict
+                            | CommandReply::Receipt {
+                                receipt: Receipt::Rejected { .. }
+                            })
+                    );
+                let uncertain = query_receipt
+                    || matches!(
+                        &result,
+                        Ok(CommandReply::DeliveryUnknown
+                            | CommandReply::Other
+                            | CommandReply::Receipt { .. })
+                    );
                 let saved = match result {
                     Ok(CommandReply::Receipt {
                         receipt: Receipt::Done { value },
@@ -111,13 +131,18 @@ impl Desktop {
                         this.persist_draft(session.clone(), window, cx);
                     }
                     Err(e) => {
-                        this.drafts
-                            .entry(key.clone())
-                            .or_default()
-                            .save_failed(uncertain);
+                        let draft = this.drafts.entry(key.clone()).or_default();
+                        if terminal {
+                            draft.save_rejected();
+                        } else {
+                            draft.save_failed(uncertain);
+                        }
                         this.queued_send = None;
                         this.warning =
                             Some(format!("草稿保存未确认，文字仍在本窗口；可重试保存：{e}"));
+                        if missing {
+                            this.persist_draft(session.clone(), window, cx);
+                        }
                     }
                 }
                 this.refresh_send(cx);
@@ -237,6 +262,7 @@ impl Desktop {
     pub fn scenario_draft(plan: serde_json::Value, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |weak, cx| {
             let mut drop_stage = 0;
+            let mut edited = false;
             for _ in 0..400 {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(50))
@@ -244,6 +270,22 @@ impl Desktop {
                 if weak
                     .update_in(cx, |this, window, cx| {
                         if this.session_snapshot.is_none() {
+                            return false;
+                        }
+                        if let Some(gate) = plan["edit_gate"].as_str()
+                            && !std::path::Path::new(gate).exists()
+                        {
+                            return false;
+                        }
+                        if edited {
+                            if this
+                                .drafts
+                                .get(&this.draft_key())
+                                .is_some_and(|d| d.is_saved())
+                            {
+                                this.composer.update(cx, |c, cx| c.submit(window, cx));
+                                return true;
+                            }
                             return false;
                         }
                         if let Some(file) = plan["file"].as_str() {
@@ -290,7 +332,12 @@ impl Desktop {
                                 this.composer.update(cx, |c, cx| c.submit(window, cx));
                             }
                         }
-                        true
+                        if plan["send_when_saved"] == true {
+                            edited = true;
+                            false
+                        } else {
+                            true
+                        }
                     })
                     .unwrap()
                 {

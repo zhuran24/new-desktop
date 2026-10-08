@@ -94,3 +94,34 @@ async fn section_watch_ignores_unrelated_sections_but_get_has_latest_revision() 
         .unwrap();
     assert!(!watch.changed().await.unwrap().value.enabled);
 }
+
+#[test]
+fn updates_edit_only_user_values_and_null_removes_an_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    let defaults = json!({"claude":null,"diagnostics":{"enabled":true},"storage":{"grace":3600}});
+    let config = Config::open(Arc::new(FileSource::new(&file)), defaults, validate).unwrap();
+    let revision = config
+        .update(
+            json!({"diagnostics":{"enabled":false}}),
+            &config.snapshot().revision,
+        )
+        .unwrap();
+    let written: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(
+        written.as_table().unwrap().keys().collect::<Vec<_>>(),
+        ["diagnostics"]
+    );
+    assert_eq!(config.snapshot().value["storage"]["grace"], 3600);
+    config
+        .update(json!({"diagnostics":{"enabled":null}}), &revision)
+        .unwrap();
+    assert_eq!(config.snapshot().value["diagnostics"]["enabled"], true);
+    let next = Config::open(
+        Arc::new(FileSource::new(&file)),
+        json!({"diagnostics":{"enabled":true},"storage":{"grace":42}}),
+        validate,
+    )
+    .unwrap();
+    assert_eq!(next.snapshot().value["storage"]["grace"], 42);
+}

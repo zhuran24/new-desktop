@@ -344,7 +344,15 @@ async fn dropping_a_scenario_stops_its_whole_process_tree() {
             .trim_start_matches('/'),
     );
     assert!(cgroup.join("cgroup.procs").exists());
+    let units = scenario.units();
     drop(scenario);
+    for unit in units {
+        let out = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", &unit])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "normal Drop left {unit} active");
+    }
     assert!(!root.exists());
     assert!(
         !cgroup.exists(),
@@ -381,4 +389,159 @@ async fn failed_start_cleans_up_its_transient_services_and_slice() {
             String::from_utf8_lossy(&out.stdout)
         );
     }
+}
+
+// Executed in a separate test process so SIGKILL cannot run Scenario::drop.
+#[tokio::test]
+async fn orphan_scenario_child() {
+    let Some(manifest) = std::env::var_os("ND_TEST_ORPHAN_MANIFEST") else {
+        return;
+    };
+    let mut opts = options("orphan-expiry");
+    opts.max_lifetime = Duration::from_secs(3);
+    opts.disk_scratch = true;
+    if std::env::var_os("ND_TEST_CLEANUP_STAGE").is_some() {
+        opts.cleanup_observer = Some(|stage| {
+            if std::env::var("ND_TEST_CLEANUP_STAGE").unwrap() == format!("{stage:?}") {
+                std::fs::write(
+                    std::env::var_os("ND_TEST_CLEANUP_MARKER").unwrap(),
+                    b"paused",
+                )
+                .unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+        });
+    }
+    let mut scenario = Scenario::start(opts).await.unwrap();
+    scenario.kill_daemon().unwrap();
+    scenario.connect().await.unwrap().close().await.unwrap();
+    let child = scenario
+        .spawn(
+            "orphan-child",
+            nd_testkit::Program::new("/usr/bin/sleep").args(["90"]),
+        )
+        .unwrap();
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            child.unit(),
+            "-p",
+            "ControlGroup",
+            "--value",
+        ])
+        .output()
+        .unwrap();
+    std::fs::write(manifest, json!({"root":scenario.root(), "disk":scenario.disk_root(), "units":scenario.units(), "cgroup":String::from_utf8_lossy(&output.stdout).trim()}).to_string()).unwrap();
+    if std::env::var_os("ND_TEST_CLEANUP_STAGE").is_some() {
+        scenario.close().unwrap();
+    } else {
+        std::future::pending::<()>().await;
+        drop(scenario);
+    }
+}
+
+#[tokio::test]
+async fn killed_test_process_cannot_leave_a_restarting_daemon_or_slice() {
+    orphan_expiry(None).await;
+}
+
+#[tokio::test]
+async fn killed_cleanup_process_cannot_cancel_its_only_remaining_safeguard() {
+    for stage in [
+        "ExpiryStopped",
+        "BeforeSliceStop",
+        "SliceStopped",
+        "RuntimeRemoved",
+        "DiskRemoved",
+    ] {
+        orphan_expiry(Some(stage)).await;
+    }
+}
+
+async fn orphan_expiry(stage: Option<&str>) {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("orphan.json");
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    let marker = dir.path().join("cleanup-paused");
+    if let Some(stage) = stage {
+        command
+            .env("ND_TEST_CLEANUP_STAGE", stage)
+            .env("ND_TEST_CLEANUP_MARKER", &marker);
+    }
+    let mut child = command
+        .args(["--exact", "orphan_scenario_child", "--nocapture"])
+        .env("ND_TEST_ORPHAN_MANIFEST", &manifest)
+        .spawn()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !manifest.exists() || (stage.is_some() && !marker.exists()) {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "orphan fixture exited before ready"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("orphan fixture did not start");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let info: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    let units: Vec<_> = info["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u.as_str().unwrap())
+        .collect();
+    let active = || {
+        units
+            .iter()
+            .filter(|unit| {
+                let out = std::process::Command::new("systemctl")
+                    .args(["--user", "show", unit, "-p", "ActiveState", "--value"])
+                    .output()
+                    .unwrap();
+                matches!(
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    "active" | "activating" | "deactivating"
+                )
+            })
+            .map(|u| (*u).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !active().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let survivors = active();
+    let cgroup_exists = std::path::Path::new("/sys/fs/cgroup")
+        .join(info["cgroup"].as_str().unwrap().trim_start_matches('/'))
+        .exists();
+    // Cleanup even on the red run; record the observation before intervening.
+    for unit in &units {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", unit])
+            .output();
+    }
+    let root = std::path::Path::new(info["root"].as_str().unwrap());
+    let root_exists = root.exists();
+    let _ = std::fs::remove_dir_all(root);
+    let disk = std::path::Path::new(info["disk"].as_str().unwrap());
+    let disk_exists = disk.exists();
+    let _ = std::fs::remove_dir_all(disk);
+    assert!(
+        survivors.is_empty(),
+        "orphan units still active: {survivors:?}"
+    );
+    assert!(!cgroup_exists, "orphan descendant cgroup survived expiry");
+    assert!(
+        !root_exists && !disk_exists,
+        "orphan temporary directories survived expiry"
+    );
 }

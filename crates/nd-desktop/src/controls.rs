@@ -85,7 +85,7 @@ impl Desktop {
                 self.settings_open = false;
             }
             Escape::RewindMenu => {
-                self.state.active_panel = Some("rewind".into());
+                self.state.active_panel = Some(nd_view_model::Panel::Rewind);
             }
             Escape::Interrupt if caps["interrupt"] == true => {
                 self.control(
@@ -104,7 +104,17 @@ impl Desktop {
         let command = Command {
             id: uuid::Uuid::new_v4().to_string(),
             device: self.device.clone(),
-            expect: json!({}),
+            expect: if name == "session.interrupt" {
+                let turn = self
+                    .session_snapshot
+                    .as_ref()
+                    .and_then(|s| s.items.iter().find(|i| i.id == "header"))
+                    .map(|h| h.data["process"]["turn"].clone())
+                    .unwrap_or(Value::Null);
+                json!({"turn":turn})
+            } else {
+                json!({})
+            },
             name: name.into(),
             args,
         };
@@ -228,7 +238,7 @@ impl Desktop {
                 ));
             }
         }
-        if self.state.active_panel.as_deref() == Some("rewind") {
+        if self.state.active_panel == Some(nd_view_model::Panel::Rewind) {
             let rounds = self
                 .session_snapshot
                 .as_ref()

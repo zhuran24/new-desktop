@@ -1,6 +1,6 @@
 # CLI 与 Codex 契约清单
 
-日期：2026-10-06。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#5 的离线端点、#6 的 Workflow 流水和 #8 的只读记录契约已通过真 CLI 离线验收；#9 的转换契约区分格式回归与后续真实后端验证。
+日期：2026-10-08。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#5 的离线端点、#6 的 Workflow 流水和 #8 的只读记录契约已通过真 CLI 离线验收；#9 的转换契约区分格式回归与后续真实后端验证。
 
 ## 条目格式
 
@@ -48,14 +48,31 @@
 | 主记录是 JSONL，user/assistant/system/attachment 带 UUID 和父指针；元数据不入对话链；重复 UUID 后写覆盖，未知字段保留 | `rbn` @211932344；既有 `research/round7/cc-import.md` §3.1–3.4 | `history.rs` 的原始记录、偏移、重复 UUID、错误信封案例 | 解析失败返回字节偏移；完整重读仍失败则标记录不可判定，不绕过登记继续写 |
 | 主对话叶子受 `last-prompt`、explicit、后续对话、父链、时间戳影响；空 explicit 清空；无叶子标题不等于新对话 | `rbn` @211932344；`Okn` @211930929；`AN` @211874654、`Kut` @211874772；`FAr` @211958891 | `history.rs` 的真实回退前缀、标题/sidechain、清空、时钟倒序、并行结果选择、fork briefing | 叶子无法确定时不给独占登记一个猜出的 UUID；等待写完/扩大读取，仍不确定则不给续接放行 |
 | 最新 compact 边界、摘要、保留尾段重接；`preservedMessages` 优先于旧 `preservedSegment`；旧上下文不能经分块恢复复活 | `dAr` @211872778；`cAr` @211874082；既有 `research/round4/switch-branch.md` §1、`research/round9/VERIFY.md` E4/E5 | 真 CLI 两次 `/compact` + `--resume` 的 `cli_live`；录制默认回归；旧段格式衍生输入 | 保留列表或父链不全返回 `BrokenCompaction`/`MissingParent`；完整重读仍失败则不导出/不放行续接，不伪造摘要或手写父指针 |
-| 同 message.id 的回复分块、并行工具结果属于同一回复；旧 progress 桥接；有效链后有附件尾部 | `mAr` @211878079；`Kut` @211874772；`rbn` @211932344 | 分块/工具结果、旧 progress、附件尾部直接行为测试；这些边界案例是构造输入，非真模型证明 | 不清洗未知块；不按歧义工具 ID 猜关联。升级发现结构变化时停用相关转换/导出，保留原始记录以便修复 |
+| 同 message.id 的回复分块、并行工具结果属于同一回复；旧 progress 桥接；有效链后有附件尾部 | `mAr` @211878079；`Kut` @211874772；`rbn` @211932344 | `recovery.rs` 默认逐例比对 480 条独立参照 UUID 顺序与 1/2/7 条分页；本机提取差分覆盖原有 3525 例、独立复核 1640 例及生成器的 1931 例，方法见下文；旧 progress、叶子附件另有行为测试。构造输入不是模型续接证明 | 不清洗未知块；不按歧义工具 ID 猜关联。升级发现结构变化时停用相关转换/导出，保留原始记录以便修复 |
 | 现场回归使用 stream-json initialize、rewind_conversation、export_conversation、/compact、--resume；只能模型端点被替换 | `research/impl/BUILD.md`；`research/round4/switch-branch.md` §1–2；真实夹具生成器 | `cargo test -p nd-claude-records --test cli_live -- --ignored`，真实 CLI 自己写文件，续接请求与解析摘要/保留回复对比 | 场景失败使测试失败；候选版本不通过这条关卡，继续钉住已验证版 |
 
 测试文件都在 [nd-claude-records/tests](../crates/nd-claude-records/tests/)。默认回归与现场回归的区别、完整命令和分页契约见 [库说明](../crates/nd-claude-records/README.md)。
 
+P-24 的恢复契约按消息 ID 归组；工具结果先按父节点关联，旧 parent 再用 source UUID 和无歧义工具 ID 关联。同消息的工具 ID 归最后分块，不同消息重复声明则保持歧义。已在选链上的结果也参与附件尾链恢复。回退关联仅将缺省/null 的 `isSidechain` 视为 false；其他值不做布尔归一化。尾链要求整条透明、无分叉，且原始 `isSidechain` 字段严格相等（缺省、null、false 不同）；不额外比较 agent。字段比较不把 JSON 对象/数组按内容判等，数字按 binary64 比较；回退关联的 `agentId` 同样保留字段类型。异常类型是解析器接受输入的兼容边界，不表示 CLI 正常会产出这些类型。恢复条目按有效文件位置进入窗口，metadata 子链紧跟其锚点；重叠窗口合并后输出，原始选链的相对顺序不变。
+
+差分夹具 [recovery-orders.jsonl](../crates/nd-claude-records/tests/fixtures/recovery-orders.jsonl) 共 480 例、814855 字节，只含人工构造输入和 CLI 给出的期望 UUID 序列。覆盖连续 metadata、主链结果附件、system/isMeta 尾链、并行结果、旧 parent、侧链、跨消息 ID、原始侧链字段、重复工具 ID、区间重叠及文件顺序；另含异常字段类型及跨类型比较。默认测试不需要本机 CLI。期望值由参照生成，不从 Rust 实现更新。
+
+升级时手动运行 `recovery_matches_locally_extracted_cli`（默认 `#[ignore]`，需要本机闭源二进制和完整外部语料）。以下命令验证原 3525 例加生成器 1931 例。完整复核另将 `last-p24-evidence/independent.jsonl` 的 1616 例和 `malformed.jsonl` 的 24 例与原语料拼接到仓库外的 JSONL，把环境变量指向该文件，即验证合计 7096 例；本次拼接文件及日志在 `/mnt/wd_external/nd-build/tmp/r9-p24/`。外部语料均为输入数据，不需复制 oracle 源码到仓库。
+
+```bash
+export CARGO_TARGET_DIR=/mnt/wd_external/nd-build/target/review-fixes
+export CARGO_BUILD_JOBS=6
+export ND_CLAUDE_RECOVERY_CORPUS=/mnt/wd_external/nd-build/tmp/final-P24-c6e13a4-evidence/corpus.jsonl
+systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
+  cargo test -p nd-claude-records --test recovery --locked \
+  recovery_matches_locally_extracted_cli -- --ignored --exact --nocapture
+```
+
+[recovery_oracle.py](../crates/nd-claude-records/tests/cli/recovery_oracle.py) 校验钉版 SHA-256，按已核对偏移和括号边界现场抽出 `mAr` 及其纯函数依赖，仅在 Node 子进程内执行；启用工具 ID 恢复开关，关闭遥测和诊断登记。脚本不运行 CLI、不读取配置或凭据，子进程清空继承环境；现场抽出的函数体不写入仓库或夹具；禁止提交这些函数的源码或任何语言的源码改写。脚本输出提取函数的散列供留证，将完整外部语料与 [recovery_cases.py](../crates/nd-claude-records/tests/cli/recovery_cases.py) 的 1931 例分支定向输入（含 768 例字段类型交叉组合）一起送入参照，Rust 测试逐例核对完整历史和分页。新版必须先复核符号、依赖、开关及二进制散列，再更新抽取清单；抽取或比对失败不放行。该差分只证明记录恢复顺序，实际压缩和续接仍由 `cli_live` 验证。
+
 当前实现对破损文件比 CLI 更严格：不使用它的邻近时间戳猜父节点、忽略坏行或返回部分历史作为登记基线。错误必须由调用方处理，不能转成空历史/空叶子。库只做原生记录顺序和原始内容读取；模型请求的规范化与转换有各自契约。
 
-本条目没有写 CLI 存储例外：产品库是纯读取，测试记录也由真实 CLI 经协议产生。`PinLeaf` 写入仍归后续 Claude 适配与独占凭据，不由此库实施。没有新增会话结构/派发操作，无需在引擎崩溃矩阵新增行。
+本条目没有写 CLI 存储例外：产品库是纯读取，真实录制由 CLI 经协议产生；差分夹具另以构造输入标识。`PinLeaf` 写入仍归后续 Claude 适配与独占凭据，不由此库实施。没有新增会话结构/派发操作，无需在引擎崩溃矩阵新增行。
 
 ## 对话转换（#9）
 
@@ -78,10 +95,10 @@
 
 | 依赖 | 出处 | 自动验证 | 不成立时的退路 |
 |---|---|---|---|
-| `sessions/<pid>.json` 带完整 sessionId、字符串 procStart、cwd、version、startedAt、pidDomain；PID 域是 `linux:<machine-id>:<pid namespace>` | 真实离线 `session.json`/`identity.json`；固定二进制 `fJo` @201874306；父规格「独占登记」 | `scripts/test-claims-live.sh`：真 CLI 写注册表，Rust 登记读取真 `/proc`；自己被排除，第二条同 id CLI 被判冲突；默认测试在原始副本上造错 ticks、异 PID 域、旧启动纪元和无 pid | 缺身份不猜，`ExternalUnverified`；损坏或读失败 `Checking`，完整重扫成功后再放行 |
-| `agents --json --all` 是数组，列表里的 pid 本身不构成启动身份 | 真实离线 `agents.json`；父规格「窄接缝二」 | `PinnedCli` 运行真命令的现场 probe；脚本化命令测试无 pid 列表条目，文件检测在没有列表兴趣时继续运行 | 只按 pid 与 sessionId 同时匹配的注册表补身份；无法核实标 unverified，不按会话 id 排除外部写者 |
-| `jobs/<8 位 id>/state.json` 可引用完整会话 id 而没有 pid | 真实离线 `job-state.json`（blocked/login required）；生成器仅在隔离目录写入工作目录信任设置 | 原始后台作业夹具直接读入，未订阅列表也阻止该 id 放行；现场自动生成并保留状态文件 | 保守等待，不据无 pid 推断退出。完整版本/参数资格与接管退路 R12-X2 留 #64 |
-| 外部目录扫描和进程身份确认不足以封闭“检查后才出现写者”的窗口 | 父规格单写者及常开检测；R12 §2.3.1/§2.3.3 | 默认行为测试覆盖同 id 外部出现、消失、列表隐藏、半文件重读、后台周期补扫 | 后续发现后暂停；不增加每条传输路径各自的第二套准入，也不承诺 OS 文件锁 |
+| `sessions/<pid>.json` 带完整 sessionId、字符串 procStart、cwd、version、startedAt、pidDomain；PID 域是 `linux:<machine-id>:<pid namespace>` | 真实离线 `session.json`/`identity.json`；固定二进制 `fJo` @201874306；父规格「独占登记」 | `recovery_requires_identities_then_a_complete_scan_and_excludes_own_pid_before_holding`、`stale_local_pids_are_ignored_but_foreign_pid_namespaces_remain_unverified`；`scripts/test-claims-live.sh`：真 CLI 写注册表，Rust 登记读取真 `/proc`；自己被排除，第二条同 id CLI 被判冲突；默认测试在原始副本上造错 ticks、异 PID 域、旧启动纪元和无 pid | 缺身份不猜，`ExternalUnverified`；损坏或读失败 `Checking`，完整重扫成功后再放行 |
+| `agents --json --all` 是数组，列表里的 pid 本身不构成启动身份 | 真实离线 `agents.json`；父规格「窄接缝二」 | `scripted_cli_lists_are_unverified_without_registry_identity_and_interest_drop_keeps_detection`、`an_unavailable_optional_cli_list_does_not_block_registry_recovery_or_writes`；`scripts/test-claims-live.sh` 的真实列表 probe | 列表只用于展示，失败只报告列表不可读；独占裁决始终依据注册表扫描与进程身份 |
+| `jobs/<8 位 id>/state.json` 可引用完整会话 id 而没有 pid | 真实离线 `job-state.json`（blocked/login required）；生成器仅在隔离目录写入工作目录信任设置 | `real_cli_background_session_without_a_pid_blocks_even_when_no_one_is_listing_external_sessions`；`scripts/test-claims-live.sh` 生成并留存 state.json | 保守等待，不据无 pid 推断退出。完整版本/参数资格与接管退路 R12-X2 留 #64 |
+| 外部目录扫描和进程身份确认不足以封闭“检查后才出现写者”的窗口 | 父规格单写者及常开检测；R12 §2.3.1/§2.3.3 | `a_second_process_with_the_same_session_id_blocks_even_an_already_admitted_write`、`unverified_entries_and_incomplete_registry_reads_never_mean_no_external_writer`、`detection_keeps_running_without_a_list_subscriber_and_stops_without_releasing_leases`；`scripts/test-claims-live.sh` | 后续发现后暂停；不增加每条传输路径各自的第二套准入，也不承诺 OS 文件锁 |
 
 本单没有 CLI 存储写入例外，最后自有叶子只接受自有流水证据，文件检查使用 #8 的纯解析库。`CliCommands::stop` 仅定义并实现短 id 命令边界，本单不调用它实施接管；stop/退出/注册项消失的实际状态机与验证属于 #64。完整验证与 owner 边界见 [验证记录](verification/ticket-12.md)。
 
@@ -92,6 +109,7 @@
 | 编号 | 依赖 | 出处 | 自动验证 | 不成立时的退路 |
 |---|---|---|---|---|
 | MOD-LAUNCH | 启动模板被接受：stream-json 双向、`--verbose`、`--permission-prompt-tool stdio`、`--replay-user-messages`、`--include-partial-messages`、两个 `--plugin-dir`、`--settings` 内联 JSON、`--session-id`/`--resume`；不带 `--await-initialize` 时也不等 stdin，约 200 ms 内装载 mod、触发 `session.start` | 规格「进程」L231–232；本版本实跑 | `ready.rs`：`pinned_cli_is_ready_after_both_mods_report_the_preset_session_before_initialize`、`backend_gets_the_spec_template_…`（读 `/proc/<pid>/cmdline`） | 关卡不放行该版本，继续钉旧版；参数被拒的按版本改模板 |
+| LAUNCH-PROFILE | `--model` 接受别名和完整名；`--permission-mode` 在新建与 `--resume` 时传递；initialize 的 `current_permission_mode` 回读实际模式 | 固定 2.1.289，`launch.rs` 启动模板及 CLI initialize 回应；权限模式来自对应进程能力 | `backend_gets_the_spec_template_without_preload_and_with_the_four_old_mods_disabled` 核对两参数和回读；`settings_are_read_on_open_and_permissions_and_effort_survive_reclaim` 覆盖续接 | 参数或回读字段不兼容，升级关卡不放行 |
 | MOD-ENV | 环境开关按名生效：`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`、`CLAUDE_CODE_FORK_SUBAGENT=1`、`CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true`、`CLAUDE_CODE_SDK_READS_SESSION_STATE=1`、`DISABLE_UPDATES=1`（关自动更新，B289@202660933）、`CLAUDE_CODE_PLUGIN_DIR_WATCH=0`（三态布尔，显式 false 不监视，B289@206370606）；`BUN_OPTIONS` 去掉 | 规格 L234；`research/impl/cli-protocol.md` §1 | `backend_gets_the_spec_template_…` 读 `/proc/<pid>/environ`；基础环境故意带 `BUN_OPTIONS` 预加载不存在的脚本 | 开关改名或失效时关卡不放行；fork、检查点各自的功能验收归 #22 及后续 |
 | MOD-DISABLE | `--settings` 的 `enabledPlugins` 把 `<名>@skills-dir` 设 false，只在本进程关掉四个旧 mod；与用户设置按键合并（用户关掉的仍关，其余 skills-dir mod 照常装载；原 U06） | ADR 0011；规格「两个 mod」 | `backend_gets_the_spec_template_…`：临时 `CLAUDE_CONFIG_DIR/skills/` 放同名小 mod 与对照 mod，按标记文件判断是否装载 | 建议：关卡不放行；不改 owner 的设置或 mod 文件 |
 | MOD-OPTIONS | `pluginConfigs.<mod 名>.options` 传给 `register(on, options)`；值须在 plugin.json 的 `userConfig` 声明 | `research/impl/mod-api.md` §3.2 | 所有场景：hello 里的 `run` 来自 options，mod 能连上 options 给的 socket | 建议：关卡不放行；拿不到 options 的 mod 报不了到，进程按 MOD-HELLO 降级只能聊天 |
@@ -101,6 +119,7 @@
 | MOD-SESSION-ID | `$.session.id()`：新建等于 `--session-id`，续接等于 `--resume` 的 id | 本版本实跑（原 U03 的前两种；分叉的指定 id 归后续工单） | `ready.rs`：新建与 `a_resumed_backend_is_ready_…` | 已实现：hello 的 id 对不上不算报到，进程只能聊天；建议关卡不放行 |
 | MOD-CLEAR | `/clear`：`session.end`（`reason:"clear"`、旧 id，此时 `$.session.id()` 仍是旧 id）→ stdout `conversation_reset` → `classic.SessionStart`（`source:"clear"`、新 id，`$.session.id()` 已是新 id）；不再触发 `session.start`；之后 stdout 帧带新 id | 本版本实跑；`mod-api.md` §9（原 U03 的 clear 顺序） | `rebind.rs`：`clear_rebinds_both_mods_to_the_new_session_…`（长轮询 20 s 时 3 s 内完成重绑） | 退路已实现：两个 mod 每轮长轮询前重读 id，重绑最迟延到一个长轮询周期 |
 | MOD-HTTP | `$.http.fetch` 经 `socketPath` 走 unix socket，HTTP/1.1 往返正常；守护进程不在时调用报错而不是挂住，mod 每秒重试。单次 fetch 的 30 s 上限来自 `mod-api.md` §5，本单没有重测，长轮询取 25 s 留出余量 | `mod-api.md` §5、§8 | 所有场景；`restart.rs`：通道丢弃后 mod 自动重连 | 上限变短就缩短长轮询；UDS 不可用则 mod 报不了到，按 MOD-HELLO 降级 |
+| MOD-BUDGET | `$.clock.after(0, …)` 的后台轮询持续到模块重载；普通钩子 10 秒、`.catch` 1 秒，`$` 调用在途不计钩子预算；`session.end` 另受约 1.5 秒墙钟限制；`$.session.version()` 返回版本信息 | `research/impl/mod-api.md` §8、§9、§15 MOD-09，D289:4917–4952、10502–10504；两个 mod 的 channel/lifecycle | `mods_rebind_after_an_adapter_restart_and_earlier_operations_can_be_queried`；`clear_rebinds_both_mods_to_the_new_session_and_stale_commands_are_refused` 含 20 秒长轮询 | 报到失败按 MOD-HELLO 降级；版本读取或轮询失效不冒称能力可用 |
 | MOD-RELOAD | 模块文件变动后 `reload_plugins` 重载该模块：模块变量清零、`session.start` 再跑 | 本版本实跑（`research/round9/VERIFY.md` E1 是开着目录监视时的旧观察） | `reload.rs` | 退路已实现：代次不同的命令被拒，在途命令按可重发类别重排或记 Unknown |
 
 本节不写 CLI 原生存储（mod 只用协议与 `$`，没有用 `$.store`），也没有新增会话结构或派发操作，不加引擎崩溃矩阵行。mod 往返的录制格式与回放见 Claude 适配说明；已提交 2.1.289 的 `clear-rebind` 录制，默认测试套件回放。
@@ -115,6 +134,7 @@
 | CONV-STREAM | `--include-partial-messages`：`stream_event` 的 `message_start.message.id` 给 API 消息 id，`content_block_delta.index` 与随后同一消息的 `assistant` 帧按块的先后一一对应（每个完整块一条 `assistant` 帧，在 `content_block_stop` 之前到）；子代理的帧带 `parent_tool_use_id` | 本版本录制（见夹具）；cli-protocol §4 | `ndctl_creates_a_session_and_streams_the_reply`（增量越来越长、最后整块替换、同一个条目）；`recorded_conversation_replays_to_the_committed_facts`（每块的增量连起来等于完整块） | 对不上时增量仍只是临时显示，完整块到了照样整体替换；关卡跑录制回归 |
 | CONV-TURN | 主对话每个回合开头一条 `system/init`（无 `parent_tool_use_id`）；`result` 结束回合，`subtype:"success"` 且 `is_error` 不为真才算成功，`result` 不结任何一条消息；工具结果是不带 `isReplay` 的 user 帧，`content` 里 `tool_result{tool_use_id}` | P §5.1；cli-protocol §4；本版本录制 | `a_recorded_conversation_replays_through_the_adapter_state_machine`、录制回归（两个回合、工具调用与结果配对） | 回合状态只影响显示与闲置判断；看不清时按在跑处理，不回收 |
 | CONV-TASKS | 后台 Bash 起来时 stdout 有 `system/task_started{task_id}`，结束有 `task_notification`；任务结束后 CLI 自己把结果交给主对话的模型（多一次模型请求） | 本版本实跑 | `a_backend_with_a_running_background_task_is_not_reclaimed`（有任务时会话头 `drain:busy`、闲置期满不回收；放行 FIFO 后模型收到结果、之后回收） | 任务表拿不到、流水丢过行、用过定时事项（`CronCreate`、`ScheduleWakeup`）时收尾判据是 Unknown，不回收；R10-E3 的钩子判据在第 4 步接 |
+| CONV-TASKS-TABLE | `background_tasks_changed.tasks[].task_id` 是整表替换，空数组才表示无任务；`task_updated.patch.status` 的 completed/failed/killed/stopped 移除该 task_id | 真 CLI `nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl` 的 seq 12、34、35 | `recorded_task_tables_keep_busy_work_and_malformed_tables_cannot_claim_drained` 重放真实非空任务表并破坏 tasks 字段；`recorded_terminal_task_update_drains_without_a_table_or_notification` 屏蔽冗余空表、在通知前断言 recorded completed 的 Busy→Drained（含检查点恢复），另测终态 status 变体及非终态/无关 id；原主接缝后台任务不回收场景 | 字段缺失或任务 id 不可识别判 Unknown、不回收；终态集合变动须重跑关卡 |
 | CONV-END | 控制请求 `end_session`：CLI 回成功后退出，看守记退出码、单元清理 | `case"end_session"` 分派 B289@216828319、处理 B289@227273232；本版本实跑 | `an_idle_backend_is_reclaimed_and_the_next_message_resumes_it`（回收后看守报 Gone） | 不退出时回收操作失败、进程留着；建议关卡不放行 |
 | CONV-RESUME | 用新建时预定的后端会话 id `--resume` 拉起：同一个后端会话，stdout 不重放旧历史，下一次模型请求带着之前的全部对话 | P §6；本版本实跑 | `an_idle_backend_is_reclaimed_and_the_next_message_resumes_it`（第二次请求含第一轮的提示与回答） | 续接失败时按需拉起失败、代持的消息报失败；会话本身不撤 |
 | CONV-REGISTRY | CLI 写进 `CLAUDE_CONFIG_DIR/sessions/<pid>.json` 的 pid、procStart、pidDomain 与看守报的身份一致，守护进程据此把自己的后端进程认作自有，不当同一后端会话的外部写入者 | #12 的注册表条目；本版本实跑 | 全部会话场景：每次发送都经独占登记的 `Write` 放行才写出 | 认不出时发送停在「等独占」，关卡不放行 |
@@ -155,6 +175,7 @@
 | SEND-INTERRUPT | 普通 `interrupt`；perTaskStopAffordance 后保后台，ACK 与 result 分离；ADR 0008、R10-E1 | `escape_ends…`、`escape_preserves_background_bash_agent_and_workflow_until_their_results_arrive`；三类后台完成通知均到实际模型请求 | 声明失效时范围标为会停后台任务；不以空白 now 或关闭 stdin 代替 |
 | SEND-CANCEL-QUEUE | `system/init.capabilities` 声明 interrupt_cancel_queued_v1；`cancel_queued:true` 回 cancelled UUID 列表 | `explicit_stop_and_cancel_queue_restores_each_queued_message_once`；只恢复明确取消的消息 | 不声明就拒绝并隐藏入口；缺列表是 Unknown，不当成空队列或取消成功 |
 | SEND-E2B | `CLAUDE_AUTO_BACKGROUND_TASKS=1` 下立即发送使可后台化的前台 MCP 转后台；规格第 2 步 E2b | `e2b_send_now_moves_foreground_mcp_to_background_and_delivers_its_result`：真实 MCP 已执行且尚未放 FIFO，立即发送收到 background task，放行后结果回主对话，服务端无取消通知；正式启动模板固定启用该变量 | 若升级后此场景不成立，撤掉变量，能力表禁用保留前台 MCP，界面说明会中断；不以超时自动后台化代替 send-now 场景 |
+| SEND-E2B-ENV | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` 或 `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` 禁用普通前台 MCP 的后台化；`CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND=true` 控制服务器 task handle 的后台等待，不能等同于禁止普通调用转后台。应用对这三种配置均保守关闭保留承诺 | 钉版 2.1.289：Vd @205765136、iht @207476353；普通调用/任务 handle 分流 @235008300、@235043450；任务测试使用隔离缓存 tengu_mcp_tasks 和 MCP_PROTOCOL_NEGOTIATION=auto 协商 2026-07-28 | `disabling_mcp_backgrounding_removes_the_send_now_preservation_promise`：真实普通 MCP 执行中立即发送，服务端收到取消；`mcp_task_background_switch_controls_inflight_task_handles`：task 开关关闭时后台任务经中断仍完成，开启时不协商 task 结果，前台调用被中断且服务端收到取消；逐个删掉 CLI 环境变量均须检出。默认正例见 `e2b_send_now_moves_foreground_mcp_to_background_and_delivers_its_result` | 实际调用路径或开关语义改变时升级关卡不放行；字段为 false 只表示不承诺保留，不推断所有 MCP 都会被取消 |
 | SEND-E2B-AGENT | 同开关影响 Agent 后台策略；固定二进制的开关读取 @215204979 与 Agent schema 中的异步策略说明 | `auto_background_keeps_an_explicit_foreground_agent_completable`：显式 false 在当前模板仍异步启动，主回合先继续，代理随后正常完成 | 不承诺 Agent 必定同步，也不把源码中的 120000 ms 分支当作该模板实测延迟；升级需重跑并记录实际策略 |
 
 E2b 本轮的无变量对照也能后台化，不能把结果归因为该变量的唯一作用。采用规格主方案是在启用变量的正式模板上验证行为成立。MCP 后台准入仍由 CLI 决定，能力说明只覆盖可后台化调用。没有新增应用写 CLI 原生存储的例外。

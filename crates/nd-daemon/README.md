@@ -54,6 +54,8 @@ tick_ms = 1000                    # 闲置检查间隔
 
 `claude`、`watchdogs` 两节在启动时读，改了要重启守护进程才生效。启动次序：独占登记进入恢复中 → 看守托管报每个还在的后端进程的身份 → 名册装载有活进程或未完操作的会话、适配器接回（续读流水、对账未结的票）→ 独占登记身份已知、第一次扫描完成 → 放行；放行之前起操作的命令照常受理，操作等着。
 
+服务单元用 `RuntimeDirectoryPreserve=yes` 保留运行目录：停止、重启和崩溃重启都不删除看守的 socket、身份与流水。更新已安装的服务文件后须执行 `systemctl --user daemon-reload`；只有全部看守和后端进程都退出后才能手动清理该目录。
+
 ```bash
 ndctl new --cwd ~/proj --model claude-haiku-4-5 --follow "你好"
 ndctl send <会话 id> --follow "接着说"
@@ -105,10 +107,10 @@ UDS 的 `/wire` 是 HTTP WebSocket 升级入口，随后使用 JSON 文本帧：
 2. `subscribe {stream:"global", since:null}`：冷启动一定得到 snapshot，包含当前所有条目，包括零事件情形。
 3. `event` 带 epoch、cursor、upsert、remove。单次状态发布中的条目变化一起应用。只在内存保留最近 128 个事件；守护进程重启换纪元。
 4. 持有副本的重连可以给 `since {epoch,seq}`。同纪元且游标仍在缓冲内时先重放事件，再发 `resumed`；旧纪元、过期或未来游标都重新取快照。快照和事件订阅在同一个协调锁下取得，避免其间漏事件。
-5. `get {id,res,page}` 经 `NamespaceProvider::page`；当前 system 和 diagnostics 都是单页，不支持历史 `before`。#20 在同一路径扩展历史分页。
+5. `get {id,res,page}` 经 `NamespaceProvider::page`；system 和 diagnostics 是单页，`session/<id>/items` 提供历史分页。
 6. `execute {id,command}` 提交持久命令，`receipt {id,command_id,content_hash?}` 查询收据；数字 id 仅关联 RPC，持久身份是 `command.id`。旧 `command {id,name}` 保留为只读诊断查询，不受理写命令。
 
-每条连接独立有界发送队列，命令回应、快照和事件都经这一队列。持久事件不合并、不改序；队列满、广播滞后或写超时即关闭连接。能写出时附 `bye{resume:true}`，无法写出则直接断开。配置对新连接生效，单个慢连接不阻塞其他连接。重放所需消息超过队列容量时直接发完整快照，防止重连反复溢出。当前没有流式 delta，后续增量不能放入持久事件环。
+每条连接独立有界发送队列，命令回应、快照和事件都经这一队列。持久事件不合并、不改序；队列满、广播滞后或写超时即关闭连接。能写出时附 `bye{resume:true}`，无法写出则直接断开。配置对新连接生效，单个慢连接不阻塞其他连接。重放所需消息超过队列容量时直接发完整快照，防止重连反复溢出。会话的流式增量由会话提供者折叠进当前条目，再经自己的快照和事件流发布。
 
 `nd-ui-core::SyncReplica` 提供 `connect`、`subscribe`、`get`、`current`、`next`、`command`、`receipt`、只读 `query` 及附件读写。调用方持续驱动 `next()` 来收事件和自动重连，可以取消等待；`current()` 是最近应用的副本。查询和命令等待期间也应用流事件。请求编号单调增长，取消的请求迟到后不会冒充下一次回应。副本只由快照与事件修改。`ndctl`、场景测试均使用这个库。
 
@@ -139,9 +141,11 @@ ndctl page diagnostics
 
 断线或等待回应超过 5 秒后，同步副本只查询命令 id 和原内容散列；拿到原收据、`conflict` 或 `expired` 就返回相应结论，查不到或无法连接则报告 `delivery_unknown`。独立的 `receipt(id)` 返回 `found`、`missing`、`expired` 或查询 `unavailable`，查询本身可重连重试。`missing` 只表示当前查不到，不能证明正文未曾送达。调用方取消 `command()` 后应保留 id 并查询，不另造 id 重送。
 
-明确未受理的 `CommandReply::Unavailable` 最多发送五次，间隔 50、100、200、400 ms；用尽后把最后的 unavailable 交给调用方。`Receipt::Rejected` 即使错误码叫 unavailable 也不会触发这一重试。收据查询默认不发送正文，带散列的恢复查询还防止误认同 id 的另一条命令。
+明确未受理且带 `code:recovering` 的请求保持同 id 等待恢复；其余 `CommandReply::Unavailable` 最多发送五次，间隔 50、100、200、400 ms；用尽后把最后的 unavailable 交给调用方。`Receipt::Rejected` 即使错误码叫 unavailable 也不会触发这一重试。收据查询默认不发送正文，带散列的恢复查询还防止误认同 id 的另一条命令。
 
-新增单事务能力实现 `NamespaceProvider::execute(tx,command)`，在账本去重之后核对该能力的必填条件并修改业务状态；可复用 `commands::{migrate,execute,lookup,expire}`。不得在闭包里写文件、发网络请求或派发后端动作。结构操作和 Delivery 时点的命令由后续会话引擎持久保存意图、追踪动作结果；本次实际业务命令只有 Commit 时点的诊断备注，不把本单测试视为后端执行至多一次的证明。只读查询走 `query/get`，不落命令收据。
+`NamespaceProvider` 覆盖版本声明、全局快照贡献、事件订阅、查询、命令与收据。系统/global、会话/列表/模型、runs 和可选诊断各有提供者，均通过组件内核登记。连接循环按命名空间查提供者，不解释会话 id、运行状态或诊断效果。添加命名空间只需实现端口并在装配处登记。原有 `Models` 请求作为兼容入口保留，实际调用走 models 提供者；规格要求小版本只加不改，不删除已有请求变体。
+
+`NamespaceProvider::execute(command)` 返回 `NamespaceExecution`；普通命令按连接到达次序受理，Delivery 时点的结果等待可独立完成。单事务能力在 `namespaces::durable_command` 的账本去重之后核对前置条件并修改业务状态；效果闭包不得写文件、发网络请求或派发后端动作。会话提供者调用真正的会话执行器，持久保存意图并追踪后端结果。所有收据查询共用系统提供者的只读账本入口，禁用业务提供者也不妨碍查询已有收据。只读查询不落命令收据。
 
 ## SQLite 与附件
 

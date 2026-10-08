@@ -1,6 +1,6 @@
 # #6 看守进程与保活验证
 
-日期：2026-10-06。status=complete。N7、V6 成立，采用独立 transient service；默认测试不制造 OOM，真实 OOM 仅保留为 ignored 手动测试。owner_checklist 为空。
+日期：2026-10-07。状态：看守实现、N7 和溢出策略已验证；V6 容量定值待验。采用独立 transient service；默认测试不制造 OOM，真实 OOM 仅为 ignored 手动测试。
 
 ## 基线和复验
 
@@ -72,13 +72,21 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
 
 ## V6：真实 Workflow 的流水大小与增量占比
 
-**已实测，保留 64 MiB 软限、256 MiB 硬限，不改变溢出策略。** `v6_real_workflow_records_versioned_fixture_and_measures_stream_share` 让真 CLI 执行六个顺序 Workflow 子代理，每个由本地端点发送 2048 个 SSE 文本增量，间隔配置为 5 ms。模型路由按本版本实际 `sonnet → claude-sonnet-5-5`，观察到六个真实 agent id 的 HTTP 请求和 Workflow 成功完成通知。
+**V6 容量结论待验。** 64 MiB 软限、256 MiB 硬限是当前暂定配置，下面只记录离线流程样本；主对话仅两个 delta，不能据其占比推定长 Workflow 的容量。 `v6_real_workflow_records_versioned_fixture_and_measures_stream_share` 让真 CLI 执行六个顺序 Workflow 子代理，每个由本地端点发送 2048 个 SSE 文本增量，间隔配置为 5 ms。模型路由按本版本实际 `sonnet → claude-sonnet-5-5`，观察到六个真实 agent id 的 HTTP 请求和 Workflow 成功完成通知。
 
 最终运行耗时 **75.31 秒**，stdout **35 行 / 50,789 B**；其中 stream_event **12 行 / 3,379 B**，占行数 **34.29%**、原始 stdout 字节 **6.65%**。带看守信封和两条输入后的保留流水 **57,964 B**，溢出 0 B、LostLines=false。CLI 的子代理模型 SSE 并不全部出现在主 stdout；测量以真实看守读到的行为为准，不能用伪模型发出的 12,288 个增量冒充流水行数。
 
-这是一条约 75 秒、六个子代理的离线长 Workflow 样本，不是数小时真服务压测。样本远低于默认软限，当前阈值无需降低；未来版本或实际任务体积增长仍按相同的软限丢增量、硬限转存、真损失 Unknown 规则处理。另有明确的低阈值场景覆盖所有溢出分支。
+这是一条约 75 秒、六个子代理的离线长 Workflow 样本，不是数小时真服务压测。样本远低于默认软限，不能支持保留或调整容量阈值的结论；64/256 MiB 继续作为待测的暂定配置。实际任务体积增长时仍按软限丢增量、硬限转存、真损失 Unknown 的规则处理。另有明确的低阈值场景覆盖所有溢出分支。
 
 当前仓库夹具是同一脚本另一次约 75 秒运行的完整录制范围（从 initialize 到 Workflow 完成，CLI 此时仍活着），含 36 条看守记录。文件：`crates/nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl`；SHA-256 `8045853deb421e3a4685143150bbc401d1166fd75056bbb89289b148f629d09c`。首行的 count/first_seq/last_seq 可检出末尾整行缺失，连续性检查可检出中间漏行；默认纯回归验证六个子代理完成。最终场景生成的另一个原始录制和统计在日志根目录的 `v6-workflow.jsonl`、`v6-stats.json`。
+
+### 审查后的离线流式补测（2026-10-07）
+
+当前场景让主对话每 4 字符、2 ms 输出一个 SSE 分块，六个顺序 Workflow 子代理各先调用真实 Read 工具，再按每 16 字符、5 ms 输出 4096 块文本。断言依据看守收到的主对话文本增量和 CLI 后续请求中的实际文件内容；不把端点发送数量当作 stdout 数量。原场景在新增断言下只有 1 个已录主对话增量，红测成立。
+
+补测约 **150.33 秒**：看守 stdout **4642 行 / 1,202,625 B**，其中 stream_event **4619 行 / 1,114,677 B**（行数 **99.50%**、字节 **92.69%**）；主对话文本 delta **4608**，六个子代理均回读到真实工具结果；保留 **1,722,413 B**，溢出 0，LostLines=false。此样本包含工具调用和持续流式正文，仍受所列离线分块参数影响，不用于关闭代表性真负载下的容量定值。
+
+原始流水、统计与分块条件保留在 `/mnt/wd_external/nd-build/tmp/review-fixes-p22-stream-evidence/` 的 `v6-workflow.jsonl`、`v6-stats.json`、`v6-measurement.json`；红、绿日志分别为同级 `review-fixes-p22-stream-red.log`、`review-fixes-p22-stream-green.log`。仓库中上述旧夹具仍是原始录制；不重写其历史数字或哈希。
 
 ## 其余行为与证明边界
 
@@ -97,4 +105,10 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
 
 测试使用规格已确认的接缝：真 daemon/SyncReplica 的身份和 Unknown 观察、真实托管和看守协议、真实 systemd，以及实际模型 HTTP 请求；高吞吐用普通真实进程，未实现假 CLI/看守。TDD 红测日志为日志根目录的 `red-01/02/03/05/06/07/08/10/11.log`，另有对应 green 和最终场景日志；验证既有行为的增补场景直接通过，不冒称它们曾红测。首次身份检查、阻塞输入结束、并发幂等和完整末行截断回归均曾暴露真实失败并已修复。
 
-本单暴露供 #12 使用的 Up/Gone/IdentityMismatch 观察，供 #11/#13/#19 使用的连接、序号、ack 和 LostLines 信息。任务账本、会话折叠、mod 就绪、退役和转接的最终语义尚属对应工单；不能把这里的 `tail=Unknown` 或录制通过当作那些业务已实现。没有新会话结构/派发命令，没有 CLI 原生存储写入例外，没有需要 owner 才能完成的本单验收。
+本单暴露供 #12 使用的 Up/Gone/IdentityMismatch 观察，供 #11/#13/#19 使用的连接、序号、ack 和 LostLines 信息。任务账本、会话折叠、mod 就绪、退役和转接的最终语义尚属对应工单；不能把这里的 `tail=Unknown` 或录制通过当作那些业务已实现。没有新会话结构/派发命令，没有 CLI 原生存储写入例外。V6 的长时真实负载待验步骤见本机 `research/impl/review/OWNER-CHECKLIST.md` 的 V6 节。
+
+## V6 待验
+
+重新定值需记录长 Workflow 的真实看守 stdout 行数/字节、stream_event 占比、保留与溢出峰值，并包含后台工具调用。端点 SSE 数不能替代看守实际流水；现有离线样本不关闭 V6。真实服务测量由 owner 在隔离实例中另行授权，不进默认套件，也不制造 OOM。
+
+#6 在 V6 的测量证据与阈值依据齐全前不能关单。N7、溢出策略与离线 Workflow 回归通过只关闭各自的验证项；owner 清单的工单汇总与 V6 节均按这一条件验收。

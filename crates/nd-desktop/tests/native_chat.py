@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from PIL import Image
@@ -26,7 +25,7 @@ def inner():
         theme_file = theme_dir / 'ocean.json'
         theme_source = Path('/sandbox/ocean.json').read_text()
         theme_file.write_text(theme_source)
-        Path('/sandbox/state/ui.json').write_text(json.dumps({'theme_selection': {'kind': 'file', 'file': 'ocean.json'}}))
+        Path('/sandbox/state/ui.json').write_text(json.dumps({'theme_selection': {'kind': 'file', 'file': 'ocean.json'}, **({'window': {'width': 1100, 'height': 1300}} if not settings.get('history') and not settings.get('session_settings') else {})}))
     app = None
     handles = []
     apps = []
@@ -242,7 +241,17 @@ def inner():
             wait('draft-reopened', lambda s: s['text'] == '可找回的落败稿' and s['saved'])
             app.terminate()
             app.wait(timeout=5)
-            app = start('draft-send', draft={'text': '原生发送清稿', 'send': True}, device='b')
+            if settings.get('daemon_outage'):
+                app = start('draft-send', draft={'text': '原生发送清稿',
+                            'edit_gate': '/sandbox/out/edit-during-outage', 'send_when_saved': True}, device='b')
+                wait('draft-send', lambda s: s['text'] == '可找回的落败稿' and s['saved'])
+                (out / 'stop-daemon').touch()
+                settings['watch'] = 'rendered_notice'
+                wait('draft-send', lambda s: '草稿保存未确认' in (s.get('warning') or ''))
+                settings.pop('watch')
+                (out / 'start-daemon').touch()
+            else:
+                app = start('draft-send', draft={'text': '原生发送清稿', 'send': True}, device='b')
             # 输入、保存和受理可能在一次绘制前完成；不要求中间正文单独占一帧。
             # 首帧未加载时 saved=false，已加载的原稿非空，因此这个空稿只能来自受理清稿。
             wait('draft-send', lambda s: s['text'] == '' and s['saved'], timeout=10)
@@ -266,7 +275,7 @@ def inner():
             draft_reply = subprocess.run(['/ndctl', '--socket', socket, 'command', json.dumps(command)], capture_output=True, text=True)
             assert draft_reply.returncode == 0, draft_reply.stderr
             assert json.loads(draft_reply.stdout)['receipt']['status'] == 'done', draft_reply.stdout
-            theme_file.write_text(theme_source.replace('#123456ff', '#26384aff').replace('"body": 18', '"body": 20'))
+            theme_file.write_text(theme_source.replace('#123456ff', '#26384aff').replace('#88eeccff', '#eec188ff').replace('#173f5fff', '#3d293fff').replace('"body": 18', '"body": 20'))
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
                 events = [json.loads(line) for line in (out / 'creating.jsonl').read_text().splitlines()]
@@ -279,12 +288,31 @@ def inner():
             else:
                 raise AssertionError('live theme or draft did not update')
             screenshot('streaming-custom-theme')
+            with Image.open(out / 'streaming-custom-theme.png') as image:
+                body = image.convert('RGB').crop((440, 695, 577, 733))
+                colors = body.get_flattened_data()
+                assert sum(c == (238, 193, 136) for c in colors) > 40, 'Markdown link must use the file theme accent'
+                inline = image.convert('RGB').crop((605, 704, 710, 725))
+                assert sum(c == (38, 56, 74) for c in inline.get_flattened_data()) > 500, 'inline code must use the file theme background'
+                head = image.convert('RGB').crop((500, 754, 1125, 790))
+                assert sum(c == (38, 56, 74) for c in head.get_flattened_data()) > 15000, 'table header must use the file theme background'
+                assert sum(c == (240, 248, 255) for c in head.get_flattened_data()) > 40, 'table header text must use the file theme foreground' 
             after = json.loads(subprocess.check_output(['/ndctl', '--socket', socket, 'get', partial['stream']]))
             before_process = next(i['data']['process'] for i in before['items'] if i['id'] == 'header')
             after_process = next(i['data']['process'] for i in after['items'] if i['id'] == 'header')
             assert before_process['run'] == after_process['run']
             assert before_process['backend_session'] == after_process['backend_session']
             assert next(i['data']['text'] for i in after['items'] if i['id'] == 'draft') == '主题切换保留的草稿'
+            assert block(after)['data']['complete'] is False
+            (out / 'release-stream').touch()
+            finished = wait('creating', lambda s: block(s) is not None and block(s)['data']['complete'] is True)
+            (out / 'result.json').write_text(json.dumps({'pass': True,
+                'session': finished['stream'].removeprefix('session/'),
+                'checks': ['streaming theme reload preserves process and draft',
+                           'Markdown link, inline code and table header use file colors']}, ensure_ascii=False))
+            return
+        at_kill = json.loads(subprocess.check_output(['/ndctl', '--socket', socket, 'get', partial['stream']]))
+        assert block(at_kill)['data']['complete'] is False, 'kill must happen before the end frame'
         app.kill()
         assert app.wait(timeout=5) == -9
         app = start('reopened')
@@ -292,6 +320,8 @@ def inner():
         assert cold['stream'] == partial['stream']
         assert block(cold)['id'] == block(partial)['id']
         assert block(cold)['data']['text'].startswith(block(partial)['data']['text'])
+        assert block(cold)['data']['complete'] is False, 'cold reopen must still see a partial block'
+        (out / 'release-stream').touch()
         finished = wait('reopened', lambda s: block(s) is not None and block(s)['data']['complete'] is True)
         assert len([i for i in finished['items'] if i['id'] == block(partial)['id']]) == 1
         screenshot('dark')
@@ -334,56 +364,32 @@ def inner():
 
 
 def run(args, script=None):
-    themes = getattr(args, "themes", False)
-    invoke = getattr(args, "invoke", None)
-    expect = getattr(args, "expect", None)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'nd-testkit/python'))
+    from isolation import Sandbox
+    themes = getattr(args, 'themes', False)
+    invoke = getattr(args, 'invoke', None)
+    expect = getattr(args, 'expect', None)
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix='nd-test-chat-'))
-    unit = f'nd-test-chat-{uuid.uuid4().hex}.service'
-    slice_name = f'nd-test-chat{uuid.uuid4().hex}.slice'
     socket = Path(args.socket).resolve()
-    try:
-        for name in ['home', 'claude', 'config', 'data', 'state', 'cache', 'runtime']:
-            (work / name).mkdir(mode=0o700)
-        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings and not invoke, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'themes': themes, 'invoke': invoke, 'expect': expect}, ensure_ascii=False))
+    with Sandbox('chat', output=out) as box:
+        work = box.root
+        (work / 'plan.json').write_text(json.dumps({'socket': str(socket), 'session_settings': args.settings, 'drafts': args.session is not None and not args.history and not args.settings and not invoke, 'session': args.session, 'history': args.history, 'round': args.round, 'text': args.text, 'rounds': args.rounds, 'attachments': args.attachments, 'themes': themes, 'invoke': invoke, 'expect': expect, 'daemon_outage': getattr(args, 'daemon_outage', False)}, ensure_ascii=False))
         if themes:
             shutil.copy(Path(__file__).parents[2] / 'nd-view-model/tests/fixtures/ocean.json', work / 'ocean.json')
         if args.attachments:
             shutil.copy(Path(__file__).resolve().parents[2] / 'nd-daemon/tests/fixtures/preview.png', work / 'pixel.png')
             (work / 'pasted.txt').write_text('复制文件里的中文正文')
             (work / 'dropped.txt').write_text('拖入文件里的独立正文')
-        (work / 'dbus.conf').write_text('<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen><policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/></policy></busconfig>')
-        (work / 'session.sh').write_text('#!/bin/sh\nexec /usr/bin/python /scenario.py --inner\n')
-        (work / 'session.sh').chmod(0o700)
-        subprocess.run(['systemctl', '--user', 'set-property', '--runtime', slice_name, 'MemoryMax=2G', 'MemorySwapMax=0'], check=True)
-        command = ['systemd-run', '--user', '--quiet', '--wait', '--pipe', '--collect', '--unit', unit, '--slice', slice_name,
-                   '-p', 'MemoryMax=2G', '-p', 'MemorySwapMax=0', '-p', 'LimitCORE=0',
-                   'bwrap', '--unshare-net', '--die-with-parent', '--new-session', '--ro-bind', '/usr', '/usr', '--ro-bind', '/etc', '/etc',
-                   '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib', '/lib64', '--proc', '/proc',
-                   '--ro-bind', '/sys', '/sys', '--dev', '/dev', '--dev-bind', '/dev/dri', '/dev/dri', '--tmpfs', '/tmp',
-                   '--bind', str(work), '/sandbox', '--bind', str(out), '/sandbox/out', '--ro-bind', str(socket.parent), str(socket.parent),
-                   '--ro-bind', str(Path(script or __file__).resolve()), '/scenario.py', '--ro-bind', str(Path(args.desktop).resolve()), '/nd-desktop',
-                   '--ro-bind', str(Path(args.desktop).resolve().parent / 'ndctl'), '/ndctl', '--clearenv']
-        for key, value in {'PATH': '/usr/bin', 'HOME': '/sandbox/home', 'CLAUDE_CONFIG_DIR': '/sandbox/claude',
-                           'XDG_RUNTIME_DIR': '/sandbox/runtime', 'XDG_CONFIG_HOME': '/sandbox/config', 'XDG_DATA_HOME': '/sandbox/data',
-                           'XDG_STATE_HOME': '/sandbox/state', 'XDG_CACHE_HOME': '/sandbox/cache', 'XDG_CURRENT_DESKTOP': 'KDE',
-                           'QT_QPA_PLATFORM': 'offscreen', 'LANG': 'C.UTF-8'}.items():
-            command += ['--setenv', key, value]
-        command += ['dbus-run-session', '--config-file', '/sandbox/dbus.conf', '--', 'kwin_wayland', '--virtual', '--socket', 'nd-test-chat',
-                    '--width', '1400', '--height', '900', '--no-lockscreen', '--no-global-shortcuts', '--no-kactivities', '--exit-with-session', '/sandbox/session.sh']
+        bindings = [(socket.parent, str(socket.parent)), (Path(args.desktop).resolve(), '/nd-desktop'),
+                    (Path(args.desktop).resolve().parent / 'ndctl', '/ndctl')]
+        command = box.native(script or __file__, bindings=bindings,
+            height=1500 if themes and not args.history and not args.settings else 900)
         with (out / 'kwin.log').open('w') as log:
             result = subprocess.run(command, stdout=log, stderr=log, timeout=100)
         assert result.returncode == 0, (out / 'kwin.log').read_text()[-6000:]
         assert json.loads((out / 'result.json').read_text())['pass']
         print(f'PASS native chat: {out}')
-    finally:
-        for action, name in [('stop', unit), ('stop', slice_name), ('reset-failed', unit), ('revert', slice_name)]:
-            subprocess.run(['systemctl', '--user', action, name], capture_output=True)
-        shutil.rmtree(work)
-        remaining = subprocess.check_output(['systemctl', '--user', 'list-units', unit, slice_name, '--no-legend', '--plain'], text=True).strip()
-        (out / 'cleanup.json').write_text(json.dumps({'unit': unit, 'slice': slice_name, 'remaining': remaining, 'temporary_root_removed': not work.exists()}, indent=2))
-        assert not remaining, remaining
 
 
 if __name__ == '__main__':
@@ -391,6 +397,7 @@ if __name__ == '__main__':
         inner()
     else:
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument('--daemon-outage', action='store_true', help='coordinate daemon outage through files in the output directory')
         parser.add_argument('--desktop', required=True)
         parser.add_argument('--socket', required=True)
         parser.add_argument('--output', required=True)

@@ -57,7 +57,7 @@ fn conversation_renders_fenced_and_edit_tool_diffs_without_losing_surrounding_te
     assert!(lines.iter().any(|l| l.text == "-旧"));
     assert!(lines.iter().any(|l| l.text == "+新"));
     assert!(
-        lines
+        !lines
             .iter()
             .any(|l| l.text == "\\ No newline at end of file")
     );
@@ -66,4 +66,38 @@ fn conversation_renders_fenced_and_edit_tool_diffs_without_losing_surrounding_te
         message_blocks("text", literal, &json!(null)),
         vec![MessageBlock::Markdown(literal.into())]
     );
+}
+
+#[test]
+fn empty_context_lines_advance_both_sides_and_close_the_hunk_before_the_next_file() {
+    let rows = unified_diff(
+        "@@ -1,4 +1,4 @@\n a\n\n-b\n+c\n d\n--- a/next\n+++ b/next\n@@ -8 +9 @@\n-x\n+y",
+    );
+    assert_eq!(
+        (rows[2].kind, rows[2].old, rows[2].new),
+        (DiffKind::Context, Some(2), Some(2))
+    );
+    assert_eq!(rows[3].old, Some(3));
+    assert_eq!(rows[4].new, Some(3));
+    assert_eq!((rows[5].old, rows[5].new), (Some(4), Some(4)));
+    assert_eq!(rows[6].kind, DiffKind::Header);
+    assert_eq!(rows[7].kind, DiffKind::Header);
+    assert_eq!(rows[9].old, Some(8));
+    assert_eq!(rows[10].new, Some(9));
+}
+
+#[test]
+fn informal_diff_lines_keep_added_and_removed_colors_without_invented_line_numbers() {
+    for text in [
+        "- old\n+ new",
+        "@@ fn main @@\n- old\n+ new",
+        "@@ -1 +1 @@\n-a\n+b\n- old\n+ new",
+    ] {
+        let rows = unified_diff(text);
+        for (line, kind) in [("- old", DiffKind::Removed), ("+ new", DiffKind::Added)] {
+            let row = rows.iter().find(|row| row.text == line).unwrap();
+            assert_eq!(row.kind, kind);
+            assert_eq!((row.old, row.new), (None, None));
+        }
+    }
 }

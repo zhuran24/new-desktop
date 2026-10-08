@@ -172,6 +172,11 @@ fn invocation_view(i: &nd_wire::Item) -> Option<(String, String, String, String)
                 Some(code) => format!("退出码 {code}"),
                 None => "已结束".to_owned(),
             };
+            let done = if i.data["appended"] == false {
+                format!("{done} · 输出没有进对话")
+            } else {
+                done
+            };
             ("! 命令", text, done)
         }
         "compact" => (
@@ -295,6 +300,21 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                         attachments: vec![],
                     };
                 }
+                let text: String = if i.kind == "op" {
+                    i.data["reason"]
+                        .as_str()
+                        .unwrap_or(match i.data["phase"].as_str() {
+                            Some("running") => "进行中",
+                            Some("compensated") => "已撤销",
+                            Some("partial") => "部分完成",
+                            Some("unresolved") => "等待处理",
+                            Some("rejected") => "未受理",
+                            _ => &i.fallback.text,
+                        })
+                } else {
+                    i.data["text"].as_str().unwrap_or(&i.fallback.text)
+                }
+                .into();
                 MessageView {
                     summarize: (i.kind == "prompt" && abilities.summarize)
                         .then(|| i.data["message"].as_str())
@@ -314,57 +334,24 @@ pub fn conversation(snapshot: &Snapshot) -> ConversationView {
                     } else {
                         i.fallback.title.clone()
                     },
-                    text: if i.kind == "op" {
-                        i.data["reason"]
-                            .as_str()
-                            .unwrap_or(match i.data["phase"].as_str() {
-                                Some("running") => "进行中",
-                                Some("compensated") => "已撤销",
-                                Some("partial") => "部分完成",
-                                Some("unresolved") => "等待处理",
-                                Some("rejected") => "未受理",
-                                _ => &i.fallback.text,
-                            })
-                    } else {
-                        i.data["text"].as_str().unwrap_or(&i.fallback.text)
-                    }
-                    .into(),
+                    text: text.clone(),
                     markdown: i.kind == "text",
                     withdraw: (header.is_some_and(|h| h.data["interaction"]["withdraw"] == true)
                         && i.kind == "prompt"
-                        && matches!(
-                            i.data["state"].as_str(),
-                            Some("held" | "waiting" | "pending" | "written" | "queued")
-                        ))
+                        && nd_wire::PromptState::from_value(&i.data["state"]).withdrawable())
                     .then(|| i.data["message"].as_str().map(str::to_owned))
                     .flatten(),
                     detail: i.data["reason"].as_str().unwrap_or_default().into(),
-                    resend: (i.kind == "prompt" && i.data["state"] == "not_delivered")
+                    resend: (i.kind == "prompt"
+                        && nd_wire::PromptState::from_value(&i.data["state"])
+                            == nd_wire::PromptState::NotDelivered)
                         .then(|| i.data["message"].as_str().map(str::to_owned))
                         .flatten(),
-                    blocks: crate::message_blocks(
-                        &i.kind,
-                        i.data["text"].as_str().unwrap_or(&i.fallback.text),
-                        &i.data["raw"],
-                    ),
+                    blocks: crate::message_blocks(&i.kind, &text, &i.data["raw"]),
                     attachments: serde_json::from_value(i.data["attachments"].clone())
                         .unwrap_or_default(),
                     status: if i.kind == "prompt" {
-                        match i.data["state"].as_str() {
-                            Some("held") => "代持中",
-                            Some("waiting") => "等待可写",
-                            Some("pending") => "等待写出",
-                            Some("written") => "已写出",
-                            Some("queued") => "排队中",
-                            Some("withdrawing") => "撤回中",
-                            Some("withdrawn") => "已撤回",
-                            Some("landed") => "已送达",
-                            Some("failed") => "发送失败",
-                            Some("unknown") => "交付不明",
-                            Some("not_delivered") => "未送达",
-                            Some("resent") => "已重发",
-                            _ => "",
-                        }
+                        nd_wire::PromptState::from_value(&i.data["state"]).label()
                     } else if i.data["complete"] == false {
                         "生成中"
                     } else {
@@ -453,10 +440,20 @@ impl Draft {
         self.send_unconfirmed = true;
     }
     pub fn retry_save(&mut self) {
+        if self.save_unconfirmed {
+            self.save_rejected();
+        }
         if self.send_unconfirmed {
             self.send_unconfirmed = false;
             self.dirty = true;
         }
+    }
+    /// A final rejection or missing receipt ends this attempt, not the local edit.
+    /// Retain the original version so a late old save causes a conflict copy.
+    pub fn save_rejected(&mut self) {
+        self.pending = None;
+        self.save_unconfirmed = false;
+        self.dirty = true;
     }
     /// 只读副本更新不能盖掉本地未持久化的编辑或组词。
     pub fn observe(&mut self, remote: nd_wire::Draft, composing: bool) {

@@ -477,7 +477,13 @@ async fn summarize_from_here_compacts_only_the_selected_range_and_returns_the_pr
     fx.turn(&session, "答一").await;
     fx.round(&session, "from-2", "重复的提示", "答二").await;
     fx.round(&session, "from-3", "第三条", "答三").await;
-    let ready = fx.round(&session, "from-4", "重复的提示", "答四").await;
+    // Same row text, different attachments: the hook cannot distinguish image bytes.
+    let bytes = include_bytes!("fixtures/preview.png");
+    let blob = fx.ui().await.put_blob(bytes).await.unwrap();
+    endpoint.enqueue(fx.main(), ModelReply::text("答四"));
+    fx.command("from-4", "session.send", json!({"session":session,"text":"重复的提示",
+        "attachments":[{"blob":blob,"media_type":"image/png","name":"picture.png","size":bytes.len()}]}), json!({})).await;
+    let ready = fx.turn(&session, "答四").await;
     // 选第二次出现的「重复的提示」：同一原文按次序定位。
     let chosen = prompt_id(&ready, "重复的提示", 1);
     assert_eq!(chosen, "from-4");
@@ -627,7 +633,27 @@ async fn a_prompt_the_cli_no_longer_holds_is_not_compacted_and_the_reason_is_sho
         header(s)["process"]["turn_running"] == false
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let run = header(&first)["process"]["run"].as_str().unwrap();
+    let recording = fx.root().join(format!("recordings/{run}.jsonl"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let complete = std::fs::read_to_string(&recording)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<nd_watchdog_proto::Record>(line).ok())
+                .any(|record| match record.event {
+                    nd_watchdog_proto::Event::Out { line } => serde_json::from_str::<Value>(&line)
+                        .is_ok_and(|v| v["type"] == "system" && v["subtype"] == "compact_boundary"),
+                    _ => false,
+                });
+            if complete {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real compact boundary must be observed before selecting an old anchor");
     let before = endpoint.requests().len();
     let draft_before = draft(&fx.peek(&session).await).clone();
     let reply = fx
@@ -815,7 +841,7 @@ async fn a_bang_running_across_a_daemon_restart_settles_once_from_the_mod_result
     fx.turn(&session, "在").await;
     let mut fifo = fx.scenario.fifo("hold").unwrap();
     let command = format!(
-        "head -n 1 {} && echo AFTER_RESTART >> /sandbox/project/ran.log",
+        "echo BANG_STARTED > /sandbox/project/started.log; head -n 1 {} && echo AFTER_RESTART >> /sandbox/project/ran.log",
         fifo.sandbox_path().display()
     );
     let ui_command = Command {
@@ -835,7 +861,19 @@ async fn a_bang_running_across_a_daemon_restart_settles_once_from_the_mod_result
             item(s, "invoke/br-1").is_some_and(|i| i.data["state"] == "running")
         })
         .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // running 只证明请求已写给 mod；等真实 Bash 的外部效果再杀守护进程。
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if std::fs::read_to_string(fx.root().join("project/started.log"))
+                .is_ok_and(|text| text == "BANG_STARTED\n")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the real Bash must start before the daemon restarts");
     fx.scenario.kill_daemon().unwrap();
     assert_ne!(
         fx.peek(&session).await.epoch,

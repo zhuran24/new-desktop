@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 nd-store.workspace = true
 nd-watchdog-proto.workspace = true
-nd-runs.workspace = true
 nd-claude-records.workspace = true
 serde.workspace = true
 serde_json.workspace = true

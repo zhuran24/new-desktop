@@ -8,6 +8,41 @@ fn options(name: &str) -> ScenarioOptions {
     options
 }
 
+async fn records_until(
+    link: &mut nd_runs::WatchLink,
+    after: u64,
+    until: impl Fn(&[nd_watchdog_proto::Record]) -> bool,
+) -> Vec<nd_watchdog_proto::Record> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = link.read(after, 1000).await.unwrap();
+            if until(&rows) {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watchdog output condition must become observable")
+}
+async fn input_recorded(runs: &nd_runs::Watchdogs, run: &str) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runs
+                .records(run, 0, 100)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r.event, nd_watchdog_proto::Event::In { in_seq: 1, .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("input must reach the real pipe writer");
+}
+
 #[tokio::test]
 async fn daemon_restart_preserves_backend_identity_and_numbered_io() {
     let scenario = Scenario::start(options("watchdog")).await.unwrap();
@@ -18,8 +53,11 @@ async fn daemon_restart_preserves_backend_identity_and_numbered_io() {
     let mut link = runs.link("echo").await.unwrap();
     link.write(1, "hello").await.unwrap();
     link.write(1, "hello").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let before = link.read(0, 100).await.unwrap();
+    let before = records_until(&mut link, 0, |rows| {
+        rows.iter()
+            .any(|r| matches!(&r.event, nd_watchdog_proto::Event::Out { line } if line == "hello"))
+    })
+    .await;
     assert_eq!(
         before
             .iter()
@@ -38,16 +76,12 @@ async fn daemon_restart_preserves_backend_identity_and_numbered_io() {
     let mut link = runs.link("echo").await.unwrap();
     assert_eq!(link.read(0, 100).await.unwrap(), before);
     link.write(2, "still here").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        link.read(before.last().unwrap().end_seq, 100)
-            .await
-            .unwrap()
-            .iter()
-            .any(
-                |r| matches!(&r.event, nd_watchdog_proto::Event::Out{line} if line == "still here")
-            )
-    );
+    records_until(&mut link, before.last().unwrap().end_seq, |rows| {
+        rows.iter().any(
+            |r| matches!(&r.event, nd_watchdog_proto::Event::Out { line } if line == "still here"),
+        )
+    })
+    .await;
     scenario.close().unwrap();
 }
 
@@ -75,8 +109,11 @@ async fn soft_limit_marks_only_deltas_and_hard_limit_preserves_facts_in_overflow
         .await
         .unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let rows = link.read(0, 100).await.unwrap();
+    let rows = records_until(&mut link, 0, |rows| {
+        rows.iter()
+            .any(|r| matches!(&r.event, Event::Out { line } if line.contains("complete")))
+    })
+    .await;
     assert!(rows.iter().any(|r| matches!(
         r.event,
         Event::Gap {
@@ -123,8 +160,17 @@ async fn storage_failure_reports_lost_lines_and_never_claims_a_clean_tail() {
     let runs = scenario.watchdogs().unwrap();
     runs.launch("lost", spec).await.unwrap();
     let mut link = runs.link("lost").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let rows = link.read(0, 100).await.unwrap();
+    let rows = records_until(&mut link, 0, |rows| {
+        rows.iter().any(|r| {
+            matches!(
+                r.event,
+                Event::Gap {
+                    reason: GapReason::LostLines
+                }
+            )
+        })
+    })
+    .await;
     assert!(rows.iter().any(|r| matches!(
         r.event,
         Event::Gap {
@@ -142,14 +188,20 @@ async fn storage_failure_reports_lost_lines_and_never_claims_a_clean_tail() {
 async fn backend_exit_cleans_descendants_even_without_daemon_and_watchdog_never_restarts() {
     let scenario = Scenario::start(options("exit-cleanup")).await.unwrap();
     let script = "import subprocess,sys,os\np=subprocess.Popen(['sleep','60'])\nprint(p.pid,flush=True)\nsys.stdin.readline()\nos._exit(7)";
-    let spec = scenario
+    let mut spec = scenario
         .watchdog_spec("exit", "/usr/bin/python3", &["-u", "-c", script])
         .unwrap();
+    spec.limits.soft_bytes = 0;
+    spec.limits.hard_bytes = 0;
+    let overflow = spec.limits.overflow.clone();
     let runs = scenario.watchdogs().unwrap();
     let launch = runs.launch("exit", spec.clone()).await.unwrap();
     let mut link = runs.link("exit").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let rows = link.read(0, 100).await.unwrap();
+    let rows = records_until(&mut link, 0, |rows| {
+        rows.iter()
+            .any(|r| matches!(r.event, nd_watchdog_proto::Event::Out { .. }))
+    })
+    .await;
     let descendant = rows
         .iter()
         .find_map(|r| match &r.event {
@@ -170,13 +222,33 @@ async fn backend_exit_cleans_descendants_even_without_daemon_and_watchdog_never_
     .unwrap();
     assert!(runs.launch("exit", spec).await.is_err());
     let found = runs.recover().await.unwrap();
-    assert_eq!(found[0].state, "Gone");
+    assert!(found[0].state.is_gone());
     assert_eq!(found[0].exit, Some(7));
     assert!(
         runs.records("exit", 0, 100)
             .unwrap()
             .iter()
             .any(|r| matches!(r.event, nd_watchdog_proto::Event::Exit { code: 7 }))
+    );
+    assert_eq!(
+        runs.collect_unused(|| Ok(std::collections::BTreeSet::from(["exit".to_owned()])))
+            .unwrap(),
+        0,
+        "a committed reference keeps the unread tail"
+    );
+    assert!(runs.directory("exit").unwrap().exists());
+    assert_eq!(runs.collect_unused(|| Ok(Default::default())).unwrap(), 1);
+    assert!(!runs.directory("exit").unwrap().exists());
+    assert!(!overflow.exists());
+    assert_eq!(
+        runs.inspect().unwrap()[0].exit,
+        Some(7),
+        "compact tombstone preserves the exit"
+    );
+    let spec = scenario.watchdog_spec("exit", "/usr/bin/cat", &[]).unwrap();
+    assert!(
+        runs.launch("exit", spec).await.is_err(),
+        "collection must not allow launch replay"
     );
     scenario.close().unwrap();
 }
@@ -297,6 +369,11 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
     use nd_watchdog_proto::{Event, FixtureMeta};
     let scenario = Scenario::start(options("v6-workflow")).await.unwrap();
     let main = Route::new(None, "claude-haiku-4-5");
+    std::fs::write(
+        scenario.root().join("project/volume-input.txt"),
+        "VOLUME_TOOL_OBSERVED\n".repeat(128),
+    )
+    .unwrap();
     let script = "export const meta = {name:'watchdog-volume',description:'Offline sequential workflow volume probe'}; for (let i=0;i<6;i++) { await agent('offline volume sample '+i, {model:'sonnet',label:'volume-'+i}); } return {completed:6};";
     scenario.endpoint().enqueue(
         main.clone(),
@@ -307,14 +384,23 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
         ),
     );
     for _ in 0..4 {
-        scenario
-            .endpoint()
-            .enqueue(main.clone(), ModelReply::text("WORKFLOW_OBSERVED"));
+        scenario.endpoint().enqueue(
+            main.clone(),
+            ModelReply::streaming_text("WORKFLOW_OBSERVED\n".repeat(1024), 4, 2),
+        );
     }
-    for _ in 0..6 {
+    for i in 0..6 {
         scenario.endpoint().enqueue_any_agent(
             "claude-sonnet-5-5",
-            ModelReply::streaming_text("0123456789abcdef".repeat(2048), 16, 5),
+            ModelReply::tool(
+                &format!("volume_read_{i}"),
+                "Read",
+                serde_json::json!({"file_path":"/sandbox/project/volume-input.txt"}),
+            ),
+        );
+        scenario.endpoint().enqueue_any_agent(
+            "claude-sonnet-5-5",
+            ModelReply::streaming_text("0123456789abcdef".repeat(4096), 16, 5),
         );
     }
     let spec = scenario.claude_watchdog_spec("workflow").unwrap();
@@ -327,7 +413,7 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
     let mut cursor = 0;
     let mut recorded = vec![];
     let mut completed = false;
-    while began.elapsed() < Duration::from_secs(120) {
+    while began.elapsed() < Duration::from_secs(240) {
         let rows = link.read(cursor, 1000).await.unwrap();
         for row in &rows {
             if let Event::Out { line } = &row.event
@@ -359,14 +445,41 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
     );
     let stats = link.stats().await.unwrap();
     eprintln!("V6 measured elapsed={:?}; stats={stats:?}", began.elapsed());
+    let main_deltas = recorded
+        .iter()
+        .filter_map(|row| match &row.event {
+            Event::Out { line } => serde_json::from_str::<serde_json::Value>(line).ok(),
+            _ => None,
+        })
+        .filter(|v| {
+            v["type"] == "stream_event"
+                && v["parent_tool_use_id"].is_null()
+                && v["event"]["type"] == "content_block_delta"
+                && v["event"]["delta"]["type"] == "text_delta"
+        })
+        .count();
+    assert!(
+        main_deltas >= 1000,
+        "volume sample must include sustained main-conversation streaming, got {main_deltas} deltas"
+    );
+    let requests = scenario.endpoint().requests();
+    let agents = requests
+        .iter()
+        .filter_map(|r| r.route.agent.as_ref())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(agents.len(), 6);
+    let tool_results = requests
+        .iter()
+        .filter(|r| {
+            r.route.agent.is_some()
+                && r.body["messages"]
+                    .to_string()
+                    .contains("VOLUME_TOOL_OBSERVED")
+        })
+        .count();
     assert_eq!(
-        scenario
-            .endpoint()
-            .requests()
-            .iter()
-            .filter(|r| r.route.agent.is_some())
-            .count(),
-        6
+        tool_results, 6,
+        "all Workflow agents must read the actual file"
     );
     assert!(stats.stdout_lines > 0);
     assert!(stats.stream_lines > 0);
@@ -396,6 +509,23 @@ async fn v6_real_workflow_records_versioned_fixture_and_measures_stream_share() 
             serde_json::to_vec_pretty(&stats).unwrap(),
         )
         .unwrap();
+        std::fs::write(
+            std::path::Path::new(&dest).join("v6-measurement.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "kind": "offline_streaming_sample_not_capacity_validation",
+                "elapsed_seconds": began.elapsed().as_secs_f64(),
+                "main_text_deltas": main_deltas,
+                "workflow_agents": agents.len(),
+                "observed_tool_results": tool_results,
+                "main_chunk_chars": 4,
+                "main_pause_ms": 2,
+                "agent_chunk_chars": 16,
+                "agent_pause_ms": 5,
+                "stats": stats,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
     scenario.close().unwrap();
 }
@@ -415,7 +545,10 @@ async fn live_process_without_its_expected_unit_is_identity_mismatch_not_gone() 
     wrong.unit_prefix.push_str("-absent");
     let wrong = nd_runs::Watchdogs::new(wrong).unwrap();
     assert!(wrong.link("live").await.is_err());
-    assert_eq!(wrong.recover().await.unwrap()[0].state, "IdentityMismatch");
+    assert_eq!(
+        wrong.recover().await.unwrap()[0].state,
+        nd_runs::RunState::IdentityMismatch
+    );
     assert!(launched.identity.alive());
     scenario.close().unwrap();
 }
@@ -439,7 +572,7 @@ async fn new_controller_can_end_a_backend_while_old_input_pipe_is_blocked() {
         .unwrap();
     let mut old = runs.link("blocked").await.unwrap();
     let writing = tokio::spawn(async move { old.write(1, &"x".repeat(1024 * 1024)).await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    input_recorded(&runs, "blocked").await;
     let mut current = runs.link("blocked").await.unwrap();
     tokio::time::timeout(
         Duration::from_millis(500),
@@ -518,7 +651,7 @@ async fn watchdog_death_cleans_backend_and_cannot_replay_the_launch() {
     .await
     .unwrap();
     assert!(runs.launch("dead", spec).await.is_err());
-    assert_eq!(runs.recover().await.unwrap()[0].state, "Gone");
+    assert!(runs.recover().await.unwrap()[0].state.is_gone());
     scenario.close().unwrap();
 }
 
@@ -526,25 +659,28 @@ async fn watchdog_death_cleans_backend_and_cannot_replay_the_launch() {
 async fn cancelled_input_transfer_finishes_once_and_reconnect_deduplicates_its_sequence() {
     let scenario = Scenario::start(options("input-once")).await.unwrap();
     let runs = scenario.watchdogs().unwrap();
-    let spec=scenario.watchdog_spec("once","/usr/bin/python3",&["-u","-c","import time,sys; time.sleep(0.3)\nfor line in sys.stdin: print(len(line.strip()),flush=True)"]).unwrap();
+    let spec=scenario.watchdog_spec("once","/usr/bin/python3",&["-u","-c","import time,sys,pathlib\nwhile not pathlib.Path('/sandbox/read-once').exists(): time.sleep(.01)\nfor line in sys.stdin: print(len(line.strip()),flush=True)"]).unwrap();
     runs.launch("once", spec).await.unwrap();
     let mut old = runs.link("once").await.unwrap();
     let writing = tokio::spawn(async move { old.write(1, &"x".repeat(256 * 1024)).await });
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    input_recorded(&runs, "once").await;
     let mut current = runs.link("once").await.unwrap();
+    std::fs::write(scenario.root().join("read-once"), "").unwrap();
     current.write(1, &"x".repeat(256 * 1024)).await.unwrap();
     current.write(2, "marker").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let output = current
-        .read(0, 100)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|r| match r.event {
-            nd_watchdog_proto::Event::Out { line } => Some(line),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let output = records_until(&mut current, 0, |rows| {
+        rows.iter()
+            .filter(|r| matches!(r.event, nd_watchdog_proto::Event::Out { .. }))
+            .count()
+            >= 2
+    })
+    .await
+    .into_iter()
+    .filter_map(|r| match r.event {
+        nd_watchdog_proto::Event::Out { line } => Some(line),
+        _ => None,
+    })
+    .collect::<Vec<_>>();
     assert_eq!(output, vec!["262144", "6"]);
     let _ = writing.await;
     scenario.close().unwrap();
@@ -574,10 +710,24 @@ async fn failed_backend_spawn_reports_never_launched_with_no_live_identity() {
         .watchdog_spec("missing", "/no-such-backend", &[])
         .unwrap();
     assert!(runs.launch("missing", spec).await.is_err());
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let found = runs.recover().await.unwrap();
-    assert_eq!(found[0].state, "Gone");
-    assert_eq!(found[0].reason.as_deref(), Some("NeverLaunched"));
+    let found = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let found = runs.recover().await.unwrap();
+            if found[0].state.is_gone() {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(found[0].state.is_gone());
+    assert_eq!(
+        found[0].state,
+        nd_runs::RunState::Gone {
+            reason: nd_runs::GoneReason::NeverLaunched
+        }
+    );
     assert!(found[0].identity.is_none());
     scenario.close().unwrap();
 }
@@ -658,4 +808,213 @@ async fn n7_disk_page_cache_reaches_slice_limit_without_any_oom_kill() {
     let disk = scenario.disk_root().unwrap().to_owned();
     scenario.close().unwrap();
     assert!(!disk.exists());
+}
+
+#[tokio::test]
+async fn reconnect_allocates_after_an_input_that_is_still_blocked_in_the_pipe() {
+    use nd_watchdog_proto::Event;
+    let scenario = Scenario::start(options("accepted-input")).await.unwrap();
+    let script = "import pathlib,time,sys\nwhile not pathlib.Path('/sandbox/read-now').exists(): time.sleep(.01)\nfor line in sys.stdin:\n print(line[0]+':'+str(len(line.strip())),flush=True)";
+    let spec = scenario
+        .watchdog_spec("blocked", "/usr/bin/python3", &["-u", "-c", script])
+        .unwrap();
+    let runs = scenario.watchdogs().unwrap();
+    runs.launch("blocked", spec).await.unwrap();
+    let mut old = runs.link("blocked").await.unwrap();
+    let first = tokio::spawn(async move { old.write(1, &"A".repeat(200_000)).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runs
+                .records("blocked", 0, 100)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r.event, Event::In { in_seq: 1, .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut new = runs.link("blocked").await.unwrap();
+    assert_eq!(new.hello.written, 0, "first write is blocked");
+    let accepted = serde_json::to_value(&new.hello).unwrap()["accepted"]
+        .as_u64()
+        .unwrap_or(new.hello.written);
+    assert_eq!(
+        accepted, 1,
+        "reconnected controller must reserve the in-flight input sequence"
+    );
+    std::fs::write(scenario.root().join("read-now"), "").unwrap();
+    new.write(accepted + 1, "B").await.unwrap();
+    let _ = first.await.unwrap();
+    let rows = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = new.read(0, 100).await.unwrap();
+            if rows
+                .iter()
+                .filter(|r| matches!(r.event, Event::Out { .. }))
+                .count()
+                == 2
+            {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let output: Vec<_> = rows
+        .iter()
+        .filter_map(|r| match &r.event {
+            Event::Out { line } => Some(line.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(output, ["A:200000", "B:1"]);
+    scenario.close().unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_gap_extension_preserves_the_entire_previous_gap_range() {
+    use nd_watchdog_proto::{Event, GapReason};
+    let scenario = Scenario::start(options("gap-write-failure")).await.unwrap();
+    let mut config = scenario.watchdog_config().unwrap();
+    // 只对本场景看守忽略 SIGXFSZ，让真实文件限额失败返回 EFBIG；不替换 Journal。
+    config.launcher.extend(["/usr/bin/python3", "-c", "import os,signal,sys; signal.signal(signal.SIGXFSZ,signal.SIG_IGN); os.execv(sys.argv[1],sys.argv[1:])"].map(str::to_owned));
+    let runs = nd_runs::Watchdogs::new(config).unwrap();
+    let script = "import pathlib,time\nfor _ in range(9): print('{\"type\":\"stream_event\"}',flush=True)\nwhile not pathlib.Path('/sandbox/extend-gap').exists(): time.sleep(.01)\nprint('{\"type\":\"stream_event\"}',flush=True)\nwhile not pathlib.Path('/sandbox/recover-gap').exists(): time.sleep(.01)\nprint('recovered',flush=True)\ntime.sleep(60)";
+    let mut spec = scenario
+        .watchdog_spec("gap", "/usr/bin/python3", &["-u", "-c", script])
+        .unwrap();
+    spec.limits.soft_bytes = 0;
+    runs.launch("gap", spec).await.unwrap();
+    let mut link = runs.link("gap").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if link
+                .read(0, 100)
+                .await
+                .unwrap()
+                .last()
+                .is_some_and(|r| r.end_seq == 9)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let path = std::fs::read_dir(runs.directory("gap").unwrap().join("spool"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let size = path.metadata().unwrap().len();
+    let limit = std::process::Command::new("prlimit")
+        .args([
+            "--pid",
+            &link.hello.watchdog.pid.to_string(),
+            &format!("--fsize={size}:unlimited"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        limit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&limit.stderr)
+    );
+    std::fs::write(scenario.root().join("extend-gap"), "").unwrap();
+    let rows = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = link.read(0, 100).await.unwrap();
+            if rows.last().is_some_and(|r| r.end_seq == 10) {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.first().unwrap().seq,
+        1,
+        "failed rewrite must not erase earlier gap coverage: {rows:?}"
+    );
+    assert!(matches!(
+        rows.last().unwrap().event,
+        Event::Gap {
+            reason: GapReason::LostLines
+        }
+    ));
+    let restored = std::process::Command::new("prlimit")
+        .args([
+            "--pid",
+            &link.hello.watchdog.pid.to_string(),
+            "--fsize=unlimited:unlimited",
+        ])
+        .status()
+        .unwrap();
+    assert!(restored.success());
+    std::fs::write(scenario.root().join("recover-gap"), "").unwrap();
+    let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = link.read(0, 100).await.unwrap();
+            if rows.last().is_some_and(|r| r.end_seq == 11) {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!((recovered[0].seq, recovered[0].end_seq), (1, 10));
+    assert!(matches!(&recovered[1].event, Event::Out { line } if line == "recovered"));
+    scenario.close().unwrap();
+}
+
+#[tokio::test]
+async fn collection_cannot_remove_a_run_waiting_for_its_launch_lock() {
+    let scenario = Scenario::start(options("launch-collection")).await.unwrap();
+    let runs = scenario.watchdogs().unwrap();
+    let directory = runs.directory("starting").unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    let lock = std::fs::File::create(directory.join("launch.lock")).unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let spec = scenario
+        .watchdog_spec("starting", "/usr/bin/cat", &[])
+        .unwrap();
+    let launching = {
+        let runs = runs.clone();
+        tokio::spawn(async move { runs.launch("starting", spec).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !launching.is_finished(),
+        "launch is held before spec publication"
+    );
+    let collected = {
+        let runs = runs.clone();
+        tokio::task::spawn_blocking(move || runs.collect_unused(|| Ok(Default::default())))
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    fs2::FileExt::unlock(&lock).unwrap();
+    let launched = launching.await.unwrap();
+    assert_eq!(
+        collected, 0,
+        "an in-flight launch must survive a stale reference snapshot"
+    );
+    assert!(launched.is_ok(), "{launched:?}");
+    runs.link("starting")
+        .await
+        .unwrap()
+        .write(1, "still here")
+        .await
+        .unwrap();
+    scenario.close().unwrap();
 }

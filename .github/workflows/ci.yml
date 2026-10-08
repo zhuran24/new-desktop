@@ -36,11 +36,5 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
-      - name: Check protocol schemas
-        run: |
-          cargo run --locked -p nd-wire --bin nd-wire-schema -- protocol
-          git diff --exit-code -- protocol
-      - name: Check mod protocol and generated TypeScript
-        run: |
-          cargo run --locked -p nd-mod-proto --bin nd-mod-schema -- .
-          git diff --exit-code -- protocol mods
+      - name: Check all schemas and generated mod types
+        run: scripts/check-schemas.sh

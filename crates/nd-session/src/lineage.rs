@@ -10,7 +10,7 @@ pub struct NativePosition {
     pub native: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Turn {
+pub struct Round {
     pub id: String,
     pub messages: Vec<String>,
     pub positions: Vec<NativePosition>,
@@ -29,7 +29,8 @@ pub struct Binding {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Segment {
     pub id: String,
-    pub turns: Vec<String>,
+    #[serde(rename = "turns")]
+    pub rounds: Vec<String>,
     pub bindings: Vec<Binding>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +44,8 @@ pub struct Lineage {
     current: Option<String>,
     origin: Option<ForkOrigin>,
     segments: BTreeMap<String, Segment>,
-    turns: BTreeMap<String, Turn>,
+    #[serde(rename = "turns")]
+    rounds: BTreeMap<String, Round>,
     landings: Vec<Landing>,
     observed: BTreeMap<String, String>,
     edges: Vec<Edge>,
@@ -146,9 +148,15 @@ pub enum Event {
         ticket: Ticket,
         position: NativePosition,
     },
+    /// 进程已退出：该绑定上的进行中轮已结束，不代表成功产出。
+    CarrierExited {
+        carrier: CarrierId,
+        backend_session: BackendSessionId,
+    },
     /// 适配器确认的实际落点；key 是这一原生回合的稳定身份，不是消息或票。
     TurnObserved {
         carrier: CarrierId,
+        backend_session: BackendSessionId,
         key: String,
         natives: Vec<String>,
         complete: bool,
@@ -189,18 +197,18 @@ impl Lineage {
             segment: from.into(),
             through,
         });
-        for id in &source.turns[..n] {
-            child.turns.insert(id.clone(), self.turns[id].clone());
+        for id in &source.rounds[..n] {
+            child.rounds.insert(id.clone(), self.rounds[id].clone());
         }
-        child.segments.get_mut(&target.segment).unwrap().turns = source.turns[..n].to_vec();
+        child.segments.get_mut(&target.segment).unwrap().rounds = source.rounds[..n].to_vec();
         Ok(child)
     }
     pub fn common_prefix_with(&self, a: &str, other: &Self, b: &str) -> Result<Vec<String>, Error> {
         Ok(self
             .segment(a)?
-            .turns
+            .rounds
             .iter()
-            .zip(&other.segment(b)?.turns)
+            .zip(&other.segment(b)?.rounds)
             .take_while(|(a, b)| a == b)
             .map(|(a, _)| a.clone())
             .collect())
@@ -216,19 +224,19 @@ impl Lineage {
     /// 已明确属于非当前段的提示；尚未确认轮归属的提示不在这里。
     pub fn inactive_messages(&self) -> Vec<&str> {
         let current = self.current().and_then(|id| self.segment(id).ok());
-        self.turns
+        self.rounds
             .values()
-            .filter(|turn| current.is_some_and(|s| !s.turns.contains(&turn.id)))
+            .filter(|turn| current.is_some_and(|s| !s.rounds.contains(&turn.id)))
             .flat_map(|turn| turn.messages.iter().map(String::as_str))
             .collect()
     }
 
-    pub fn turns(&self, segment: &str) -> Result<Vec<&Turn>, Error> {
+    pub fn rounds(&self, segment: &str) -> Result<Vec<&Round>, Error> {
         Ok(self
             .segment(segment)?
-            .turns
+            .rounds
             .iter()
-            .map(|id| &self.turns[id])
+            .map(|id| &self.rounds[id])
             .collect())
     }
     pub fn carriers(&self) -> &BTreeMap<CarrierId, KnownCarrier> {
@@ -287,7 +295,7 @@ impl Lineage {
         out
     }
     fn prefix_len(&self, from: &str, through: &Option<String>) -> Result<usize, Error> {
-        let path = &self.segment(from)?.turns;
+        let path = &self.segment(from)?.rounds;
         let n = match through {
             None => 0,
             Some(id) => path
@@ -296,7 +304,7 @@ impl Lineage {
                 .map(|i| i + 1)
                 .ok_or_else(|| Error("截点不在来源段".into()))?,
         };
-        if path[..n].iter().any(|id| !self.turns[id].complete) {
+        if path[..n].iter().any(|id| !self.rounds[id].complete) {
             return Err(Error("不能从进行中的轮分叉".into()));
         }
         Ok(n)
@@ -318,7 +326,7 @@ impl Lineage {
             } => {
                 let value = Segment {
                     id: segment.clone(),
-                    turns: vec![],
+                    rounds: vec![],
                     bindings: vec![Binding {
                         carrier: carrier.clone(),
                         backend_session: backend_session.clone(),
@@ -365,10 +373,15 @@ impl Lineage {
                     }
                     return Err(Error("目标段已存在".into()));
                 }
+                let rebind = *kind == BranchKind::Clear
+                    && self.carriers.get(carrier).is_some_and(|known| {
+                        &known.segment == from && &known.backend_session != backend_session
+                    });
                 if self
                     .segments
                     .values()
                     .any(|s| s.bindings.iter().any(|b| &b.carrier == carrier))
+                    && !rebind
                 {
                     return Err(Error("新段不能复用来源承载位".into()));
                 }
@@ -395,10 +408,24 @@ impl Lineage {
                 });
                 let target = Segment {
                     id: segment.clone(),
-                    turns: source.turns[..count].to_vec(),
+                    rounds: source.rounds[..count].to_vec(),
                     bindings,
                 };
-                self.record_carrier(segment, carrier, backend_session)?;
+                if rebind {
+                    let source = self.segments.get_mut(from).unwrap();
+                    if let Some(binding) = source.bindings.last_mut() {
+                        binding.to = Some(source.rounds.len());
+                    }
+                    self.carriers.insert(
+                        carrier.clone(),
+                        KnownCarrier {
+                            segment: segment.clone(),
+                            backend_session: backend_session.clone(),
+                        },
+                    );
+                } else {
+                    self.record_carrier(segment, carrier, backend_session)?;
+                }
                 self.segments.insert(segment.clone(), target);
                 self.edges.push(Edge {
                     from: from.clone(),
@@ -416,10 +443,10 @@ impl Lineage {
                 backend_session,
             } => {
                 let path = self.segment(segment)?;
-                if path.turns.iter().any(|id| !self.turns[id].complete) {
+                if path.rounds.iter().any(|id| !self.rounds[id].complete) {
                     return Err(Error("回合尚未结束".into()));
                 }
-                let after = path.turns.len();
+                let after = path.rounds.len();
                 self.record_carrier(segment, carrier, backend_session)?;
                 let path = self.segments.get_mut(segment).unwrap();
                 let last = path.bindings.last_mut().unwrap();
@@ -454,7 +481,7 @@ impl Lineage {
                     .filter(|b| &b.segment == segment)
                     .ok_or_else(|| Error("导入目标不在段内".into()))?;
                 for (turn, pos) in positions {
-                    if !path.turns[..n].contains(turn)
+                    if !path.rounds[..n].contains(turn)
                         || &pos.carrier != carrier
                         || pos.backend_session != binding.backend_session
                     {
@@ -463,13 +490,13 @@ impl Lineage {
                 }
                 for (turn, pos) in positions {
                     if self
-                        .turns
+                        .rounds
                         .iter()
                         .any(|(id, t)| id != turn && t.positions.contains(pos))
                     {
                         return Err(Error("原生位置不能对应两个不同的轮".into()));
                     }
-                    let turn = self.turns.get_mut(turn).unwrap();
+                    let turn = self.rounds.get_mut(turn).unwrap();
                     if !turn.positions.contains(pos) {
                         turn.positions.push(pos.clone());
                     }
@@ -532,8 +559,23 @@ impl Lineage {
                     self.landings.push(landing);
                 }
             }
+            Event::CarrierExited {
+                carrier,
+                backend_session,
+            } => {
+                for turn in self.rounds.values_mut().filter(|turn| !turn.complete) {
+                    if turn
+                        .positions
+                        .iter()
+                        .any(|p| &p.carrier == carrier && &p.backend_session == backend_session)
+                    {
+                        turn.complete = true;
+                    }
+                }
+            }
             Event::TurnObserved {
                 carrier,
+                backend_session,
                 key,
                 natives,
                 complete,
@@ -545,7 +587,9 @@ impl Lineage {
                     .find_map(|s| {
                         s.bindings
                             .last()
-                            .filter(|b| &b.carrier == carrier)
+                            .filter(|b| {
+                                &b.carrier == carrier && &b.backend_session == backend_session
+                            })
                             .map(|b| (s.id.clone(), b.clone()))
                     })
                     .ok_or_else(|| Error(format!("未知承载位 {carrier}")))?;
@@ -560,12 +604,28 @@ impl Lineage {
                     })
                     .cloned()
                     .collect();
-                let identity = serde_json::to_string(&(carrier, key)).expect("string tuple");
-                let mut known = self.observed.get(&identity).cloned();
-                for id in &self.segment(&segment)?.turns {
+                let identity =
+                    serde_json::to_string(&(carrier, backend_session, key)).expect("binding tuple");
+                // Old checkpoints keyed observations only by carrier. Reuse an old
+                // round only when its recorded backend session also matches.
+                let legacy = serde_json::to_string(&(carrier, key)).expect("string tuple");
+                let mut known = self
+                    .observed
+                    .get(&identity)
+                    .or_else(|| {
+                        self.observed.get(&legacy).filter(|id| {
+                            self.rounds.get(*id).is_some_and(|t| {
+                                t.positions.iter().any(|p| {
+                                    &p.carrier == carrier && &p.backend_session == backend_session
+                                })
+                            })
+                        })
+                    })
+                    .cloned();
+                for id in &self.segment(&segment)?.rounds {
                     if landed
                         .iter()
-                        .any(|l| self.turns[id].positions.contains(&l.position))
+                        .any(|l| self.rounds[id].positions.contains(&l.position))
                     {
                         if known.as_ref().is_some_and(|old| old != id) {
                             return Err(Error("一个落点不能合并两个已确认的轮".into()));
@@ -574,11 +634,11 @@ impl Lineage {
                     }
                 }
                 if let Some(id) = &known
-                    && self.turns[id].complete
+                    && self.rounds[id].complete
                 {
                     if landed
                         .iter()
-                        .all(|l| self.turns[id].positions.contains(&l.position))
+                        .all(|l| self.rounds[id].positions.contains(&l.position))
                     {
                         return Ok(());
                     }
@@ -588,18 +648,9 @@ impl Lineage {
                 if landed.is_empty() && known.is_none() {
                     return Ok(());
                 }
-                let id = known.unwrap_or_else(|| {
-                    use sha2::{Digest, Sha256};
-                    let digest = Sha256::digest(identity.as_bytes());
-                    format!(
-                        "round-{}",
-                        digest[..16]
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
-                    )
-                });
-                let turn = self.turns.entry(id.clone()).or_insert_with(|| Turn {
+                let id = known
+                    .unwrap_or_else(|| format!("round-{}", crate::ids::derive_id("", &identity)));
+                let turn = self.rounds.entry(id.clone()).or_insert_with(|| Round {
                     id: id.clone(),
                     messages: vec![],
                     positions: vec![],
@@ -622,7 +673,7 @@ impl Lineage {
                         native: native.clone(),
                     });
                 }
-                let path = &mut self.segments.get_mut(&segment).unwrap().turns;
+                let path = &mut self.segments.get_mut(&segment).unwrap().rounds;
                 if !path.contains(&id) {
                     path.push(id.clone());
                 }

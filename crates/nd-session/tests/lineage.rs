@@ -31,6 +31,7 @@ fn observe(lineage: Lineage, key: &str, natives: &[&str], complete: bool) -> Lin
     lineage
         .fold(&Event::TurnObserved {
             carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs1"),
             key: key.into(),
             natives: natives.iter().map(|s| s.to_string()).collect(),
             complete,
@@ -39,6 +40,52 @@ fn observe(lineage: Lineage, key: &str, natives: &[&str], complete: bool) -> Lin
         .unwrap()
 }
 #[test]
+fn clear_rebinds_the_same_carrier_without_mixing_old_and_new_rounds() {
+    let before = observe(
+        land(root(), "old", "old#1", "old-u"),
+        "old-t",
+        &["old-u"],
+        true,
+    );
+    let clear = Event::Branch {
+        segment: "z-clear".into(),
+        from: "s1".into(),
+        through: None,
+        kind: nd_session::lineage::BranchKind::Clear,
+        carrier: "c1".into(),
+        backend_session: BackendSessionId::claude("bs2"),
+    };
+    let cleared = before.fold(&clear).unwrap();
+    let landed = cleared
+        .fold(&Event::Landed {
+            message: "new".into(),
+            ticket: "new#1".into(),
+            position: NativePosition {
+                carrier: "c1".into(),
+                backend_session: BackendSessionId::claude("bs2"),
+                native: "new-u".into(),
+            },
+        })
+        .unwrap();
+    let after = landed
+        .fold(&Event::TurnObserved {
+            carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs2"),
+            key: "new-t".into(),
+            natives: vec!["new-u".into()],
+            complete: true,
+            last_assistant: None,
+        })
+        .unwrap();
+    assert_eq!(after.rounds("s1").unwrap()[0].messages, ["old"]);
+    assert_eq!(after.rounds("z-clear").unwrap()[0].messages, ["new"]);
+    assert!(after.common_prefix("s1", "z-clear").unwrap().is_empty());
+    assert_eq!(after.fold(&clear).unwrap(), after);
+    let restored: Lineage = serde_json::from_str(&serde_json::to_string(&after).unwrap()).unwrap();
+    assert_eq!(restored, after);
+}
+
+#[test]
 fn landed_prompts_open_one_round_only_when_their_actual_turn_is_known() {
     let landed = land(
         land(root(), "message-a", "ticket-a#1", "uuid-a"),
@@ -46,17 +93,17 @@ fn landed_prompts_open_one_round_only_when_their_actual_turn_is_known() {
         "ticket-b#1",
         "uuid-b",
     );
-    assert!(landed.turns("s1").unwrap().is_empty());
+    assert!(landed.rounds("s1").unwrap().is_empty());
     let running = observe(landed, "native-turn", &["uuid-a", "uuid-b"], false);
-    let turns = running.turns("s1").unwrap();
+    let turns = running.rounds("s1").unwrap();
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].messages, ["message-a", "message-b"]);
     assert_eq!(turns[0].positions, [position("uuid-a"), position("uuid-b")]);
     assert!(!turns[0].complete);
     let id = turns[0].id.clone();
     let ended = observe(running, "native-turn", &["uuid-a", "uuid-b"], true);
-    assert_eq!(ended.turns("s1").unwrap()[0].id, id);
-    assert!(ended.turns("s1").unwrap()[0].complete);
+    assert_eq!(ended.rounds("s1").unwrap()[0].id, id);
+    assert!(ended.rounds("s1").unwrap()[0].complete);
     assert_eq!(
         observe(ended.clone(), "native-turn", &["uuid-a", "uuid-b"], true),
         ended
@@ -67,7 +114,7 @@ fn landed_prompts_open_one_round_only_when_their_actual_turn_is_known() {
 fn rewind_keeps_the_old_path_and_nested_branches_share_only_the_explicit_prefix() {
     use nd_session::lineage::BranchKind;
     let one = observe(land(root(), "a", "a#1", "ua"), "ta", &["ua"], true);
-    let first = one.turns("s1").unwrap()[0].id.clone();
+    let first = one.rounds("s1").unwrap()[0].id.clone();
     let two = observe(land(one, "b", "b#1", "ub"), "tb", &["ub"], true);
     let branched = two
         .fold(&Event::Branch {
@@ -79,9 +126,14 @@ fn rewind_keeps_the_old_path_and_nested_branches_share_only_the_explicit_prefix(
             backend_session: BackendSessionId::claude("bs2"),
         })
         .unwrap();
+    assert_eq!(branched.inactive_messages(), ["b"]);
+    assert_eq!(
+        land(branched.clone(), "unmapped", "unmapped#1", "unmapped-u").inactive_messages(),
+        ["b"]
+    );
     assert_eq!(branched.current(), Some("s2"));
-    assert_eq!(branched.turns("s1").unwrap().len(), 2);
-    assert_eq!(branched.turns("s2").unwrap().len(), 1);
+    assert_eq!(branched.rounds("s1").unwrap().len(), 2);
+    assert_eq!(branched.rounds("s2").unwrap().len(), 1);
     assert_eq!(
         branched.common_prefix("s1", "s2").unwrap(),
         std::slice::from_ref(&first)
@@ -96,6 +148,18 @@ fn rewind_keeps_the_old_path_and_nested_branches_share_only_the_explicit_prefix(
             backend_session: BackendSessionId::claude("bs3"),
         })
         .unwrap();
+    let mut inactive = empty.inactive_messages();
+    inactive.sort();
+    assert_eq!(inactive, ["a", "b"]);
+    assert!(
+        empty
+            .fold(&Event::Activate {
+                segment: "s1".into()
+            })
+            .unwrap()
+            .inactive_messages()
+            .is_empty()
+    );
     assert!(empty.common_prefix("s1", "s3").unwrap().is_empty());
     let topology = empty.topology();
     assert_eq!(
@@ -120,14 +184,14 @@ fn rewind_keeps_the_old_path_and_nested_branches_share_only_the_explicit_prefix(
         })
         .unwrap();
     assert_eq!(restored.current(), Some("s1"));
-    assert_eq!(restored.turns("s1").unwrap().len(), 2);
-    assert_eq!(restored.turns("s2").unwrap()[0].id, first);
+    assert_eq!(restored.rounds("s1").unwrap().len(), 2);
+    assert_eq!(restored.rounds("s2").unwrap()[0].id, first);
 }
 
 #[test]
 fn switching_backends_keeps_the_segment_and_tracks_intervals_and_imported_positions() {
     let first = observe(land(root(), "a", "a#1", "ua"), "ta", &["ua"], true);
-    let turn = first.turns("s1").unwrap()[0].id.clone();
+    let turn = first.rounds("s1").unwrap()[0].id.clone();
     let switched = first
         .fold(&Event::SwitchBackend {
             segment: "s1".into(),
@@ -161,7 +225,7 @@ fn switching_backends_keeps_the_segment_and_tracks_intervals_and_imported_positi
         })
         .unwrap();
     assert_eq!(
-        imported.turns("s1").unwrap()[0].positions,
+        imported.rounds("s1").unwrap()[0].positions,
         [position("ua"), target]
     );
     assert!(
@@ -185,7 +249,7 @@ fn switching_backends_keeps_the_segment_and_tracks_intervals_and_imported_positi
             .as_deref(),
         Some("压缩跨过同步点")
     );
-    assert_eq!(invalid.turns("s1").unwrap().len(), 1);
+    assert_eq!(invalid.rounds("s1").unwrap().len(), 1);
     assert_eq!(invalid.switches().len(), 1);
 }
 
@@ -193,7 +257,7 @@ fn switching_backends_keeps_the_segment_and_tracks_intervals_and_imported_positi
 fn a_session_fork_carries_its_explicit_origin_and_shares_turn_identity() {
     use nd_session::lineage::SegmentTarget;
     let source = observe(land(root(), "a", "a#1", "ua"), "ta", &["ua"], true);
-    let id = source.turns("s1").unwrap()[0].id.clone();
+    let id = source.rounds("s1").unwrap()[0].id.clone();
     let child = source
         .fork(
             "session-original".into(),
@@ -239,13 +303,13 @@ fn late_completion_and_repeated_native_positions_do_not_invent_new_human_rounds(
         &["new-uuid"],
         false,
     );
-    let id = running.turns("s1").unwrap()[0].id.clone();
+    let id = running.rounds("s1").unwrap()[0].id.clone();
     // 终结事实可以只指向已经认出的回合；重复报告不倒退 complete。
     let ended = observe(running, "native-turn", &[], true);
-    assert!(ended.turns("s1").unwrap()[0].complete);
+    assert!(ended.rounds("s1").unwrap()[0].complete);
     let repeated = observe(ended, "background-followup", &["new-uuid"], true);
-    assert_eq!(repeated.turns("s1").unwrap().len(), 1);
-    assert_eq!(repeated.turns("s1").unwrap()[0].id, id);
+    assert_eq!(repeated.rounds("s1").unwrap().len(), 1);
+    assert_eq!(repeated.rounds("s1").unwrap()[0].id, id);
     assert_eq!(
         observe(repeated.clone(), "unknown-input", &["not-echoed"], true),
         repeated
@@ -293,7 +357,7 @@ fn conflicting_identities_are_rejected_without_changing_the_lineage() {
 fn clear_external_continuation_and_invalid_cut_points_preserve_the_source() {
     use nd_session::lineage::BranchKind;
     let running = observe(land(root(), "a", "a#1", "ua"), "ta", &["ua"], false);
-    let turn = running.turns("s1").unwrap()[0].id.clone();
+    let turn = running.rounds("s1").unwrap()[0].id.clone();
     let branch = Event::Branch {
         segment: "outside".into(),
         from: "s1".into(),
@@ -318,8 +382,8 @@ fn clear_external_continuation_and_invalid_cut_points_preserve_the_source() {
     };
     let cleared = outside.fold(&clear).unwrap();
     assert_eq!(cleared.current(), Some("clear"));
-    assert!(cleared.turns("clear").unwrap().is_empty());
-    assert_eq!(cleared.turns("s1").unwrap().len(), 1);
+    assert!(cleared.rounds("clear").unwrap().is_empty());
+    assert_eq!(cleared.rounds("s1").unwrap().len(), 1);
     assert!(
         cleared
             .fold(&Event::Activate {
@@ -350,12 +414,12 @@ proptest::proptest! {
             source = observe(land(source, &format!("m{n}"), &format!("t{n}"), &format!("u{n}")), &format!("turn{n}"), &[&format!("u{n}")], true);
         }
         let count = cut.min(rounds);
-        let through = count.checked_sub(1).map(|n| source.turns("s1").unwrap()[n].id.clone());
+        let through = count.checked_sub(1).map(|n| source.rounds("s1").unwrap()[n].id.clone());
         let event = Event::Branch { segment: "earlier-lexically".into(), from: "s1".into(), through, kind: BranchKind::Rewind,
             carrier: "branch".into(), backend_session: BackendSessionId::claude("branch") };
         let branch = source.fold(&event).unwrap();
         proptest::prop_assert_eq!(branch.common_prefix("s1", "earlier-lexically").unwrap().len(), count);
-        proptest::prop_assert_eq!(branch.turns("s1").unwrap().len(), rounds);
+        proptest::prop_assert_eq!(branch.rounds("s1").unwrap().len(), rounds);
         proptest::prop_assert_eq!(&branch.topology()[0].segment, "s1");
         let restored: Lineage = serde_json::from_str(&serde_json::to_string(&branch).unwrap()).unwrap();
         proptest::prop_assert_eq!(restored.fold(&event).unwrap(), branch);
@@ -365,7 +429,7 @@ proptest::proptest! {
 #[test]
 fn an_import_records_a_mirrors_sync_point_before_it_becomes_current() {
     let source = observe(land(root(), "a", "a#1", "ua"), "ta", &["ua"], true);
-    let turn = source.turns("s1").unwrap()[0].id.clone();
+    let turn = source.rounds("s1").unwrap()[0].id.clone();
     let prepared = source
         .fold(&Event::CarrierKnown {
             segment: "s1".into(),
@@ -412,7 +476,7 @@ fn an_import_records_a_mirrors_sync_point_before_it_becomes_current() {
         "s1"
     );
     assert_eq!(
-        uncertain.turns("s1").unwrap()[0].positions,
+        uncertain.rounds("s1").unwrap()[0].positions,
         [position("ua")]
     );
     // 只有落定事实才关闭旧承载区间。
@@ -431,6 +495,7 @@ fn replaying_an_older_turn_prefix_does_not_move_the_completed_fork_anchor() {
     let landed = land(root(), "a", "a#1", "ua");
     let early = Event::TurnObserved {
         carrier: "c1".into(),
+        backend_session: BackendSessionId::claude("bs1"),
         key: "turn".into(),
         natives: vec!["ua".into()],
         complete: false,
@@ -440,6 +505,7 @@ fn replaying_an_older_turn_prefix_does_not_move_the_completed_fork_anchor() {
     let ended = running
         .fold(&Event::TurnObserved {
             carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs1"),
             key: "turn".into(),
             natives: vec!["ua".into()],
             complete: true,
@@ -450,6 +516,7 @@ fn replaying_an_older_turn_prefix_does_not_move_the_completed_fork_anchor() {
     let followup = ended
         .fold(&Event::TurnObserved {
             carrier: "c1".into(),
+            backend_session: BackendSessionId::claude("bs1"),
             key: "background-followup".into(),
             natives: vec!["ua".into()],
             complete: true,
@@ -457,7 +524,7 @@ fn replaying_an_older_turn_prefix_does_not_move_the_completed_fork_anchor() {
         })
         .unwrap();
     assert_eq!(
-        followup.turns("s1").unwrap()[0]
+        followup.rounds("s1").unwrap()[0]
             .last_assistant
             .as_ref()
             .unwrap()
@@ -471,7 +538,7 @@ fn imported_native_positions_cannot_identify_two_different_rounds() {
     let first = observe(land(root(), "a", "a#1", "ua"), "ta", &["ua"], true);
     let second = observe(land(first, "b", "b#1", "ub"), "tb", &["ub"], true);
     let ids: Vec<_> = second
-        .turns("s1")
+        .rounds("s1")
         .unwrap()
         .iter()
         .map(|t| t.id.clone())

@@ -4,7 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+mod settings;
+pub use settings::{EffectiveSettings, LiveSettings, SettingCaps};
+
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const MAX_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+pub const MAX_ATTACHMENTS_PER_MESSAGE: usize = 8;
+pub const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 会话持久草稿；光标、选区和输入法组词不在此协议中。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -113,12 +119,15 @@ pub struct Invoked {
 }
 
 /// 后端实时给出的模型选项；value 原样用于 session.create，不从显示名称推导。
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(default)]
 pub struct Model {
     pub value: String,
     pub label: String,
     pub description: String,
     pub disabled: bool,
+    pub resolved_model: Option<String>,
+    pub effort_levels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -146,6 +155,20 @@ pub struct Cursor {
     pub epoch: String,
     pub seq: u64,
 }
+impl Snapshot {
+    pub fn position(&self) -> Cursor {
+        Cursor {
+            epoch: self.epoch.clone(),
+            seq: self.cursor,
+        }
+    }
+}
+impl Cursor {
+    pub fn is_followed_by(&self, event: &Event) -> bool {
+        self.epoch == event.epoch && self.seq.checked_add(1) == Some(event.cursor)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -300,6 +323,17 @@ pub enum Receipt {
     Unknown {
         now: Value,
     },
+    /// A newer peer returned a status this version does not interpret.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableCode {
+    Recovering,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -313,19 +347,31 @@ pub enum CommandReply {
     /// 明确未受理、没有新收据，只有这一种情况可自动同 id 重试。
     Unavailable {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<UnavailableCode>,
     },
     /// 仅同步副本产生：断线后查不到收据，不能自动重发正文。
     DeliveryUnknown,
+    /// A newer peer returned a status this version does not interpret.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReceiptLookup {
     Conflict,
-    Found { receipt: Receipt },
+    Found {
+        receipt: Receipt,
+    },
     Missing,
     Expired,
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
+    /// A newer peer returned a status this version does not interpret.
+    #[serde(other)]
+    Other,
 }
 
 impl Command {
@@ -358,7 +404,7 @@ impl Command {
     Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct Attachment {
-    pub blob: String,
+    pub blob: nd_id::BlobId,
     pub name: String,
     pub media_type: String,
     pub size: u64,
@@ -366,14 +412,6 @@ pub struct Attachment {
 
 impl Attachment {
     pub fn validate(&self) -> Result<(), String> {
-        if self.blob.len() != 64
-            || !self
-                .blob
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("附件需要小写 SHA-256 内容散列".into());
-        }
         if self.name.is_empty() || self.name.len() > 255 || self.name.chars().any(char::is_control)
         {
             return Err("附件名称为空、过长或含控制字符".into());
@@ -389,7 +427,7 @@ impl Attachment {
         ) {
             return Err("不支持此附件类型".into());
         }
-        if self.size == 0 || self.size > 5 * 1024 * 1024 {
+        if self.size == 0 || self.size > MAX_ATTACHMENT_BYTES {
             return Err("单个附件须为 1 字节至 5 MiB".into());
         }
         Ok(())
@@ -425,3 +463,8 @@ pub struct SettingsExpected {
 pub struct TitleExpected {
     pub title_revision: u64,
 }
+
+mod item_state;
+pub use item_state::{ControlState, PromptState};
+
+pub use nd_id::BlobId;

@@ -4,6 +4,7 @@
 //! 生产实现是 Claude 适配（`nd-claude`），以后加 Codex；测试另有脚本化实现。
 //! 动作与事实只加不改：执行器把它们存进发件箱和操作账，跨版本读回。
 pub use nd_claims::{BackendKind, BackendSessionId};
+pub use nd_wire::{LiveSettings, SettingCaps};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
@@ -82,6 +83,13 @@ pub struct Issued {
 }
 
 /// 后端无关的动作。第 2 步先有承载位的一生（拉起、结束）和发送；其余动作随各自工单追加。
+/// Esc 钉住的实际回合；承载位换进程后也不会误用旧回合身份。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRef {
+    pub run: RunId,
+    pub key: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "act", rename_all = "snake_case")]
 pub enum Act {
@@ -111,6 +119,8 @@ pub enum Act {
     /// 只停当前回合，保留排队输入和后台任务。
     Interrupt {
         to: CarrierId,
+        #[serde(default)]
+        turn: Option<TurnRef>,
         #[serde(default)]
         queued: QueuedPolicy,
     },
@@ -181,6 +191,11 @@ pub enum CompactScope {
 /// 第 `nth` 次出现，共 `of` 次。后端看到的次数对不上就不压缩。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Anchor {
+    /// 可见提示序列与所选位置；适配器按后端实际可见的内容计数。
+    #[serde(default)]
+    pub candidates: Vec<Msg>,
+    #[serde(default)]
+    pub selected: usize,
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<nd_wire::Attachment>,
@@ -400,6 +415,8 @@ pub enum Done {
     /// 控制请求的 ACK；不证明回合已结束。
     Interrupted {
         cancelled: Vec<Ticket>,
+        #[serde(default)]
+        already_ended: bool,
     },
     Withdrawn {
         ok: bool,
@@ -408,9 +425,11 @@ pub enum Done {
         title: Option<String>,
     },
     Configured {
-        settings: Value,
+        settings: LiveSettings,
     },
     Opened {
+        #[serde(default)]
+        settings: Box<LiveSettings>,
         bs: BackendSessionId,
         run: RunId,
         readiness: Readiness,
@@ -467,6 +486,9 @@ pub struct Fact {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "fact", rename_all = "snake_case")]
 pub enum FactBody {
+    SettingsObserved {
+        settings: LiveSettings,
+    },
     CanCancelQueued {
         available: bool,
     },
@@ -495,7 +517,10 @@ pub enum FactBody {
         ticket: Ticket,
         native: String,
     },
-    TurnStarted,
+    TurnStarted {
+        #[serde(default)]
+        turn: Option<String>,
+    },
     /// 已确认的实际回合与用户输入原生位置；不代替 Landed 的送达证据。
     TurnMapped {
         turn: String,
@@ -729,11 +754,8 @@ impl Backends {
 
 /// 承载位报告的能力经过后端端口的硬约束，再交给所有界面。
 /// 缺字段一律不开放 ultracode；Codex 无论报告内容如何都不可用。
-pub fn session_capabilities(kind: &BackendKind, reported: &Value) -> Value {
-    let mut caps = reported.as_object().cloned().unwrap_or_default();
-    caps.insert(
-        "ultracode".into(),
-        Value::Bool(*kind == BackendKind::Claude && reported["ultracode"] == true),
-    );
-    Value::Object(caps)
+pub fn session_capabilities(kind: &BackendKind, reported: &SettingCaps) -> SettingCaps {
+    let mut caps = reported.clone();
+    caps.ultracode &= *kind == BackendKind::Claude;
+    caps
 }

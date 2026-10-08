@@ -186,15 +186,7 @@ impl Desktop {
                 .gap(px(t.spacing.small))
                 .child("权限模式")
                 .children(view.permission_modes.iter().map(|mode| {
-                    let label = match mode.as_str() {
-                        "default" => "默认审批",
-                        "acceptEdits" => "允许编辑",
-                        "plan" => "计划",
-                        "dontAsk" => "不询问",
-                        "auto" => "自动",
-                        "bypassPermissions" => "跳过审批",
-                        _ => mode,
-                    };
+                    let label = view.permission_labels.get(mode).unwrap_or(mode);
                     let setting = LiveSetting::PermissionMode(mode.clone());
                     option(
                         format!("session-mode/{mode}"),

@@ -102,6 +102,9 @@ pub enum Availability {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Caps {
+    /// Permission to re-enter bypass is fixed by this process launch.
+    #[serde(default)]
+    pub bypass_permissions: Option<bool>,
     pub readiness: Readiness,
     pub features: BTreeMap<Feature, Availability>,
     /// Esc（`interrupt`）不停后台的子代理与 Workflow：声明了 perTaskStopAffordance 且 stdin 开着。
@@ -113,11 +116,7 @@ impl Caps {
         Feature::ALL
             .iter()
             .map(|f| {
-                let why = match self.features.get(f) {
-                    Some(Availability::Available) => None,
-                    Some(Availability::Unsupported { why }) => Some(why.clone()),
-                    None => Some("这个进程没有声明这项能力".into()),
-                };
+                let why = self.unsupported(*f);
                 nd_backend::Feature {
                     id: f.id().into(),
                     label: f.label().into(),
@@ -223,13 +222,43 @@ impl Claude {
         link.write(1, &frame.to_string()).await?;
         let (initialize, cursor) = await_response(&mut link, &id, self.config.init_timeout).await?;
         self.channel.settle(run);
+        let mut capabilities = caps(readiness, init.per_task_stop_affordance);
+        // The CLI resolves all settings sources before replying to initialize.
+        // Preserve the resolved launch mode, including permissions.defaultMode.
+        capabilities.bypass_permissions =
+            Some(initialize["current_permission_mode"] == "bypassPermissions");
+        if capabilities.readiness == Readiness::Full {
+            let listed = |field: &str, name: &str| {
+                initialize[field]
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().any(|entry| entry["name"] == name))
+            };
+            if !listed("commands", "compact") {
+                capabilities.features.insert(
+                    Feature::Summarize,
+                    Availability::Unsupported {
+                        why: "initialize 回应未列出 compact".into(),
+                    },
+                );
+            }
+            if init.hook_agents.is_empty()
+                || !init.hook_agents.keys().all(|name| listed("agents", name))
+            {
+                capabilities.features.insert(
+                    Feature::CodexSubagent,
+                    Availability::Unsupported {
+                        why: "initialize 回应未确认所声明的钩子代理".into(),
+                    },
+                );
+            }
+        }
         Ok(ClaudeRun {
             ready: Ready {
                 run: run.to_owned(),
                 backend_session_id: session.to_owned(),
                 identity: launched.identity,
                 hellos: binding.mods,
-                caps: caps(readiness, init.per_task_stop_affordance),
+                caps: capabilities,
                 initialize,
             },
             link,
@@ -245,35 +274,94 @@ impl Claude {
     pub async fn adopt(&self, run: &str, session: &str, previous: Caps) -> Result<ClaudeRun> {
         self.channel.register(run, session);
         self.channel.settle(run);
-        let link = self.watchdogs.link(run).await?;
-        let binding = self
-            .channel
-            .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
-            .await
-            .ok_or("run unregistered while waiting for hellos")?;
-        let caps = match readiness(&binding, session, self.config.hello_timeout) {
-            Readiness::ChatOnly { why } if previous.readiness == Readiness::Full => caps(
-                Readiness::ChatOnly { why },
-                previous.interrupt_spares_background,
-            ),
-            _ => previous,
-        };
-        let cursor = link.hello.high;
-        let next_in = link.hello.written + 1;
-        Ok(ClaudeRun {
-            ready: Ready {
-                run: run.to_owned(),
-                backend_session_id: session.to_owned(),
-                identity: link.hello.identity.clone(),
-                hellos: binding.mods,
-                caps,
-                initialize: Value::Null,
-            },
-            link,
-            next_in,
-            cursor,
-            channel: self.channel.clone(),
-        })
+        let adopted = async {
+            let link = self.watchdogs.link(run).await?;
+            let binding = self
+                .channel
+                .wait_binding(run, self.config.hello_timeout, |b| b.mods.len() == 2)
+                .await
+                .ok_or("run unregistered while waiting for hellos")?;
+            let bypass_permissions = match previous.bypass_permissions {
+                Some(authorized) => Some(authorized),
+                None => {
+                    // Old Caps did not record the launch authorization. Use the
+                    // immutable watchdog launch record, never today's config or
+                    // the process's current (possibly switched) permission mode.
+                    let path = self.watchdogs.directory(run)?.join("spec.json");
+                    let spec: nd_watchdog_proto::WatchSpec =
+                        serde_json::from_slice(&std::fs::read(path)?)?;
+                    let explicit = spec.launch.argv.iter().any(|arg| {
+                        matches!(
+                            arg.as_str(),
+                            "--dangerously-skip-permissions"
+                                | "--allow-dangerously-skip-permissions"
+                        )
+                    }) || spec
+                        .launch
+                        .argv
+                        .windows(2)
+                        .any(|args| args == ["--permission-mode", "bypassPermissions"]);
+                    if explicit {
+                        Some(true)
+                    } else {
+                        // Legacy config-based launches have no granting argv.
+                        // Recover the CLI's original initialize response from
+                        // retained watchdog output, not changed settings files.
+                        self.watchdogs
+                            .records(run, 0, 1000)?
+                            .iter()
+                            .find_map(|record| {
+                                let Event::Out { line } = &record.event else {
+                                    return None;
+                                };
+                                let frame: Value = serde_json::from_str(line).ok()?;
+                                (frame["type"] == "control_response"
+                                    && frame["response"]["request_id"] == format!("nd-init-{run}"))
+                                .then(|| {
+                                    frame["response"]["response"]["current_permission_mode"]
+                                        .as_str()
+                                        .map(|mode| mode == "bypassPermissions")
+                                })
+                                .flatten()
+                            })
+                    }
+                }
+            };
+            let mut caps = match readiness(&binding, session, self.config.hello_timeout) {
+                Readiness::ChatOnly { why } if previous.readiness == Readiness::Full => caps(
+                    Readiness::ChatOnly { why },
+                    previous.interrupt_spares_background,
+                ),
+                _ => previous,
+            };
+            caps.bypass_permissions = bypass_permissions;
+            let cursor = link.hello.high;
+            let next_in = link
+                .hello
+                .accepted
+                .unwrap_or(link.hello.written)
+                .max(link.hello.written)
+                + 1;
+            Ok(ClaudeRun {
+                ready: Ready {
+                    run: run.to_owned(),
+                    backend_session_id: session.to_owned(),
+                    identity: link.hello.identity.clone(),
+                    hellos: binding.mods,
+                    caps,
+                    initialize: Value::Null,
+                },
+                link,
+                next_in,
+                cursor,
+                channel: self.channel.clone(),
+            })
+        }
+        .await;
+        if adopted.is_err() {
+            self.channel.unregister(run);
+        }
+        adopted
     }
 }
 
@@ -308,6 +396,7 @@ fn caps(readiness: Readiness, interrupt_spares_background: bool) -> Caps {
         })
         .collect();
     Caps {
+        bypass_permissions: None,
         readiness,
         features,
         interrupt_spares_background,
@@ -368,14 +457,27 @@ impl ClaudeRun {
     /// 写一行 stdin，返回看守分配的输入序号。
     pub async fn write(&mut self, frame: &Value) -> Result<u64> {
         let seq = self.next_in;
-        self.link.write(seq, &frame.to_string()).await?;
         self.next_in += 1;
+        self.retry_write(seq, frame).await?;
         Ok(seq)
     }
     /// 看守连接断了（传输错误后连接作废）：换一条新连接，输入序号接着看守报的已写高水位。
     pub fn relink(&mut self, link: WatchLink) {
-        self.next_in = link.hello.written + 1;
+        self.next_in = self.next_in.max(
+            link.hello
+                .accepted
+                .unwrap_or(link.hello.written)
+                .max(link.hello.written)
+                + 1,
+        );
         self.link = link;
+    }
+    /// 只重试同一帧的同一序号；不得为后续新帧复用一次失败写入的序号。
+    pub async fn retry_write(&mut self, seq: u64, frame: &Value) -> Result<()> {
+        self.link.write(seq, &frame.to_string()).await
+    }
+    pub fn written_through(&self) -> u64 {
+        self.link.hello.written
     }
     /// 下一行 stdin 的输入序号。看守按输入序号去重：同一序号重写不会写两次。
     pub fn next_input(&self) -> u64 {
@@ -461,38 +563,13 @@ impl ClaudeRun {
     }
     /// 按当前绑定把命令放进 mod 的队列，返回操作 id；这个 mod 没绑定在当前后端会话上就不发。
     pub fn send(&self, module: ModName, action: Action) -> Option<String> {
-        let binding = self.binding();
-        let mod_gen = binding.mods.get(&module)?.mod_gen.clone();
         let op_id = uuid::Uuid::new_v4().to_string();
-        self.channel.send(
-            &self.ready.run,
-            module,
-            Command {
-                op_id: op_id.clone(),
-                expected_backend_session_id: binding.backend_session_id,
-                expected_mod_gen: mod_gen,
-                action,
-            },
-        );
-        Some(op_id)
+        self.send_as(module, &op_id, action).then_some(op_id)
     }
-    /// 用指定的操作 id 按当前绑定发命令（不可重发的动作用票派生的 id，重启后能按它查）。
-    /// 这个 mod 没绑定在当前后端会话上就不发，返回 false。
+    /// 用指定的操作 id 按当前绑定发命令；未绑定的 mod 不发送。
     pub fn send_as(&self, module: ModName, op_id: &str, action: Action) -> bool {
-        let binding = self.binding();
-        let Some(hello) = binding.mods.get(&module) else {
-            return false;
-        };
-        self.channel.send(
-            &self.ready.run,
-            module,
-            Command {
-                op_id: op_id.into(),
-                expected_backend_session_id: binding.backend_session_id,
-                expected_mod_gen: hello.mod_gen.clone(),
-                action,
-            },
-        )
+        self.channel
+            .send_current(&self.ready.run, module, op_id, action)
     }
     /// 等某条命令的结论；None 表示到时限仍无结论。
     pub async fn result(&self, op_id: &str, timeout: Duration) -> Option<CommandResult> {

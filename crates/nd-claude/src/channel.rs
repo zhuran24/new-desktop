@@ -248,6 +248,32 @@ impl ModChannel {
         }
     }
 
+    /// 在同一把锁下按当前绑定组装命令并入队；未绑定的 mod 不发送。
+    pub fn send_current(
+        &self,
+        run: &str,
+        module: ModName,
+        op_id: &str,
+        action: nd_mod_proto::Action,
+    ) -> bool {
+        let sent = self
+            .with(run, |r| {
+                let hello = r.state.current(module)?;
+                let command = Command {
+                    op_id: op_id.into(),
+                    expected_backend_session_id: hello.backend_session_id.clone(),
+                    expected_mod_gen: hello.mod_gen.clone(),
+                    action,
+                };
+                r.apply(ModEvent::Send { module, command });
+                Some(())
+            })
+            .flatten()
+            .is_some();
+        self.inner.changed.notify_waiters();
+        sent
+    }
+
     /// 把命令放进 mod 的队列，唤醒挂着的长轮询。
     pub fn send(&self, run: &str, module: ModName, command: Command) -> bool {
         let sent = self

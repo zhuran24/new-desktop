@@ -15,6 +15,7 @@ pub struct SettingsView {
     pub efforts: Vec<String>,
     pub effort: String,
     pub permission_modes: Vec<String>,
+    pub permission_labels: std::collections::BTreeMap<String, String>,
     pub permission_mode: String,
     /// None 表示完全不显示；false 是可用但未生效。
     pub ultracode: Option<bool>,
@@ -28,66 +29,58 @@ pub fn session_settings(snapshot: &Snapshot) -> SettingsView {
         return SettingsView::default();
     };
     let h = &header.data;
-    let s = &h["settings"];
-    let applied = &s["applied"];
-    let catalog = s["models"].as_array();
-    let current = catalog.and_then(|models| {
-        models
-            .iter()
-            .find(|m| m["value"] == h["model"])
-            .or_else(|| {
-                models
-                    .iter()
-                    .find(|m| m["resolvedModel"] == applied["model"])
+    let settings: nd_wire::LiveSettings =
+        serde_json::from_value(h["settings"].clone()).unwrap_or_default();
+    let caps: nd_wire::SettingCaps = serde_json::from_value(h["caps"].clone()).unwrap_or_default();
+    let chosen_model = h["model"].as_str();
+    let current = settings
+        .models
+        .iter()
+        .find(|m| Some(m.value.as_str()) == chosen_model)
+        .or_else(|| {
+            settings.models.iter().find(|m| {
+                m.resolved_model
+                    .as_ref()
+                    .is_some_and(|r| Some(r) == settings.applied.model.as_ref())
             })
-    });
-    let strings = |v: &serde_json::Value| -> Vec<String> {
-        v.as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|s| s.as_str().map(str::to_owned))
-            .collect()
-    };
+        });
     SettingsView {
         title: h["title"].as_str().unwrap_or_default().into(),
-        models: if h["caps"]["model"] == true {
-            catalog
-                .into_iter()
-                .flatten()
+        models: if caps.model {
+            settings
+                .models
+                .iter()
                 .map(|m| SettingChoice {
-                    value: m["value"].as_str().unwrap_or_default().into(),
-                    label: m["displayName"]
-                        .as_str()
-                        .or_else(|| m["label"].as_str())
-                        .unwrap_or_default()
-                        .into(),
-                    selected: m["value"] == h["model"],
-                    disabled: m["disabled"] == true,
+                    value: m.value.clone(),
+                    label: m.label.clone(),
+                    selected: Some(m.value.as_str()) == chosen_model,
+                    disabled: m.disabled,
                 })
                 .collect()
         } else {
             vec![]
         },
-        efforts: if h["caps"]["effort"] == true {
-            current
-                .map(|m| strings(&m["supportedEffortLevels"]))
-                .unwrap_or_default()
+        efforts: if caps.effort {
+            current.map(|m| m.effort_levels.clone()).unwrap_or_default()
         } else {
             vec![]
         },
-        effort: applied["effort"].as_str().unwrap_or_default().into(),
-        permission_modes: if h["caps"]["permission_mode"] == true {
-            strings(&s["permission_modes"])
+        effort: settings.applied.effort.unwrap_or_default(),
+        permission_modes: if caps.permission_mode {
+            settings.permission_modes
         } else {
             vec![]
         },
+        permission_labels: settings.permission_labels,
         permission_mode: h["permission_mode"]
             .as_str()
-            .or_else(|| s["permission_mode"].as_str())
-            .unwrap_or("default")
-            .into(),
-        ultracode: (h["caps"]["ultracode"] == true).then(|| applied["ultracode"] == true),
-        ultracode_requested: applied["ultracodeRequested"] == true,
+            .map(str::to_owned)
+            .or(settings.permission_mode)
+            .unwrap_or_else(|| "default".into()),
+        ultracode: caps
+            .ultracode
+            .then_some(settings.applied.ultracode.unwrap_or(false)),
+        ultracode_requested: settings.applied.ultracode_requested.unwrap_or(false),
         pending: h["pending_setting"].as_str().map(str::to_owned),
     }
 }

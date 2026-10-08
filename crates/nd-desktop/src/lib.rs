@@ -38,18 +38,14 @@ pub struct Desktop {
     settings_open: bool,
     auxiliary_escape_held: bool,
     settings_sending: bool,
-    models: Vec<nd_wire::Model>,
-    model: Option<String>,
-    model_cwd: Option<String>,
-    model_generation: u64,
-    model_loading: bool,
+    model_picker: nd_view_model::ModelPicker,
     creating: bool,
     sending: bool,
     send_intent: String,
     escape: nd_view_model::EscapeState,
     started: std::time::Instant,
     uploading: usize,
-    images: std::collections::BTreeMap<String, Option<std::sync::Arc<Image>>>,
+    images: nd_view_model::ImageCache<std::sync::Arc<Image>>,
     device: String,
     draft_writes: std::collections::BTreeSet<String>,
     queued_send: Option<(String, String, u64, String)>,
@@ -162,11 +158,12 @@ impl Desktop {
             }
         });
         let system_theme = themes::system_mode(window);
-        let theme_catalog = nd_view_model::ThemeCatalog::default();
-        let theme = theme_catalog
-            .resolve(&state.theme_selection(), system_theme)
-            .theme;
-        let mut theme_feed = themes::ThemeFeed::start(theme_directory.clone())?;
+        let _ = std::fs::create_dir_all(&theme_directory);
+        let theme_catalog = nd_view_model::ThemeCatalog::read(&theme_directory);
+        let resolved = theme_catalog.resolve(&state.theme_selection(), system_theme);
+        let theme = resolved.theme;
+        let mut theme_feed =
+            themes::ThemeFeed::start(theme_directory.clone(), theme_catalog.clone())?;
         let theme_reload = theme_feed.reload.clone();
         let themes = cx.spawn(async move |weak, cx| {
             while let Some(catalog) = theme_feed.recv().await {
@@ -200,11 +197,7 @@ impl Desktop {
             settings_open: false,
             auxiliary_escape_held: false,
             settings_sending: false,
-            models: vec![],
-            model: None,
-            model_cwd: None,
-            model_generation: 0,
-            model_loading: false,
+            model_picker: Default::default(),
             creating: state.selected_session.is_none(),
             sending: false,
             send_intent: "fold".into(),
@@ -224,7 +217,7 @@ impl Desktop {
             theme,
             theme_catalog,
             system_theme,
-            theme_warning: None,
+            theme_warning: resolved.warning,
             theme_directory,
             theme_reload,
             _themes: themes,
@@ -343,6 +336,12 @@ pub fn apply_theme(theme: &Theme, cx: &mut App) {
         kit.colors.ring = rgba(theme.colors.accent).into();
         kit.colors.muted_foreground = rgba(theme.colors.muted).into();
         kit.colors.selection = rgba(theme.colors.accent).into();
+        kit.colors.link = rgba(theme.colors.accent).into();
+        kit.colors.accent = rgba(theme.colors.background).into();
+        kit.colors.accent_foreground = rgba(theme.colors.foreground).into();
+        kit.colors.muted = rgba(theme.colors.background).into();
+        kit.colors.table_head = rgba(theme.colors.background).into();
+        kit.colors.table_head_foreground = rgba(theme.colors.foreground).into();
     });
 }
 impl Render for Desktop {
@@ -411,9 +410,13 @@ impl Render for Desktop {
         let header = self.render_slots(Slot::Header, window, cx);
         let sidebar = self.render_slots(Slot::Sidebar, window, cx);
         let mut right = self.render_slots(Slot::RightPanel, window, cx);
-        match self.state.active_panel.as_deref() {
-            Some("settings") => right.extend(self.render_slots(Slot::Settings, window, cx)),
-            Some("commands") => right.extend(self.render_slots(Slot::CommandPalette, window, cx)),
+        match self.state.active_panel {
+            Some(nd_view_model::Panel::Settings) => {
+                right.extend(self.render_slots(Slot::Settings, window, cx))
+            }
+            Some(nd_view_model::Panel::Commands) => {
+                right.extend(self.render_slots(Slot::CommandPalette, window, cx))
+            }
             _ => {}
         }
         let chat_sidebar = self.chat_sidebar(cx);

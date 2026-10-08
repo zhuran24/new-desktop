@@ -64,6 +64,8 @@ fn the_compaction_hook_sees_text_blocks_joined_without_a_separator() {
     ];
     assert_eq!(invoke::row_text(&content), "TWO_ATWO_B");
     let anchor = Anchor {
+        candidates: vec![],
+        selected: 0,
         text: "TWO_A".into(),
         attachments: vec![],
         nth: 2,
@@ -95,6 +97,8 @@ fn compact() -> Invocation {
     Invocation::Compact {
         scope: CompactScope::From,
         anchor: Anchor {
+            candidates: vec![],
+            selected: 0,
             text: "x".into(),
             attachments: vec![],
             nth: 1,

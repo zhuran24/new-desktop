@@ -38,7 +38,7 @@ pub fn unified_diff(text: &str) -> Vec<DiffLine> {
                 row.kind = DiffKind::Header;
             } else if let Some((old, new, left, right)) = range.as_mut() {
                 match line.as_bytes().first() {
-                    Some(b' ') if *left > 0 && *right > 0 => {
+                    Some(b' ') | None if *left > 0 && *right > 0 => {
                         row.kind = DiffKind::Context;
                         row.old = Some(*old);
                         row.new = Some(*new);
@@ -64,6 +64,13 @@ pub fn unified_diff(text: &str) -> Vec<DiffLine> {
                 if *left == 0 && *right == 0 {
                     range = None;
                 }
+            }
+            if row.kind == DiffKind::Notice {
+                row.kind = match line.as_bytes().first() {
+                    Some(b'+') => DiffKind::Added,
+                    Some(b'-') => DiffKind::Removed,
+                    _ => DiffKind::Notice,
+                };
             }
             row
         })
@@ -94,7 +101,7 @@ pub enum MessageBlock {
     Diff(Vec<DiffLine>),
 }
 
-/// 简单替换基准：整段旧内容删除、整段新内容加入，保留缺少末尾换行的信息。
+/// 简单片段替换基准：整段旧内容删除、整段新内容加入，不推断文件末尾。
 /// 不猜测 Edit 在文件中的绝对行号；这里的行号从被替换的片段开头计。
 pub fn replacement_diff(before: &str, after: &str) -> Vec<DiffLine> {
     let old: Vec<_> = before.split_inclusive('\n').collect();
@@ -111,11 +118,25 @@ pub fn replacement_diff(before: &str, after: &str) -> Vec<DiffLine> {
             patch.push(prefix);
             patch.push_str(line);
             if !line.ends_with('\n') {
-                patch.push_str("\n\\ No newline at end of file\n");
+                patch.push('\n');
             }
         }
     }
-    unified_diff(patch.trim_end_matches('\n'))
+    let mut rows = unified_diff(patch.trim_end_matches('\n'));
+    if before.ends_with('\n') != after.ends_with('\n') {
+        rows.push(DiffLine {
+            text: if after.ends_with('\n') {
+                "片段末尾增加换行"
+            } else {
+                "片段末尾移除换行"
+            }
+            .into(),
+            kind: DiffKind::Notice,
+            old: None,
+            new: None,
+        });
+    }
+    rows
 }
 
 pub fn message_blocks(kind: &str, text: &str, raw: &serde_json::Value) -> Vec<MessageBlock> {

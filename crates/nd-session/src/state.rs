@@ -37,6 +37,55 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    Summary,
+    Ai,
+    Manual,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionTitle {
+    #[serde(rename = "title")]
+    pub text: Option<String>,
+    #[serde(rename = "title_source")]
+    pub source: Option<TitleSource>,
+    #[serde(rename = "title_seed")]
+    pub seed: Option<String>,
+    #[serde(rename = "title_attempted")]
+    pub attempted: bool,
+    #[serde(rename = "title_revision")]
+    pub revision: u64,
+}
+impl SessionTitle {
+    pub fn new(text: &str) -> Self {
+        let mut title = Self {
+            text: Some(text.trim().chars().take(60).collect()),
+            source: Some(TitleSource::Summary),
+            ..Self::default()
+        };
+        title.note_prompt(text);
+        title
+    }
+    pub fn may_auto_generate(&self) -> bool {
+        !self.attempted && self.seed.is_some() && self.source != Some(TitleSource::Manual)
+    }
+    pub fn note_prompt(&mut self, text: &str) {
+        if !self.attempted
+            && self.seed.is_none()
+            && self.source != Some(TitleSource::Manual)
+            && text.trim().chars().count() >= 10
+            && !text.trim_start().starts_with(['!', '/'])
+        {
+            self.seed = Some(text.to_owned());
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Meta {
     pub id: SessionId,
@@ -50,20 +99,12 @@ pub struct Meta {
     #[serde(default)]
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
-    #[serde(default)]
-    pub settings: Value,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub title_source: Option<String>,
-    #[serde(default)]
-    pub title_seed: Option<String>,
-    #[serde(default)]
-    pub title_attempted: bool,
+    #[serde(default, deserialize_with = "read_settings")]
+    pub settings: nd_backend::LiveSettings,
+    #[serde(flatten)]
+    pub title: SessionTitle,
     #[serde(default)]
     pub settings_revision: u64,
-    #[serde(default)]
-    pub title_revision: u64,
     /// 撤掉或部分完成的原因。
     pub note: Option<String>,
     /// 部分完成时已经做过（或可能做过）的不可逆步骤。
@@ -87,6 +128,8 @@ pub struct Carrier {
     /// 后台任务能否收尾；没报过就是 Unknown，不当成空。
     pub drain: Drain,
     pub turn_running: bool,
+    #[serde(default)]
+    pub turn: Option<nd_backend::TurnRef>,
     pub turns: u64,
     /// 端口报的能力表（拉起时、能力变了时）；旧记录没有时为空。
     #[serde(default)]
@@ -162,6 +205,25 @@ pub struct DraftRestore {
     pub device: String,
 }
 
+/// 发送台共同的签票状态；平铺序列化，兼容既有持久核心。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueState {
+    pub ticket: Option<Ticket>,
+    pub attempt: u32,
+    pub waiting: Option<String>,
+    pub arrival: u64,
+}
+impl QueueState {
+    pub fn retry(&mut self) {
+        self.ticket = None;
+        self.attempt += 1;
+    }
+    pub fn sent(&mut self, ticket: Ticket) {
+        self.ticket = Some(ticket);
+        self.waiting = None;
+    }
+}
+
 /// 发送台里还没结论的一条消息。界面上始终是这一条，另发尝试不换消息。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -171,10 +233,8 @@ pub struct Message {
     pub text: String,
     pub intent: Intent,
     /// 当前尝试的票；None 表示还在发送台里（代持或等独占）。
-    pub ticket: Option<Ticket>,
-    pub attempt: u32,
-    pub waiting: Option<String>,
-    pub arrival: u64,
+    #[serde(flatten)]
+    pub queue: QueueState,
 }
 
 /// 收据等动作有结果的一件事（规格「收据时点」）：命令受理时记下意图，结果到了才落收据。
@@ -197,10 +257,8 @@ pub struct Invoke {
     /// 总结成功后不再是 CLI 对话行的提示（受理时算出）。
     #[serde(default)]
     pub covers: Vec<String>,
-    pub ticket: Option<Ticket>,
-    pub attempt: u32,
-    pub waiting: Option<String>,
-    pub arrival: u64,
+    #[serde(flatten)]
+    pub queue: QueueState,
 }
 impl Invoke {
     pub fn kind(&self) -> &'static str {
@@ -436,4 +494,56 @@ pub fn listed(store: &nd_store::Store) -> nd_store::Result<Vec<Core>> {
         out.push(serde_json::from_str(&row?).map_err(corrupt)?);
     }
     Ok(out)
+}
+
+fn read_settings<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<nd_backend::LiveSettings, D::Error> {
+    let mut value = Option::<Value>::deserialize(de)?.unwrap_or_else(|| serde_json::json!({}));
+    // Before neutral settings, the persisted applied object used the CLI key.
+    // Migrate on every load, including carriers with no live process to adopt.
+    if let Some(applied) = value.get_mut("applied").and_then(Value::as_object_mut)
+        && let Some(requested) = applied.remove("ultracodeRequested")
+    {
+        applied.entry("ultracode_requested").or_insert(requested);
+    }
+    if let Some(models) = value.get_mut("models").and_then(Value::as_array_mut) {
+        for model in models.iter_mut().filter_map(Value::as_object_mut) {
+            for (legacy, neutral) in [
+                ("displayName", "label"),
+                ("resolvedModel", "resolved_model"),
+                ("supportedEffortLevels", "effort_levels"),
+            ] {
+                if let Some(old) = model.remove(legacy) {
+                    model.entry(neutral).or_insert(old);
+                }
+            }
+        }
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+/// Gone 流水回收的持久引用屏障，包括未结和交付不明的 Open 票。
+pub fn referenced_runs(
+    store: &nd_store::Store,
+) -> nd_store::Result<std::collections::BTreeSet<String>> {
+    let db = store.read()?;
+    let mut stmt = db.prepare("SELECT core FROM sessions")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut runs = std::collections::BTreeSet::new();
+    for row in rows {
+        let core: Core = serde_json::from_str(&row?).map_err(corrupt)?;
+        runs.extend(
+            core.carriers
+                .values()
+                .filter_map(|c| c.run.as_ref())
+                .map(|r| r.0.clone()),
+        );
+        for row in core.outbox.values().chain(core.uncertain.values()) {
+            if let nd_backend::Act::Open { run, .. } = &row.act {
+                runs.insert(run.0.clone());
+            }
+        }
+    }
+    Ok(runs)
 }

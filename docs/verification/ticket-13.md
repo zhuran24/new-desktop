@@ -20,20 +20,21 @@
 | 守护进程重启后接着用 | `the_session_keeps_its_backend_process_across_a_daemon_restart` | SIGKILL 守护进程后自动重启，接回同一个后端进程（同 pid、同后端进程编号），重启后发的消息落地、得到回答 |
 | 录制回归的来源 | `a_recorded_conversation_replays_through_the_adapter_state_machine` | 真对话（流式、工具调用与结果、两回合）的看守流水录成夹具，读回完整；回放的写出与回显一一对应且等于会话里落地消息的原生编号，完整块等于守护进程显示的内容 |
 
+正常语义集中在主接缝：`messages_held_during_creation_reach_the_real_cli_in_arrival_order` 验代持保序；`an_idle_backend_is_reclaimed_and_the_next_message_resumes_it` 同时验真实订阅阻止回收；创建失败场景验撤回后拒收及已代持消息的终态。
+
 ## 窄接缝一：`crates/nd-session/tests/`
 
 真的会话组件、独占登记、名册与 SQLite，经名册命令与会话流观察；后端是脚本化适配器（分层记录接纳、原生步骤生效、重报）。每次重跑都双跑比对纯度。
 
 | 行为 | 测试 |
 |---|---|
-| 首条消息回显才落定，列表标活动 | `a_created_session_becomes_active_once_its_first_message_lands` |
-| 拉起失败撤掉、提示一次，撤掉后的消息回 `precondition` | `a_create_that_never_started_a_backend_is_withdrawn_and_noticed_once` |
-| 首条消息交付不明：保留、部分完成，补偿弃置后端进程 | `a_create_whose_first_message_may_have_reached_the_backend_is_kept_as_partial` |
-| 创建中的消息代持，落定后按到达次序写出 | `messages_sent_while_the_session_is_being_created_are_held_then_sent_in_order` |
-| 闲置回收与按需拉起续接同一后端会话、换后端进程编号 | `an_idle_process_is_reclaimed_and_the_next_message_launches_it_again` |
-| 任务在跑或任务表看不清不回收；有人在看不回收 | `a_process_with_busy_or_unknown_background_work_is_not_reclaimed`、`a_watched_session_is_not_reclaimed_until_nobody_is_watching` |
+| 新建成功、拉起失败、首条消息不明的提交点恢复 | `create_reaches_active_or_is_compensated_at_every_commit_point`、`a_create_that_cannot_start_is_withdrawn_at_every_commit_point`、`a_create_whose_first_message_is_unknown_is_partial_at_every_commit_point` |
+| 闲置回收与按需续接的提交点恢复 | `idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_every_commit_point` |
+| 任务表 Unknown 在提交前、提交后及发件交出后逐提交点崩溃恢复仍不回收 | `unknown_background_work_remains_unreclaimable_at_every_commit_point` |
+| 连续忙碌输入压住 Tick 后重新计时，与重启后重新计时 | `busy_inputs_reset_idle_time_without_waiting_for_a_tick` |
+| 在途自动标题跨重启不占结构槽位、不挡发送台 | `a_pending_automatic_title_does_not_hold_shell_invocations` |
 
-引擎崩溃矩阵（`tests/matrix.rs`）在提交前、提交后交出发件前、交出后结果入账前三处的每一次提交上杀引擎、换新实例重开跑完。各（操作，场景）覆盖的提交点数：新建成功 6、新建拉起失败 4、新建首条消息不明 8、闲置回收＋按需拉起 15（三处故障点各一遍）。断言终态、原生步骤至多一次、没有留下进行中的操作、活进程与会话头一致。把「证明没写出就另发」的那一处改掉后，矩阵里三个场景失败，证明它能抓到漏另发与重复执行。
+引擎崩溃矩阵（`tests/matrix.rs`）在提交前、提交后交出发件前、交出后结果入账前三处的每一次提交上杀引擎、换新实例重开跑完。覆盖的提交点数由每次对照跑现场计数，不依赖旧实现的固定次数。断言终态、原生步骤至多一次、没有留下进行中的操作、活进程与会话头一致。
 
 ## 纯计算与录制回归
 

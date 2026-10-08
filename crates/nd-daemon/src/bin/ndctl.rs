@@ -201,12 +201,10 @@ fn quiet(snapshot: &Snapshot) -> bool {
         .iter()
         .filter(|i| i.kind == "prompt")
         .collect();
-    if prompts.iter().any(|p| {
-        !matches!(
-            p.data["state"].as_str(),
-            Some("landed" | "failed" | "unknown")
-        )
-    }) {
+    if prompts
+        .iter()
+        .any(|p| !nd_wire::PromptState::from_value(&p.data["state"]).terminal())
+    {
         return false;
     }
     let last_landed = prompts

@@ -3,6 +3,51 @@ use nd_wire::{Fallback, Item, Snapshot};
 use serde_json::json;
 
 #[test]
+fn retrying_an_uncertain_draft_save_preserves_new_edits_and_the_conflict_baseline() {
+    let mut draft = nd_view_model::Draft::default();
+    draft.observe(
+        nd_wire::Draft {
+            version: 4,
+            ..Default::default()
+        },
+        false,
+    );
+    draft.edit("first edit".into());
+    draft.save_command("s", "desktop", "lost").unwrap();
+    draft.save_failed(true);
+    draft.edit("edited while disconnected".into());
+    draft.observe(
+        nd_wire::Draft {
+            version: 5,
+            text: "other device".into(),
+            ..Default::default()
+        },
+        false,
+    );
+    draft.retry_save();
+    let retry = draft.save_command("s", "desktop", "retry").unwrap();
+    assert!(!draft.needs_receipt());
+    assert_eq!(retry.id, "retry");
+    assert_eq!(retry.args["text"], "edited while disconnected");
+    assert_eq!(
+        retry.expect["draft_version"], 4,
+        "a retry must not overwrite another device's draft"
+    );
+    draft.saved(
+        nd_wire::DraftUpdated {
+            draft: nd_wire::Draft {
+                version: 5,
+                text: "other device".into(),
+                ..Default::default()
+            },
+            saved: Some("retry".into()),
+        },
+        false,
+    );
+    assert!(draft.is_saved());
+}
+
+#[test]
 fn an_unconfirmed_send_keeps_its_text_until_the_user_edits_or_retries_saving() {
     let mut editor = nd_view_model::Draft::default();
     editor.observe(
@@ -272,6 +317,12 @@ fn completed_creation_is_out_of_the_chat_and_partial_failure_stays_explained() {
     assert!(view.header.contains("部分完成"));
     assert_eq!(view.messages[0].title, "新建会话");
     assert_eq!(view.messages[0].text, "首条消息交付不明");
+    assert_eq!(
+        view.messages[0].blocks,
+        vec![nd_view_model::MessageBlock::Plain(
+            "首条消息交付不明".into()
+        )]
+    );
 }
 
 #[test]
@@ -325,7 +376,7 @@ fn delivery_unknown_is_explained_and_only_confirmed_non_delivery_offers_resend()
 fn attachment_edits_participate_in_draft_receipt_revision() {
     let mut draft = nd_view_model::Draft::default();
     let a = nd_wire::Attachment {
-        blob: "a".repeat(64),
+        blob: "a".repeat(64).parse().unwrap(),
         name: "图.png".into(),
         media_type: "image/png".into(),
         size: 42,

@@ -22,6 +22,7 @@ def inner():
     daemon = None
     portals = []
     offsets = {}
+    click_after = {}
 
     def start(name):
         for path in ['/sandbox/controls.json', '/sandbox/escape.json']:
@@ -52,19 +53,33 @@ def inner():
         raise AssertionError('theme never rendered: ' + (out / f'{name}.jsonl').read_text()[-3000:])
 
     def click(app, name, control):
-        # 日志在 Render 开始时发出，命中坐标要等该帧完成绘制。
-        time.sleep(.1)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            for line in reversed((out / f'{name}.jsonl').read_text().splitlines()):
+            for line in reversed((out / f'{name}.jsonl').read_text().splitlines()[click_after.get(name, 0):]):
                 try:
                     data = json.loads(line).get('theme_control')
                 except json.JSONDecodeError:
                     continue
                 if data and data['id'] == control:
-                    Path('/sandbox/controls.json').write_text(json.dumps({'nonce': time.monotonic_ns(), 'click': data['center']}))
-                    time.sleep(.15)
-                    return
+                    nonce = time.monotonic_ns()
+                    Path('/sandbox/controls.json').write_text(json.dumps({'nonce': nonce, 'click': data['center']}))
+                    while time.monotonic() < deadline:
+                        events = []
+                        for event_line in (out / f'{name}.jsonl').read_text().splitlines():
+                            try:
+                                events.append(json.loads(event_line))
+                            except json.JSONDecodeError:
+                                pass
+                        consumed = next((i for i, e in enumerate(events) if e.get('theme_input_consumed') == nonce), None)
+                        if consumed is not None and any('theme_control' in e for e in events[consumed + 1:]):
+                            # A theme change can move every menu row. The next
+                            # click must find its own control after this receipt,
+                            # even if only the menu button has painted so far.
+                            click_after[name] = consumed + 1
+                            return
+                        assert app.poll() is None
+                        time.sleep(.02)
+                    raise AssertionError(f'{control}: input nonce was not consumed and painted')
             time.sleep(.03)
         raise AssertionError('missing theme control: ' + control)
 
@@ -101,16 +116,35 @@ def inner():
         config = Path('/sandbox/config/xdg-desktop-portal')
         config.mkdir()
         (config / 'portals.conf').write_text('[preferred]\ndefault=gtk\n')
-        for binary in ['/usr/lib/dconf-service', '/usr/lib/xdg-desktop-portal-gtk', '/usr/lib/xdg-desktop-portal']:
+        for binary, bus_name in [
+            ('/usr/lib/dconf-service', 'ca.desrt.dconf'),
+            ('/usr/lib/xdg-desktop-portal-gtk', 'org.freedesktop.impl.portal.desktop.gtk'),
+            ('/usr/lib/xdg-desktop-portal', 'org.freedesktop.portal.Desktop'),
+        ]:
             log = (out / (Path(binary).name + '.log')).open('w')
             handles.append(log)
-            portals.append(subprocess.Popen([binary], stdout=log, stderr=log, env=dict(os.environ, GDK_BACKEND='wayland')))
+            portal = subprocess.Popen([binary], stdout=log, stderr=log, env=dict(os.environ, GDK_BACKEND='wayland'))
+            portals.append(portal)
+            # The frontend may otherwise activate a second GTK backend through
+            # D-Bus before the explicitly launched Wayland backend owns its name.
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                assert portal.poll() is None, Path(log.name).read_text()
+                owner = subprocess.run(['gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+                    '--object-path', '/org/freedesktop/DBus', '--method', 'org.freedesktop.DBus.NameHasOwner',
+                    bus_name], capture_output=True, text=True, timeout=3)
+                if owner.returncode == 0 and owner.stdout.strip() == '(true,)':
+                    break
+                time.sleep(.03)
+            else:
+                raise AssertionError(bus_name + ' did not acquire its bus name: ' + Path(log.name).read_text())
         system_scheme('prefer-light')
         log = (out / 'daemon.log').open('w')
         handles.append(log)
         daemon = subprocess.Popen(['/nd-daemon', '--root', '/sandbox/daemon'], stdout=log, stderr=log)
         app = start('theme')
-        original = wait(app, 'theme', lambda t: t['theme']['colors']['background'] == '#123456ff')
+        original = wait(app, 'theme', lambda t: True)
+        assert original['theme']['colors']['background'] == '#123456ff' and original['warning'] is None, original
         screenshot('custom', [(18, 52, 86), (23, 63, 95)])
         replacement = themes / 'replacement.tmp'
         replacement.write_text(ocean.replace('#123456ff', '#26384aff').replace('"body": 18', '"body": 20'))
@@ -170,7 +204,8 @@ def inner():
         (themes / 'ocean.json').unlink()
         Path('/sandbox/state/ui.json').write_text(json.dumps({'theme_selection': {'kind': 'file', 'file': 'missing.json'}}))
         app = start('missing')
-        wait(app, 'missing', lambda t: t['warning'] is not None and 'missing.json' in t['warning'])
+        missing = wait(app, 'missing', lambda t: True)
+        assert missing['warning'] is not None and 'missing.json' in missing['warning'], missing
         (themes / 'missing.json').write_text(ocean)
         wait(app, 'missing', lambda t: t['warning'] is None and t['theme']['colors']['background'] == '#123456ff')
         (themes / 'missing.json').unlink()

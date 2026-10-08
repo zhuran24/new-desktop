@@ -18,7 +18,7 @@ impl Desktop {
             .or_default()
             .attachments()
             .len();
-        if sources.len() + existing + self.uploading > 8 {
+        if sources.len() + existing + self.uploading > nd_wire::MAX_ATTACHMENTS_PER_MESSAGE {
             self.warning = Some("每条消息最多 8 个附件".into());
             cx.notify();
             return;
@@ -59,24 +59,17 @@ impl Desktop {
             "image/gif" => ImageFormat::Gif,
             _ => return,
         };
-        if self.images.contains_key(&a.blob) {
+        if !self.images.request(a.blob.as_str()) {
             return;
         }
-        // 显示缓存有界；字节的持久所有者是守护进程 Blobs。
-        if self.images.len() >= 64 {
-            self.images.pop_first();
-        }
-        self.images.insert(a.blob.clone(), None);
         let client = self.client.clone();
         let blob = a.blob.clone();
         cx.spawn(async move |weak, cx| {
             let result = client.blob(blob.clone()).await;
             let _ = weak.update(cx, |this, cx| {
-                if let Ok(bytes) = result
-                    && this.images.contains_key(&blob)
-                {
+                if let Ok(bytes) = result {
                     this.images
-                        .insert(blob, Some(Arc::new(Image::from_bytes(format, bytes))));
+                        .complete(blob.as_str(), Arc::new(Image::from_bytes(format, bytes)));
                 }
                 cx.notify();
             });
@@ -87,14 +80,14 @@ impl Desktop {
         let t = &self.theme;
         let attachment = a.clone();
         let missing_image = a.media_type.starts_with("image/")
-            && self.images.get(&a.blob).and_then(Clone::clone).is_none();
+            && self.images.get(a.blob.as_str()).cloned().is_none();
         div()
             .id(SharedString::from(format!("{}/{}", a.blob, a.name)))
             .when(missing_image, |d| {
                 d.cursor_pointer()
                     .child("点击加载图片或重试")
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.images.remove(&attachment.blob);
+                        this.images.remove(attachment.blob.as_str());
                         this.load_attachment_image(&attachment, cx);
                     }))
             })
@@ -104,17 +97,14 @@ impl Desktop {
             .text_color(rgba(t.colors.muted))
             .text_size(px(t.typography.small))
             .child(format!("📎 {} · {} 字节", a.name, a.size))
-            .when_some(
-                self.images.get(&a.blob).and_then(Clone::clone),
-                |d, image| {
-                    d.child(
-                        img(image)
-                            .max_w(px(t.spacing.large * 10.))
-                            .max_h(px(t.spacing.large * 6.))
-                            .object_fit(ObjectFit::Contain),
-                    )
-                },
-            )
+            .when_some(self.images.get(a.blob.as_str()).cloned(), |d, image| {
+                d.child(
+                    img(image)
+                        .max_w(px(t.spacing.large * 10.))
+                        .max_h(px(t.spacing.large * 6.))
+                        .object_fit(ObjectFit::Contain),
+                )
+            })
             .into_any_element()
     }
     pub(crate) fn draft_attachments(&self, cx: &mut Context<Self>) -> AnyElement {

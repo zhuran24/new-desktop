@@ -18,6 +18,48 @@ fn message(id: &str, parent: Option<&str>, role: &str, text: &str) -> Value {
 }
 
 #[test]
+fn an_ordinary_pin_below_a_parallel_result_follows_the_remaining_batch() {
+    let mut a1 = message("a1", Some("u"), "assistant", "");
+    a1["message"]["id"] = json!("batch");
+    a1["message"]["content"] = json!([{"type":"tool_use","id":"t1","name":"Read","input":{}}]);
+    let mut a2 = message("a2", Some("a1"), "assistant", "");
+    a2["message"]["id"] = json!("batch");
+    a2["message"]["content"] = json!([{"type":"tool_use","id":"t2","name":"Read","input":{}}]);
+    let mut r1 = message("r1", Some("a1"), "user", "");
+    r1["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"t1","content":"one"}]);
+    let mut r2 = message("r2", Some("a2"), "user", "");
+    r2["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"t2","content":"two"}]);
+    for (kind, parent, tool) in [
+        ("attachment", "r1", None),
+        ("system", "r1", None),
+        ("user", "r1", None),
+        ("attachment", "a1", Some("t1")),
+    ] {
+        let mut extra = message("extra", Some(parent), kind, "metadata");
+        extra["isMeta"] = json!(true);
+        if let Some(tool) = tool {
+            extra["attachment"] = json!({"type":"tool_result", "toolUseID":tool});
+        }
+        let data = transcript(&[
+            message("u", None, "user", "read both"),
+            a1.clone(),
+            a2.clone(),
+            r1.clone(),
+            extra,
+            json!({"type":"last-prompt","leafUuid":"extra"}),
+            r2.clone(),
+            message("next", Some("r2"), "assistant", "done"),
+        ]);
+        let index = RecordIndex::parse(&data).unwrap();
+        assert_eq!(
+            index.current().unwrap().leaf(),
+            Some("next"),
+            "pin on {kind}"
+        );
+    }
+}
+
+#[test]
 fn history_follows_the_current_leaf_and_excludes_a_rewound_branch() {
     let data = transcript(&[
         message("alpha", None, "user", "你好"),
@@ -315,13 +357,15 @@ fn parallel_assistant_blocks_and_sibling_tool_results_are_not_lost() {
         a1,
         a2,
         r1,
+        json!({"type":"attachment","uuid":"date","parentUuid":"r1","attachment":{"type":"date","date":"2026-10-07"}}),
+        json!({"type":"attachment","uuid":"other","parentUuid":"r1","attachment":{"type":"date","date":"2026-10-08"}}),
         r2,
         message("done", Some("r2"), "assistant", "done"),
     ]);
     let index = RecordIndex::parse(&data).unwrap();
     assert_eq!(
         index.current().unwrap().ids().collect::<Vec<_>>(),
-        ["u", "a1", "a2", "r1", "r2", "done"]
+        ["u", "a2", "a1", "r1", "date", "other", "r2", "done"]
     );
 }
 
@@ -538,4 +582,267 @@ fn real_cli_prefixes_select_rewind_and_new_branch_before_compaction() {
         }
     }
     panic!("missing real CLI compact boundary");
+}
+
+#[test]
+fn attachments_below_selected_tool_metadata_are_recovered() {
+    let mut call = message("a", Some("u"), "assistant", "");
+    call["message"]["id"] = json!("reply");
+    call["message"]["content"] = json!([{"type":"tool_use","id":"t","name":"Read","input":{}}]);
+    let mut result = message("r", Some("a"), "user", "");
+    result["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"t","content":"ok"}]);
+    let mut meta = message("meta", Some("r"), "user", "metadata");
+    meta["isMeta"] = json!(true);
+    let data = transcript(&[
+        message("u", None, "user", "read"),
+        call,
+        result,
+        meta,
+        json!({"type":"attachment","uuid":"date","parentUuid":"meta","attachment":{"type":"date","date":"2026-10-07"}}),
+        message("done", Some("meta"), "assistant", "done"),
+    ]);
+    let index = RecordIndex::parse(&data).unwrap();
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        ["u", "a", "r", "meta", "date", "done"]
+    );
+}
+
+#[test]
+fn attachment_below_text_only_member_of_a_tool_reply_is_recovered() {
+    let mut a1 = message("a1", Some("u"), "assistant", "");
+    a1["message"]["id"] = json!("batch");
+    a1["message"]["content"] = json!([{"type":"tool_use","id":"t","name":"Read","input":{}}]);
+    let mut a2 = message("a2", Some("a1"), "assistant", "text after call");
+    a2["message"]["id"] = json!("batch");
+    let mut r = message("r", Some("a1"), "user", "");
+    r["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"t","content":"ok"}]);
+    let data = transcript(&[
+        message("u", None, "user", "read"),
+        a1,
+        a2,
+        r,
+        json!({"type":"attachment","uuid":"date","parentUuid":"a2","attachment":{"type":"date","date":"2026-10-08"}}),
+        message("done", Some("r"), "assistant", "done"),
+    ]);
+    let index = RecordIndex::parse(&data).unwrap();
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        ["u", "a1", "a2", "r", "date", "done"]
+    );
+}
+
+#[test]
+fn recovered_attachments_stay_at_their_selected_metadata_anchor() {
+    // mAr from pinned CLI 2.1.289: p24-cli-probe.js, independent audit input.
+    let data = include_bytes!("fixtures/anchored-metadata.jsonl");
+    let index = RecordIndex::parse(data).unwrap();
+    let history = index.current().unwrap();
+    let expected = ["u", "a", "r", "meta1", "date", "meta2", "done"];
+    assert_eq!(history.ids().collect::<Vec<_>>(), expected);
+    let mut before = None;
+    let mut pages = Vec::new();
+    loop {
+        let page = history
+            .page(before, std::num::NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        before = page.next_before;
+        pages.push(page.records.iter().map(|r| r.uuid()).collect::<Vec<_>>());
+        if before.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        pages.into_iter().rev().flatten().collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn anchored_tails_ignore_file_position_and_keep_sibling_chains_in_order() {
+    let rows: Vec<Value> = include_str!("fixtures/anchored-metadata.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // Literal expected sequences independently evaluated with pinned mAr.
+    for position in [0, 3, 5, 6] {
+        let mut variant = rows.clone();
+        let date = variant.remove(5);
+        variant.insert(position, date);
+        variant.push(json!({"type":"last-prompt","leafUuid":"done","explicit":true}));
+        let data = transcript(&variant);
+        let index = RecordIndex::parse(&data).unwrap();
+        assert_eq!(
+            index.current().unwrap().ids().collect::<Vec<_>>(),
+            ["u", "a", "r", "meta1", "date", "meta2", "done"],
+            "position {position}"
+        );
+    }
+    let mut variant = rows;
+    variant.insert(
+        6,
+        json!({"type":"attachment","uuid":"tail","parentUuid":"date","attachment":{"type":"date"}}),
+    );
+    variant.insert(7, json!({"type":"attachment","uuid":"second","parentUuid":"meta1","attachment":{"type":"date"}}));
+    let data = transcript(&variant);
+    let index = RecordIndex::parse(&data).unwrap();
+    // Tail sidechain equality is strict: absent is not the anchor's false.
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        ["u", "a", "r", "meta1", "meta2", "done"]
+    );
+    variant[6]["isSidechain"] = json!(false);
+    variant[7]["isSidechain"] = json!(false);
+    let data = transcript(&variant);
+    let index = RecordIndex::parse(&data).unwrap();
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        [
+            "u", "a", "r", "meta1", "date", "tail", "second", "meta2", "done"
+        ]
+    );
+}
+
+#[test]
+fn an_attachment_at_the_selected_leaf_is_returned_only_once() {
+    let mut rows: Vec<Value> = include_str!("fixtures/anchored-metadata.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows.push(json!({"type":"last-prompt","leafUuid":"meta1","explicit":true}));
+    let data = transcript(&rows);
+    let index = RecordIndex::parse(&data).unwrap();
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        ["u", "a", "r", "meta1", "date"]
+    );
+}
+
+#[test]
+fn stale_results_and_their_attachments_use_the_cli_effective_order() {
+    // Independent audit fixtures and literal mAr output from pinned CLI 2.1.289.
+    for (data, expected) in [
+        (
+            include_bytes!("fixtures/stale-result-early-attachment.jsonl").as_slice(),
+            ["u", "a1", "a2", "date", "r2"],
+        ),
+        (
+            include_bytes!("fixtures/stale-result-early-result.jsonl").as_slice(),
+            ["u", "a1", "a2", "r2", "date"],
+        ),
+    ] {
+        let index = RecordIndex::parse(data).unwrap();
+        let history = index.current().unwrap();
+        assert_eq!(history.ids().collect::<Vec<_>>(), expected);
+        for size in [1, 2, 3, 10] {
+            let mut before = None;
+            let mut pages = Vec::new();
+            loop {
+                let page = history
+                    .page(before, std::num::NonZeroUsize::new(size).unwrap())
+                    .unwrap();
+                before = page.next_before;
+                pages.push(page.records.iter().map(|r| r.uuid()).collect::<Vec<_>>());
+                if before.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(
+                pages.into_iter().rev().flatten().collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn stale_result_order_variants_match_the_pinned_cli() {
+    let cases: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/stale-result-orders.json")).unwrap();
+    for case in cases {
+        let mut rows = case["rows"].as_array().unwrap().clone();
+        rows.push(json!({"type":"last-prompt","leafUuid":"a2","explicit":true}));
+        let data = transcript(&rows);
+        let index = RecordIndex::parse(&data).unwrap();
+        let expected: Vec<_> = case["expected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            index.current().unwrap().ids().collect::<Vec<_>>(),
+            expected,
+            "{}",
+            case["name"]
+        );
+    }
+}
+
+#[test]
+fn ordinary_history_recovery_scales_with_record_count() {
+    fn measure(count: usize) -> std::time::Duration {
+        let rows: Vec<_> = (0..count)
+            .map(|i| {
+                message(
+                    &format!("m{i}"),
+                    (i > 0).then(|| format!("m{}", i - 1)).as_deref(),
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    "text",
+                )
+            })
+            .collect();
+        let data = transcript(&rows);
+        let index = RecordIndex::parse(&data).unwrap();
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let history = index.current().unwrap();
+                assert_eq!(history.ids().count(), count);
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+    // Eight times the input allows a generous 24x runtime, but rejects the
+    // previous per-message suffix scan (quadratic, approximately 64x).
+    let small = measure(4_000);
+    let large = measure(32_000);
+    eprintln!("current(): 4000={small:?}, 32000={large:?}");
+    assert!(
+        large < small * 24,
+        "history recovery regressed: {small:?} -> {large:?}"
+    );
+}
+
+#[test]
+fn tool_history_recovery_does_not_rescan_all_selected_results_per_message() {
+    fn measure(count: usize) -> std::time::Duration {
+        let rows: Vec<_> = (0..count).map(|i| {
+            let mut row = message(&format!("m{i}"), (i > 0).then(|| format!("m{}", i-1)).as_deref(), if i % 3 == 1 { "assistant" } else { "user" }, "text");
+            if i % 3 == 1 {
+                row["message"]["content"] = json!([{"type":"tool_use","id":format!("tool{i}"),"name":"Read","input":{}}]);
+            } else if i % 3 == 2 {
+                row["message"]["content"] = json!([{"type":"tool_result","tool_use_id":format!("tool{}",i-1),"content":"ok"}]);
+            }
+            row
+        }).collect();
+        let data = transcript(&rows);
+        let index = RecordIndex::parse(&data).unwrap();
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                assert_eq!(index.current().unwrap().ids().count(), count);
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+    let small = measure(16_000);
+    let large = measure(256_000);
+    eprintln!("tool current(): 16000={small:?}, 256000={large:?}");
+    assert!(
+        large < small * 40,
+        "tool history recovery regressed: {small:?} -> {large:?}"
+    );
 }

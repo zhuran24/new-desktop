@@ -10,62 +10,37 @@ import queue
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
 
-CLI = Path('/mnt/wd_external/nd-build/cli/claude-2.1.289')
+CLI = Path('/cli')
 
 
 def outside():
+    global CLI
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'nd-testkit/python'))
+    from isolation import Sandbox, PINNED_CLI, environment
+    CLI = PINNED_CLI
     destination = Path(sys.argv[1]).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    if any(destination.iterdir()):
-        raise ValueError('evidence destination must be empty')
-    with tempfile.TemporaryDirectory(prefix='nd-records-', dir='/mnt/wd_external/nd-build/tmp') as tmp:
-        root = Path(tmp)
-        for folder in ('home', 'config', 'cache', 'data', 'state', 'runtime', 'project', 'out'):
-            (root / folder).mkdir()
+    assert not any(destination.iterdir()), 'evidence destination must be empty'
+    with Sandbox('records', memory_max=12 * 1024**3, temporary_parent='/mnt/wd_external/nd-build/tmp', mount='/fixture') as box:
+        root = box.root
         shutil.copyfile(__file__, root / 'generate.py')
-        unit = 'nd-test-records-' + uuid.uuid4().hex[:12]
-        slice_name = unit.rsplit('-', 1)[0] + unit.rsplit('-', 1)[1] + '.slice'
-        subprocess.run(['busctl', '--user', 'call', 'org.freedesktop.systemd1',
-            '/org/freedesktop/systemd1', 'org.freedesktop.systemd1.Manager', 'StartTransientUnit',
-            'ssa(sv)a(sa(sv))', slice_name, 'fail', '3',
-            'MemoryMax', 't', str(12 * 1024**3), 'MemorySwapMax', 't', '0',
-            'CollectMode', 's', 'inactive-or-failed', '0'], check=True, stdout=subprocess.DEVNULL)
+        (root / 'environment.json').write_text(json.dumps(environment('/fixture', claude=True, CLAUDE_CONFIG_DIR='/fixture/config')))
+        (root / 'out/isolation.json').write_text(json.dumps(dict(slice=box.slice, **box.limits()), indent=2) + '\n')
         try:
-            group_path = subprocess.check_output(['systemctl', '--user', 'show', slice_name,
-                '--property=ControlGroup', '--value'], text=True).strip()
-            memory = Path('/sys/fs/cgroup') / group_path.lstrip('/')
-            isolation = {'slice': slice_name, 'memory_max': (memory / 'memory.max').read_text().strip(),
-                         'memory_swap_max': (memory / 'memory.swap.max').read_text().strip()}
-            assert isolation['memory_max'] == str(12 * 1024**3), isolation
-            assert isolation['memory_swap_max'] == '0', isolation
-            (root / 'out' / 'isolation.json').write_text(json.dumps(isolation, indent=2) + '\n')
-            args = ['systemd-run', '--user', '--wait', '--pipe', '--collect', '--quiet',
-                    '--unit=' + unit, '--slice=' + slice_name,
-                    '-p', 'MemoryMax=12G', '-p', 'MemorySwapMax=0', '-p', 'RuntimeMaxSec=180',
-                    'bwrap', '--unshare-all', '--die-with-parent', '--new-session',
-                    '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin',
-                    '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib', '/lib64',
-                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/etc',
-                    '--bind', str(root), '/fixture', '--ro-bind', str(CLI), '/cli',
-                    '--chdir', '/fixture/project', '--clearenv',
-                    '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'HOME', '/fixture/home',
-                    '/usr/bin/python3', '/fixture/generate.py', '--inside']
-            subprocess.run(args, check=True)
+            subprocess.run(box.command(['/usr/bin/python3', '/fixture/generate.py', '--inside'], bindings=[(CLI, '/cli')], runtime_max=180), check=True)
         finally:
-            # Transient service is collected; this dedicated slice has no other consumers.
-            subprocess.run(['systemctl', '--user', 'stop', slice_name], check=True)
             for file in (root / 'out').iterdir():
                 shutil.copyfile(file, destination / file.name)
-        manifest = json.loads((destination / 'manifest.json').read_text())
-        manifest['cli_sha256'] = hashlib.file_digest(CLI.open('rb'), 'sha256').hexdigest()
-        manifest['isolation'] = 'bwrap --unshare-all; empty environment; temporary HOME/config/XDG; unique nd-test-records*.slice; MemoryMax=12G; no host home or run mount'
-        (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-        print(json.dumps(manifest, indent=2))
+    manifest = json.loads((destination / 'manifest.json').read_text())
+    manifest['cli_sha256'] = hashlib.file_digest(CLI.open('rb'), 'sha256').hexdigest()
+    manifest['isolation'] = 'shared nd-testkit Sandbox; bwrap --unshare-all; temporary HOME/config/XDG; transient slice; MemoryMax=12G; no host home or run mount'
+    manifest['cleanup'] = {'temporary_directory_removed': not root.exists(), 'units_inactive': True, 'unit': box.unit, 'slice': box.slice}
+    (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(json.dumps(manifest, indent=2))
 
 
 class Model(http.server.BaseHTTPRequestHandler):
@@ -180,14 +155,7 @@ class Session:
 
 
 def inside():
-    env = dict(PATH='/usr/bin:/bin', HOME='/fixture/home', CLAUDE_CONFIG_DIR='/fixture/config',
-               XDG_CONFIG_HOME='/fixture/config', XDG_CACHE_HOME='/fixture/cache',
-               XDG_DATA_HOME='/fixture/data', XDG_STATE_HOME='/fixture/state',
-               XDG_RUNTIME_DIR='/fixture/runtime', LANG='C.UTF-8', TERM='dumb',
-               DISABLE_AUTOUPDATER='1', DISABLE_TELEMETRY='1', DISABLE_ERROR_REPORTING='1',
-               CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1', CLAUDE_CODE_EAGER_FLUSH='1',
-               CLAUDE_CODE_SDK_READS_SESSION_STATE='1', ANTHROPIC_API_KEY='offline-fixture',
-               ANTHROPIC_BASE_URL='http://127.0.0.1:8765')
+    env = json.loads(Path('/fixture/environment.json').read_text())
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 8765), Model)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     session = Session(env, 'write')

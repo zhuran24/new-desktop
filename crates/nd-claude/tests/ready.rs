@@ -94,7 +94,10 @@ fn skills_mod(root: &std::path::Path, name: &str) {
 async fn backend_gets_the_spec_template_without_preload_and_with_the_four_old_mods_disabled() {
     let fx = Fixture::start("claude-template").await;
     let root = fx.scenario.root().to_owned();
-    for name in nd_claude::OLD_MODS.iter().chain(&["keep-me", "owner-off"]) {
+    for name in ["codex-direct", "sendnow", "cc-quota", "ultracode-toggle"]
+        .iter()
+        .chain(&["keep-me", "owner-off"])
+    {
         skills_mod(&root, name);
     }
     // owner 自己在用户设置里关掉的 mod 仍然关着：flag 层的 enabledPlugins 按键合并，不整体覆盖。
@@ -114,8 +117,10 @@ async fn backend_gets_the_spec_template_without_preload_and_with_the_four_old_mo
         .insert("CLAUDE_CODE_PLUGIN_DIR_WATCH".into(), "1".into());
     let claude = fx.claude(config);
     let session = session_id();
+    let mut open = fx.fresh(&session);
+    open.permission_mode = Some("acceptEdits".into());
     let run = claude
-        .open("template", fx.fresh(&session), InitOptions::default())
+        .open("template", open, InitOptions::default())
         .await
         .unwrap();
     let pid = run.ready().identity.pid;
@@ -164,6 +169,12 @@ async fn backend_gets_the_spec_template_without_preload_and_with_the_four_old_mo
     };
     assert_eq!(value_of("--permission-prompt-tool"), "stdio");
     assert_eq!(value_of("--session-id"), session);
+    assert_eq!(value_of("--model"), MODEL);
+    assert_eq!(value_of("--permission-mode"), "acceptEdits");
+    assert_eq!(
+        run.ready().initialize["current_permission_mode"],
+        "acceptEdits"
+    );
     assert_eq!(
         cmdline.iter().filter(|a| *a == "--plugin-dir").count(),
         2,
@@ -200,7 +211,10 @@ async fn backend_gets_the_spec_template_without_preload_and_with_the_four_old_mo
     })
     .await
     .expect("an unrelated skills-dir mod still loads");
-    for name in nd_claude::OLD_MODS.iter().chain(&["owner-off"]) {
+    for name in ["codex-direct", "sendnow", "cc-quota", "ultracode-toggle"]
+        .iter()
+        .chain(&["owner-off"])
+    {
         assert!(!loaded(name), "{name} loaded");
     }
     drop(run);
@@ -328,7 +342,7 @@ async fn a_resumed_backend_is_ready_when_both_mods_report_the_resumed_session() 
             .inspect()
             .unwrap()
             .iter()
-            .any(|f| f.run == "first" && f.state == "Up")
+            .any(|f| f.run == "first" && f.state == nd_runs::RunState::Up)
         {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -350,6 +364,38 @@ async fn a_resumed_backend_is_ready_when_both_mods_report_the_resumed_session() 
         assert_eq!(resumed.ready().hellos[&module].backend_session_id, session);
     }
     drop(resumed);
+    drop(claude);
+    fx.close();
+}
+
+#[tokio::test]
+async fn capabilities_require_initialize_declarations_and_failed_adoption_removes_its_binding() {
+    let fx = Fixture::start("claude-declared-caps").await;
+    let mut config = fx.config();
+    config.env.insert("DISABLE_COMPACT".into(), "1".into());
+    let claude = fx.claude(config);
+    let session = session_id();
+    let run = claude
+        .open("caps", fx.fresh(&session), InitOptions::default())
+        .await
+        .unwrap();
+    let caps = run.ready().caps.clone();
+    assert!(
+        caps.unsupported(nd_claude::Feature::CodexSubagent)
+            .is_some(),
+        "no hook agent was declared"
+    );
+    assert!(
+        caps.unsupported(nd_claude::Feature::Summarize).is_some(),
+        "compact was omitted by the real CLI"
+    );
+    assert!(caps.unsupported(nd_claude::Feature::BangMode).is_none());
+    assert!(claude.adopt("absent-run", &session, caps).await.is_err());
+    assert!(
+        claude.channel().binding("absent-run").is_none(),
+        "failed adopt must unregister"
+    );
+    drop(run);
     drop(claude);
     fx.close();
 }

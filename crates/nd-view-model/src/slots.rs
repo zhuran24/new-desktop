@@ -57,7 +57,7 @@ impl<T> Drop for SlotGuard<T> {
 }
 impl<T: Clone> Slots<T> {
     pub fn changed(&self) -> nd_kernel::Changed {
-        self.kernel.changed_since(self.kernel.revision())
+        self.kernel.changed_since(self.kernel.change_count())
     }
     pub fn configure(
         &mut self,

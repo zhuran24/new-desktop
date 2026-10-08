@@ -1,6 +1,6 @@
 //! 按节监视、校验后发布的配置。修订号不跨守护进程纪元复用。
 use notify::Watcher;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
     io::Write,
@@ -19,7 +19,33 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
-pub type Revision = String;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Revision(String);
+impl Revision {
+    fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+impl std::str::FromStr for Revision {
+    type Err = uuid::Error;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        uuid::Uuid::parse_str(value)?;
+        Ok(Self(value.into()))
+    }
+}
+impl TryFrom<String> for Revision {
+    type Error = uuid::Error;
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+impl From<Revision> for String {
+    fn from(value: Revision) -> Self {
+        value.0
+    }
+}
+
 pub type Validator = fn(&Value) -> Result<()>;
 
 pub trait ConfigSource: Send + Sync {
@@ -95,6 +121,15 @@ pub struct Config {
 }
 pub trait Section: DeserializeOwned + Clone {
     const NAME: &'static str;
+    fn parse(value: &Value) -> Result<Self> {
+        let section: Self = serde_json::from_value(value[Self::NAME].clone())
+            .map_err(|e| Error::Invalid(format!("{}: {e}", Self::NAME)))?;
+        section.check()?;
+        Ok(section)
+    }
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
 }
 pub struct SectionWatch<S> {
     last: Value,
@@ -106,8 +141,7 @@ impl<S: Section> SectionWatch<S> {
         let s = self.receiver.borrow();
         Ok(Versioned {
             revision: s.revision.clone(),
-            value: serde_json::from_value(s.value[S::NAME].clone())
-                .map_err(|e| Error::Invalid(e.to_string()))?,
+            value: S::parse(&s.value)?,
         })
     }
     pub async fn changed(&mut self) -> Result<Versioned<S>> {
@@ -133,7 +167,7 @@ impl Config {
         let text = source.read()?;
         let value = parse(text.as_deref(), &defaults, validate)?;
         let published = Versioned {
-            revision: uuid::Uuid::new_v4().to_string(),
+            revision: Revision::new(),
             value,
         };
         let (changed, _) = watch::channel(published.clone());
@@ -171,29 +205,35 @@ impl Config {
             return Ok(false);
         }
         state.published = Versioned {
-            revision: uuid::Uuid::new_v4().to_string(),
+            revision: Revision::new(),
             value,
         };
         self.changed.send_replace(state.published.clone());
         Ok(true)
     }
-    pub fn update(&self, patch: Value, expect: &str) -> Result<Revision> {
+    pub fn update(&self, patch: Value, expect: &Revision) -> Result<Revision> {
         self.refresh()?;
         let mut state = self.state.lock().unwrap();
-        if state.published.revision != expect {
+        if &state.published.revision != expect {
             return Err(Error::Conflict);
         }
         if !patch.is_object() {
             return Err(Error::Invalid("补丁必须为对象".into()));
         }
-        let mut value = state.published.value.clone();
-        merge(&mut value, patch);
-        (self.validate)(&value)?;
-        let text = toml::to_string_pretty(&value).map_err(|e| Error::Invalid(e.to_string()))?;
+        let mut user = match state.text.as_deref() {
+            Some(text) => serde_json::to_value(
+                toml::from_str::<toml::Value>(text).map_err(|e| Error::Invalid(e.to_string()))?,
+            )
+            .map_err(|e| Error::Invalid(e.to_string()))?,
+            None => serde_json::json!({}),
+        };
+        merge_patch(&mut user, patch);
+        let text = toml::to_string_pretty(&user).map_err(|e| Error::Invalid(e.to_string()))?;
+        let value = parse(Some(&text), &self.defaults, self.validate)?;
         self.source.compare_and_swap(state.text.as_deref(), &text)?;
         state.text = Some(text);
         state.published = Versioned {
-            revision: uuid::Uuid::new_v4().to_string(),
+            revision: Revision::new(),
             value,
         };
         self.changed.send_replace(state.published.clone());
@@ -217,6 +257,25 @@ fn merge(target: &mut Value, patch: Value) {
     if let (Some(a), Some(b)) = (target.as_object_mut(), patch.as_object()) {
         for (key, value) in b {
             merge(a.entry(key.clone()).or_insert(Value::Null), value.clone());
+        }
+    } else {
+        *target = patch;
+    }
+}
+
+/// User patches delete explicit overrides with null; defaults are merged only for validation/publication.
+fn merge_patch(target: &mut Value, patch: Value) {
+    if let Value::Object(patch) = patch {
+        if !target.is_object() {
+            *target = serde_json::json!({});
+        }
+        let target = target.as_object_mut().unwrap();
+        for (key, value) in patch {
+            if value.is_null() {
+                target.remove(&key);
+            } else {
+                merge_patch(target.entry(key).or_insert(Value::Null), value);
+            }
         }
     } else {
         *target = patch;

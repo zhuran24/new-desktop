@@ -21,7 +21,7 @@ pub enum Shown {
     },
     Control {
         id: String,
-        state: String,
+        state: nd_wire::ControlState,
         outcome: Value,
     },
     Lineage {
@@ -36,7 +36,7 @@ pub enum Shown {
         id: String,
         text: String,
         intent: String,
-        state: String,
+        state: nd_wire::PromptState,
         native: Option<String>,
         reason: Option<String>,
     },
@@ -127,16 +127,7 @@ impl Shown {
                 "control",
                 json!({"control": id, "state": state, "outcome": outcome}),
                 "操作结果".to_owned(),
-                match state.as_str() {
-                    "acknowledged" => "停止请求已送达",
-                    "pending" => "正在处理",
-                    "withdrawn" => "已撤回，内容已保存在草稿中",
-                    "not_withdrawable" => "消息已开始处理，无法撤回",
-                    "unknown" => "交付不明，请核对会话状态",
-                    "failed" => "操作失败",
-                    other => other,
-                }
-                .into(),
+                state.label().into(),
             ),
             Shown::Lineage { data } => (
                 "lineage",
@@ -222,6 +213,11 @@ impl Shown {
             ),
             Shown::Invoke { kind, data, .. } => {
                 let state = data["state"].as_str().unwrap_or("?");
+                let state = if kind == "shell" && data["appended"] == false {
+                    format!("{state}，输出没有进对话")
+                } else {
+                    state.to_owned()
+                };
                 let (title, text) = match kind.as_str() {
                     "shell" => (
                         "! 命令".to_owned(),

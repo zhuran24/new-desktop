@@ -10,6 +10,7 @@ pub const VERSION: u32 = 1;
 // 附件最多 16 MiB；base64、JSON 转义和看守信封仍须装得下。
 // 单行界限为 MAX_FRAME / 4（32 MiB），读回批次仍受此帧界限约束。
 pub const MAX_FRAME: usize = 128 * 1024 * 1024;
+pub const MAX_RECORDS_PER_READ: usize = 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
@@ -107,6 +108,9 @@ pub struct Hello {
     pub watchdog: Identity,
     pub high: u64,
     pub written: u64,
+    /// 已接受的输入高水位，包括排队中和正在写的行。None 表示旧看守未提供该字段。
+    #[serde(default)]
+    pub accepted: Option<u64>,
     pub exit: Option<i32>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,7 +231,7 @@ pub fn read_records(directory: &Path, after: u64, limit: usize) -> Result<Vec<Re
                 }
                 size += line.len();
                 records.push(record);
-                if records.len() >= limit.clamp(1, 1000) {
+                if records.len() >= limit.clamp(1, MAX_RECORDS_PER_READ) {
                     return Ok(records);
                 }
             }
@@ -235,14 +239,18 @@ pub fn read_records(directory: &Path, after: u64, limit: usize) -> Result<Vec<Re
     }
     // A full disk can leave only this compact emergency range; keep it visible after process exit.
     if let Ok(bytes) = std::fs::read(directory.join("lost.json")) {
-        let mut gap: Record = serde_json::from_slice(&bytes)?;
-        let cursor = records.last().map_or(after, |r| r.end_seq);
-        if gap.end_seq > cursor && records.len() < limit.clamp(1, 1000) {
-            gap.seq = gap.seq.max(cursor + 1);
-            records.push(gap);
-        }
+        let gap: Record = serde_json::from_slice(&bytes)?;
+        append_gap_tail(&mut records, after, limit, gap);
     }
     Ok(records)
+}
+/// Append only the part of an emergency gap beyond the returned cursor.
+pub fn append_gap_tail(records: &mut Vec<Record>, after: u64, limit: usize, mut gap: Record) {
+    let cursor = records.last().map_or(after, |r| r.end_seq);
+    if gap.end_seq > cursor && records.len() < limit.clamp(1, MAX_RECORDS_PER_READ) {
+        gap.seq = gap.seq.max(cursor + 1);
+        records.push(gap);
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JournalManifest {

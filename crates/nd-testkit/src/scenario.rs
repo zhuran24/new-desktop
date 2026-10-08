@@ -1,4 +1,7 @@
-use crate::{ClaudeEndpoint, Result};
+use crate::{
+    ClaudeEndpoint, Result,
+    isolation::{self, Isolation},
+};
 use nd_ui_core::SyncReplica;
 use std::{
     io::Write,
@@ -24,7 +27,7 @@ impl Program {
     /// The pinned BUILD.md CLI, with a fake key and only the local offline endpoint.
     pub fn claude() -> Self {
         Self {
-            binary: "/mnt/wd_external/nd-build/cli/claude-2.1.289".into(),
+            binary: isolation::pinned_cli().into(),
             args: vec![],
             claude: true,
         }
@@ -124,14 +127,28 @@ pub struct ResourceLimits {
     pub memory_swap_max: u64,
 }
 
+/// Observable cleanup boundaries for terminating a scenario driver mid-close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupStage {
+    BeforeSliceStop,
+    SliceStopped,
+    RuntimeRemoved,
+    DiskRemoved,
+    ExpiryStopped,
+}
+
 pub struct ScenarioOptions {
     pub name: String,
     pub daemon: PathBuf,
     pub config: String,
     pub memory_max: u64,
     pub timeout: Duration,
+    /// Absolute lifetime of the whole scenario, including automatic daemon restarts.
+    pub max_lifetime: Duration,
     pub watchdog: Option<PathBuf>,
     pub disk_scratch: bool,
+    pub default_paths: bool,
+    pub cleanup_observer: Option<fn(CleanupStage)>,
 }
 impl ScenarioOptions {
     pub fn new(name: &str, daemon: impl Into<PathBuf>) -> Self {
@@ -141,9 +158,20 @@ impl ScenarioOptions {
             config: String::new(),
             memory_max: 2 * 1024 * 1024 * 1024,
             timeout: Duration::from_secs(10),
+            max_lifetime: Duration::from_secs(300),
             watchdog: None,
             disk_scratch: false,
+            default_paths: false,
+            cleanup_observer: None,
         }
+    }
+    pub fn config(mut self, config: &str) -> Self {
+        self.config = config.into();
+        self
+    }
+    pub fn default_paths(mut self) -> Self {
+        self.default_paths = true;
+        self
     }
 }
 
@@ -152,7 +180,11 @@ pub struct Scenario {
     disk: Option<tempfile::TempDir>,
     slice: String,
     services: Vec<String>,
+    daemon_args: Vec<String>,
+    default_paths: bool,
     timeout: Duration,
+    expiry: Option<String>,
+    cleanup_observer: Option<fn(CleanupStage)>,
     endpoint: Option<ClaudeEndpoint>,
     watchdog_config: Option<nd_runs::Config>,
 }
@@ -162,7 +194,6 @@ pub enum CommandFault {
     CrashAfterEffect,
     CrashBeforeCommit,
     CrashAfterCommit,
-    UnavailableAfterEffect,
 }
 
 fn command(binary: &str) -> Command {
@@ -202,7 +233,12 @@ impl Scenario {
             );
         }
         let daemon = options.daemon.canonicalize()?;
-        let dir = tempfile::Builder::new().prefix("nd-test-").tempdir()?;
+        // systemd must own the same runtime directory as the packaged service.
+        // A unique parent keeps each scenario away from the owner's instance.
+        let runtime = PathBuf::from(format!("/run/user/{}", rustix::process::geteuid().as_raw()));
+        let dir = tempfile::Builder::new()
+            .prefix("nd-test-")
+            .tempdir_in(runtime)?;
         for name in [
             "home", "claude", "config", "data", "state", "cache", "runtime", "project", "out",
             "fifos", "programs",
@@ -234,7 +270,11 @@ impl Scenario {
             },
             slice,
             services: vec![unit],
+            daemon_args: Vec::new(),
+            default_paths: options.default_paths,
             timeout: options.timeout,
+            expiry: None,
+            cleanup_observer: options.cleanup_observer,
             endpoint: None,
             watchdog_config: None,
         };
@@ -264,21 +304,11 @@ impl Scenario {
                 "0",
             ],
         )?;
+        this.arm_expiry(options.max_lifetime)?;
         if let Some(watchdog) = options.watchdog {
             let watchdog = watchdog.canonicalize()?;
             // Keep host PIDs for /proc identity checks. Network and home remain isolated.
-            let mut launcher = this.sandbox_args(&watchdog)?;
-            launcher.retain(|s| s != "--unshare-all");
-            launcher.splice(
-                1..1,
-                [
-                    "--unshare-user",
-                    "--unshare-ipc",
-                    "--unshare-net",
-                    "--unshare-uts",
-                ]
-                .map(str::to_owned),
-            );
+            let mut launcher = this.sandbox_args(&watchdog, Isolation::HostPid)?;
             launcher.extend([
                 "--ro-bind".into(),
                 watchdog.to_string_lossy().into_owned(),
@@ -287,7 +317,9 @@ impl Scenario {
             launcher.extend(
                 [
                     "--ro-bind",
-                    "/mnt/wd_external/nd-build/cli/claude-2.1.289",
+                    isolation::pinned_cli()
+                        .to_str()
+                        .expect("pinned path is UTF-8"),
                     "/cli",
                     "/usr/bin/python3",
                     "/sandbox/sandbox.py",
@@ -312,30 +344,27 @@ impl Scenario {
         }
         this.endpoint = Some(ClaudeEndpoint::bind(this.root().join("model.sock")).await?);
         let mut args = this.service_args(&this.services[0], true);
-        args.extend(this.sandbox_args(&daemon)?);
+        args.extend(this.sandbox_args(
+            &daemon,
+            if this.watchdog_config.is_some() {
+                Isolation::HostPid
+            } else {
+                Isolation::PrivatePid
+            },
+        )?);
         if this.watchdog_config.is_some() {
             // 短命的模型目录查询由真适配器在守护进程 cgroup 里直接拉起。
             args.extend(
                 [
                     "--ro-bind",
-                    "/mnt/wd_external/nd-build/cli/claude-2.1.289",
+                    isolation::pinned_cli()
+                        .to_str()
+                        .expect("pinned path is UTF-8"),
                     "/cli",
                 ]
                 .map(str::to_owned),
             );
             let bus = format!("/run/user/{}/bus", rustix::process::geteuid().as_raw());
-            args.retain(|s| s != "--unshare-all");
-            let at = args.iter().position(|s| s == "/usr/bin/bwrap").unwrap() + 1;
-            args.splice(
-                at..at,
-                [
-                    "--unshare-user",
-                    "--unshare-ipc",
-                    "--unshare-net",
-                    "--unshare-uts",
-                ]
-                .map(str::to_owned),
-            );
             args.extend(["--ro-bind".into(), bus.clone(), bus]);
             let private = format!(
                 "/run/user/{}/systemd/private",
@@ -343,17 +372,59 @@ impl Scenario {
             );
             args.extend(["--ro-bind".into(), private.clone(), private]);
         }
-        args.extend([
-            "/program".into(),
-            "--root".into(),
-            this.root().to_string_lossy().into_owned(),
-        ]);
+        args.push("/program".into());
+        if !this.default_paths {
+            args.extend(["--root".into(), this.root().to_string_lossy().into_owned()]);
+        } else {
+            let path = this.root().join("config/new-desktop");
+            std::fs::create_dir_all(&path)?;
+            std::fs::copy(this.root().join("config.toml"), path.join("config.toml"))?;
+        }
         checked(
             "systemd-run",
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )?;
+        this.daemon_args = args;
         this.connect().await?;
         Ok(this)
+    }
+
+    /// A separate timer stops the slice explicitly: service RuntimeMaxSec would
+    /// count as failure and trigger Restart=on-failure again. Neither daemon
+    /// restarts nor the test process lifetime can reset this deadline.
+    fn arm_expiry(&mut self, lifetime: Duration) -> Result<()> {
+        if lifetime.is_zero() {
+            return Err("scenario lifetime must be positive".into());
+        }
+        let expiry = self.services[0].replace("-daemon.service", "-expiry");
+        let cleanup = "import subprocess,shutil,sys; subprocess.run(['/usr/bin/systemctl','--user','stop',sys.argv[1]],check=True); [shutil.rmtree(p,ignore_errors=True) for p in sys.argv[2:] if p]";
+        checked(
+            "systemd-run",
+            &[
+                "--user",
+                "--quiet",
+                "--collect",
+                "--unit",
+                &expiry,
+                &format!("--on-active={}s", lifetime.as_secs_f64()),
+                "--timer-property=AccuracySec=100ms",
+                "--timer-property=RemainAfterElapse=no",
+                "-p",
+                "Type=oneshot",
+                "-p",
+                "TimeoutStartSec=30s",
+                "-p",
+                "Restart=no",
+                "/usr/bin/python3",
+                "-c",
+                cleanup,
+                &self.slice,
+                self.root().to_str().ok_or("non-UTF8 scenario root")?,
+                self.disk_root().and_then(Path::to_str).unwrap_or(""),
+            ],
+        )?;
+        self.expiry = Some(expiry);
+        Ok(())
     }
 
     fn service_args(&self, unit: &str, restart: bool) -> Vec<String> {
@@ -373,13 +444,26 @@ impl Scenario {
             "TimeoutStopSec=3s",
             "-p",
             "KillMode=control-group",
-            "-p",
-            "RuntimeMaxSec=300",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
         if restart {
+            for property in include_str!("../../../packaging/systemd/nd-daemon.service").lines() {
+                if let Some((key, value)) = property.split_once('=') {
+                    if key == "RuntimeDirectory" {
+                        args.extend([
+                            "-p".into(),
+                            format!(
+                                "RuntimeDirectory={}/runtime",
+                                self.root().file_name().unwrap().to_string_lossy()
+                            ),
+                        ]);
+                    } else if matches!(key, "RuntimeDirectoryMode" | "RuntimeDirectoryPreserve") {
+                        args.extend(["-p".into(), format!("{key}={value}")]);
+                    }
+                }
+            }
             args.extend(
                 [
                     "-p",
@@ -394,48 +478,49 @@ impl Scenario {
         }
         args
     }
-    fn sandbox_args(&self, binary: &Path) -> Result<Vec<String>> {
-        let mut args = vec![
-            "/usr/bin/bwrap",
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--symlink",
-            "usr/bin",
-            "/bin",
-            "--symlink",
-            "usr/lib",
-            "/lib",
-            "--symlink",
-            "usr/lib",
-            "/lib64",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--dir",
-            "/etc",
-            "--bind",
-            self.root().to_str().ok_or("non-UTF8 scenario root")?,
-            "/sandbox",
-            "--bind",
-            self.root().to_str().ok_or("non-UTF8 scenario root")?,
-            self.root().to_str().ok_or("non-UTF8 scenario root")?,
-            "--ro-bind",
-            binary.to_str().ok_or("non-UTF8 program path")?,
-            "/program",
-            "--chdir",
-            "/sandbox/project",
-            "--clearenv",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    fn sandbox_args(&self, binary: &Path, isolation: Isolation) -> Result<Vec<String>> {
+        let mut args = vec!["/usr/bin/bwrap".to_owned()];
+        args.extend(isolation.flags().iter().map(|s| (*s).to_owned()));
+        args.extend(
+            [
+                "--die-with-parent",
+                "--new-session",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib",
+                "/lib64",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--dir",
+                "/etc",
+                "--bind",
+                self.root().to_str().ok_or("non-UTF8 scenario root")?,
+                "/sandbox",
+                "--bind",
+                self.root().to_str().ok_or("non-UTF8 scenario root")?,
+                self.root().to_str().ok_or("non-UTF8 scenario root")?,
+                "--ro-bind",
+                binary.to_str().ok_or("non-UTF8 program path")?,
+                "/program",
+                "--chdir",
+                "/sandbox/project",
+                "--clearenv",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
         if let Some(disk) = &self.disk {
             args.extend([
                 "--bind".into(),
@@ -443,18 +528,8 @@ impl Scenario {
                 "/scratch".into(),
             ]);
         }
-        for (key, value) in [
-            ("PATH", "/usr/bin:/bin"),
-            ("LANG", "C.UTF-8"),
-            ("HOME", "/sandbox/home"),
-            ("CLAUDE_CONFIG_DIR", "/sandbox/claude"),
-            ("XDG_CONFIG_HOME", "/sandbox/config"),
-            ("XDG_DATA_HOME", "/sandbox/data"),
-            ("XDG_STATE_HOME", "/sandbox/state"),
-            ("XDG_CACHE_HOME", "/sandbox/cache"),
-            ("XDG_RUNTIME_DIR", "/sandbox/runtime"),
-        ] {
-            args.extend(["--setenv", key, value].map(str::to_owned));
+        for (key, value) in isolation::environment() {
+            args.extend(["--setenv".into(), key, value]);
         }
         Ok(args)
     }
@@ -494,19 +569,7 @@ impl Scenario {
                 r#"{"enableWorkflows":true}"#,
             ],
         )?;
-        for (key, value) in [
-            ("ANTHROPIC_BASE_URL", "http://127.0.0.1:8765"),
-            ("ANTHROPIC_API_KEY", "offline-fixture"),
-            ("DISABLE_AUTOUPDATER", "1"),
-            ("DISABLE_TELEMETRY", "1"),
-            ("DISABLE_ERROR_REPORTING", "1"),
-            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-            ("CLAUDE_CODE_EAGER_FLUSH", "1"),
-            ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
-            ("TERM", "dumb"),
-        ] {
-            spec.env.insert(key.into(), value.into());
-        }
+        spec.env.extend(isolation::offline_claude());
         Ok(spec)
     }
     pub fn watchdog_spec(
@@ -524,20 +587,7 @@ impl Scenario {
                 overflow: self.root().join("cache/spool-overflow").join(run),
                 ..Default::default()
             },
-            env: [
-                ("PATH", "/usr/bin:/bin"),
-                ("HOME", "/sandbox/home"),
-                ("CLAUDE_CONFIG_DIR", "/sandbox/claude"),
-                ("XDG_CONFIG_HOME", "/sandbox/config"),
-                ("XDG_DATA_HOME", "/sandbox/data"),
-                ("XDG_STATE_HOME", "/sandbox/state"),
-                ("XDG_CACHE_HOME", "/sandbox/cache"),
-                ("XDG_RUNTIME_DIR", "/sandbox/runtime"),
-                ("LANG", "C.UTF-8"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect(),
+            env: isolation::environment(),
         })
     }
     pub fn disk_root(&self) -> Option<&Path> {
@@ -564,14 +614,14 @@ impl Scenario {
         write!(
             file,
             "{}",
-            serde_json::json!({"name":name,"args":program.args,"claude":program.claude})
+            serde_json::json!({"name":name,"args":program.args,"claude":program.claude,"env":if program.claude {isolation::offline_claude()} else {Default::default()}})
         )?;
         let unit = self.services[0].replace("-daemon.service", &format!("-{name}.service"));
         if self.services.contains(&unit) {
             return Err("process name already used".into());
         }
         let mut args = self.service_args(&unit, false);
-        args.extend(self.sandbox_args(&program.binary.canonicalize()?)?);
+        args.extend(self.sandbox_args(&program.binary.canonicalize()?, Isolation::PrivatePid)?);
         args.extend([
             "/usr/bin/python3".into(),
             "/sandbox/sandbox.py".into(),
@@ -638,8 +688,28 @@ impl Scenario {
         self.services
             .iter()
             .cloned()
+            .chain(
+                self.expiry
+                    .iter()
+                    .flat_map(|name| [format!("{name}.timer"), format!("{name}.service")]),
+            )
             .chain([self.slice.clone()])
             .collect()
+    }
+    pub fn stop_daemon(&self) -> Result<()> {
+        checked("systemctl", &["--user", "stop", &self.services[0]])?;
+        Ok(())
+    }
+    pub fn start_daemon(&self) -> Result<()> {
+        checked(
+            "systemd-run",
+            &self
+                .daemon_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(())
     }
     pub fn restart_daemon(&self) -> Result<()> {
         checked("systemctl", &["--user", "restart", &self.services[0]])?;
@@ -657,7 +727,6 @@ impl Scenario {
             CommandFault::CrashAfterEffect => ("after_effect", "crash"),
             CommandFault::CrashBeforeCommit => ("before_commit", "crash"),
             CommandFault::CrashAfterCommit => ("after_commit", "crash"),
-            CommandFault::UnavailableAfterEffect => ("after_effect", "unavailable"),
         };
         let dest = self.root().join("command-fault.json");
         if dest.exists() {
@@ -674,8 +743,15 @@ impl Scenario {
     pub fn command_fault_consumed(&self) -> bool {
         !self.root().join("command-fault.json").exists()
     }
+    pub fn socket(&self) -> PathBuf {
+        self.root().join(if self.default_paths {
+            "runtime/new-desktop/nd.sock"
+        } else {
+            "runtime/nd.sock"
+        })
+    }
     pub async fn connect(&self) -> Result<SyncReplica> {
-        let socket = self.root().join("runtime/nd.sock");
+        let socket = self.socket();
         tokio::time::timeout(self.timeout, async {
             loop {
                 if let Ok(ui) = SyncReplica::connect(&socket).await {
@@ -694,17 +770,41 @@ impl Scenario {
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
             .unwrap_or_default()
     }
+    fn cleanup_stage(&self, stage: CleanupStage) {
+        if let Some(observer) = self.cleanup_observer {
+            observer(stage);
+        }
+    }
     fn cleanup(&mut self) -> Result<()> {
         if self.dir.is_none() {
             return Ok(());
         }
+        self.cleanup_stage(CleanupStage::BeforeSliceStop);
         // Stopping the slice also kills any descendant unit launched by the product.
         checked("systemctl", &["--user", "stop", &self.slice])?;
+        self.cleanup_stage(CleanupStage::SliceStopped);
         self.endpoint.take();
         self.dir.take().unwrap().close()?;
+        self.cleanup_stage(CleanupStage::RuntimeRemoved);
         if let Some(disk) = self.disk.take() {
             disk.close()?;
         }
+        self.cleanup_stage(CleanupStage::DiskRemoved);
+        // Keep the independent deadline armed until every resource is gone.
+        // SIGKILL at any earlier boundary must still finish cleanup externally.
+        if let Some(expiry) = self.expiry.take() {
+            // The expiry units may already have run and been collected.
+            let _ = command("systemctl")
+                .args([
+                    "--user",
+                    "stop",
+                    &format!("{expiry}.timer"),
+                    &format!("{expiry}.service"),
+                ])
+                .output()?;
+        }
+        self.cleanup_stage(CleanupStage::ExpiryStopped);
+
         Ok(())
     }
     pub fn close(mut self) -> Result<()> {

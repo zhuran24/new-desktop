@@ -147,7 +147,7 @@ fn simple_and_incremental_projections_agree_on_the_recorded_conversation() {
                 id: uuid.clone(),
                 text: "…".into(),
                 intent: "fold".into(),
-                state: "written".into(),
+                state: nd_wire::PromptState::Written,
                 native: Some(uuid),
                 reason: None,
             }),
@@ -156,7 +156,7 @@ fn simple_and_incremental_projections_agree_on_the_recorded_conversation() {
                 id: uuid.clone(),
                 text: "…".into(),
                 intent: "fold".into(),
-                state: "landed".into(),
+                state: nd_wire::PromptState::Landed,
                 native: Some(uuid),
                 reason: None,
             }),
@@ -230,5 +230,122 @@ fn recorded_human_rounds_keep_their_user_uuids_and_final_assistant_anchor() {
                 .iter()
                 .any(|(id, ids, done, _)| id == &end.0 && !**done && ids == &end.1)
         );
+    }
+}
+
+#[test]
+fn recorded_task_tables_keep_busy_work_and_malformed_tables_cannot_claim_drained() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl");
+    let (_, mut records) = read_fixture(&path).unwrap();
+    let table = records.iter().position(|r| matches!(&r.event, Event::Out { line } if line.contains("background_tasks_changed"))).unwrap();
+    assert!(
+        replay(&records[..=table])
+            .iter()
+            .flatten()
+            .any(|fact| matches!(
+                fact,
+                Convo::Tasks {
+                    drain: nd_backend::Drain::Busy
+                }
+            ))
+    );
+    let Event::Out { line } = &mut records[table].event else {
+        unreachable!()
+    };
+    let mut frame: serde_json::Value = serde_json::from_str(line).unwrap();
+    frame.as_object_mut().unwrap().remove("tasks");
+    *line = frame.to_string();
+    assert!(
+        replay(&records[..=table])
+            .iter()
+            .flatten()
+            .any(|fact| matches!(
+                fact,
+                Convo::Tasks {
+                    drain: nd_backend::Drain::Unknown { .. }
+                }
+            ))
+    );
+}
+
+#[test]
+fn recorded_terminal_task_update_drains_without_a_table_or_notification() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../nd-watchdog-proto/tests/fixtures/watchdog/claude/2.1.289/long-workflow.jsonl");
+    let (_, records) = read_fixture(&path).unwrap();
+    let terminal = records
+        .iter()
+        .position(|r| matches!(&r.event, Event::Out { line } if line.contains("task_updated")))
+        .unwrap();
+    // The pinned recording has an empty table immediately before task_updated.
+    // Lose that redundant observation and stop before task_notification: neither
+    // may conceal a broken task_updated decoder. Retain the recorded frame bytes.
+    let prefix: Vec<_> = records[..terminal]
+        .iter()
+        .filter(|r| {
+            let Event::Out { line } = &r.event else {
+                return true;
+            };
+            let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+            !(frame["subtype"] == "background_tasks_changed"
+                && frame["tasks"] == serde_json::json!([]))
+        })
+        .cloned()
+        .collect();
+    for restart in [false, true] {
+        let mut convo = nd_claude::Conversation::new();
+        for record in &prefix {
+            convo.apply(record);
+        }
+        assert_eq!(convo.drain(), nd_backend::Drain::Busy);
+        if restart {
+            convo = serde_json::from_value(serde_json::to_value(&convo).unwrap()).unwrap();
+        }
+        let facts = convo.apply(&records[terminal]);
+        assert_eq!(convo.drain(), nd_backend::Drain::Drained);
+        assert!(facts.iter().any(|f| matches!(
+            f,
+            Convo::Tasks {
+                drain: nd_backend::Drain::Drained
+            }
+        )));
+    }
+    // Contract status variants of the same recorded patch envelope.
+    for status in ["failed", "killed", "stopped"] {
+        let mut convo = nd_claude::Conversation::new();
+        for record in &prefix {
+            convo.apply(record);
+        }
+        let mut changed = records[terminal].clone();
+        let Event::Out { line } = &mut changed.event else {
+            unreachable!()
+        };
+        let mut frame: serde_json::Value = serde_json::from_str(line).unwrap();
+        frame["patch"]["status"] = status.into();
+        *line = frame.to_string();
+        convo.apply(&changed);
+        assert_eq!(convo.drain(), nd_backend::Drain::Drained, "{status}");
+    }
+    // Perturb only the status/id of that recorded patch: nonterminal or another
+    // task's completion cannot remove the running task.
+    for (field, value) in [("status", "running"), ("task_id", "unrelated")] {
+        let mut convo = nd_claude::Conversation::new();
+        for record in &prefix {
+            convo.apply(record);
+        }
+        let mut changed = records[terminal].clone();
+        let Event::Out { line } = &mut changed.event else {
+            unreachable!()
+        };
+        let mut frame: serde_json::Value = serde_json::from_str(line).unwrap();
+        if field == "status" {
+            frame["patch"][field] = value.into();
+        } else {
+            frame[field] = value.into();
+        }
+        *line = frame.to_string();
+        convo.apply(&changed);
+        assert_eq!(convo.drain(), nd_backend::Drain::Busy);
     }
 }

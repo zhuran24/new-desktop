@@ -67,7 +67,7 @@ fn attachment_reference_and_owning_row_commit_or_rollback_together() {
     let blobs = Blobs::open(dir.path().join("blobs"), store.clone()).unwrap();
     let id = blobs.put(b"abc").unwrap();
     assert_eq!(
-        id,
+        id.as_str(),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     assert_eq!(blobs.put(b"abc").unwrap(), id);
@@ -78,28 +78,32 @@ fn attachment_reference_and_owning_row_commit_or_rollback_together() {
         })
         .unwrap();
     let failure: Result<(), Error> = store.write(|tx| {
-        tx.execute("INSERT INTO messages VALUES ('m1', ?1)", [&id])?;
+        tx.execute("INSERT INTO messages VALUES ('m1', ?1)", [id.as_str()])?;
         blobs.hold(tx, &id, "message/m1")?;
         Err(Error::Aborted("simulated rejection".into()))
     });
     assert!(failure.is_err());
-    assert_eq!(blobs.references(&id).unwrap(), 0);
+    assert_eq!(blobs.collect(std::time::Duration::ZERO).unwrap(), 1);
+    assert!(blobs.get(&id).is_err());
+    assert_eq!(blobs.put(b"abc").unwrap(), id);
     store
         .write(|tx| {
-            tx.execute("INSERT INTO messages VALUES ('m1', ?1)", [&id])?;
+            tx.execute("INSERT INTO messages VALUES ('m1', ?1)", [id.as_str()])?;
             blobs.hold(tx, &id, "message/m1")?;
             blobs.hold(tx, &id, "message/m1")?;
             Ok(())
         })
         .unwrap();
-    assert_eq!(blobs.references(&id).unwrap(), 1);
+    assert_eq!(blobs.collect(std::time::Duration::ZERO).unwrap(), 0);
+    assert_eq!(blobs.get(&id).unwrap(), b"abc");
     let failure: Result<(), Error> = store.write(|tx| {
         tx.execute("DELETE FROM messages", [])?;
         blobs.release(tx, &id, "message/m1")?;
         Err(Error::Aborted("rollback removal".into()))
     });
     assert!(failure.is_err());
-    assert_eq!(blobs.references(&id).unwrap(), 1);
+    assert_eq!(blobs.collect(std::time::Duration::ZERO).unwrap(), 0);
+    assert_eq!(blobs.get(&id).unwrap(), b"abc");
     store
         .write(|tx| {
             tx.execute("DELETE FROM messages", [])?;
@@ -107,14 +111,15 @@ fn attachment_reference_and_owning_row_commit_or_rollback_together() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(blobs.references(&id).unwrap(), 0);
     assert_eq!(blobs.get(&id).unwrap(), b"abc"); // 零引用不立即删文件。
+    assert_eq!(blobs.collect(std::time::Duration::ZERO).unwrap(), 1);
+    assert!(blobs.get(&id).is_err());
     assert!(
         store
-            .write(|tx| blobs.hold(tx, &"0".repeat(64), "missing"))
+            .write(|tx| blobs.hold(tx, &"0".repeat(64).parse().unwrap(), "missing"))
             .is_err()
     );
-    assert!(blobs.get("../state.sqlite").is_err());
+    assert!("../state.sqlite".parse::<nd_id::BlobId>().is_err());
 }
 
 #[test]

@@ -8,6 +8,7 @@ use std::{
 };
 mod cli;
 mod registry;
+mod reservations;
 pub use cli::{CliCommands, PinnedCli};
 pub use registry::{ExternalEntry, RegistryConfig};
 
@@ -104,9 +105,9 @@ struct Grant {
 }
 #[derive(Default, Serialize, Deserialize)]
 struct State {
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     causes: BTreeMap<String, Act>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     gone: BTreeSet<String>,
     #[serde(default)]
     scan_failed: bool,
@@ -119,14 +120,18 @@ struct State {
     #[serde(default)]
     own: BTreeMap<String, OwnProcess>,
     leases: BTreeMap<String, Lease>,
+    #[serde(default, skip_serializing)]
     grants: BTreeMap<String, Grant>,
 }
+
+type CliListing = Option<std::result::Result<Vec<ExternalEntry>, String>>;
 
 pub struct Exclusivity {
     store: Arc<Store>,
     config: RegistryConfig,
     changes: tokio::sync::watch::Sender<u64>,
     commands: Arc<dyn CliCommands>,
+    listing: Arc<std::sync::Mutex<CliListing>>,
     interest: Arc<std::sync::atomic::AtomicUsize>,
     scan_lock: Arc<std::sync::Mutex<()>>,
     stop: Option<std::sync::mpsc::SyncSender<()>>,
@@ -158,6 +163,7 @@ impl Exclusivity {
         })?;
         store.write(|tx| {
             let mut state = Self::in_tx(tx)?;
+            reservations::migrate(tx, &state)?;
             state.recovery = Recovery::IdentitiesPending;
             state.external.clear();
             for own in state.own.values_mut() {
@@ -173,9 +179,11 @@ impl Exclusivity {
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scan_lock = Arc::new(std::sync::Mutex::new(()));
         let (stop, receiver) = std::sync::mpsc::sync_channel(1);
+        let listing = Arc::new(std::sync::Mutex::new(None));
         let background = Self {
             changes: changes.clone(),
             commands: commands.clone(),
+            listing: listing.clone(),
             interest: interest.clone(),
             store: store.clone(),
             config: config.clone(),
@@ -253,6 +261,7 @@ impl Exclusivity {
         Ok(Self {
             changes,
             commands,
+            listing,
             interest,
             store,
             config,
@@ -291,9 +300,6 @@ impl Exclusivity {
             return Admit::Wait(Obstacle::Recovering);
         }
         if let Act::Open { via, bs, .. } = act {
-            if state.gone.contains(via) {
-                return Admit::No(Refusal::RunGone(via.clone()));
-            }
             if state.own.get(via).is_some_and(|p| p.unknown) {
                 return Admit::Wait(Obstacle::HolderUnknown(via.clone()));
             }
@@ -357,25 +363,49 @@ impl Exclusivity {
         })
     }
     pub fn peek(&self, act: &Act) -> Result<Admit> {
+        if let Act::Open { via, .. } = act {
+            let gone: bool = self.store.read()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims_gone WHERE run=?1)",
+                [via],
+                |r| r.get(0),
+            )?;
+            if gone {
+                return Ok(Admit::No(Refusal::RunGone(via.clone())));
+            }
+        }
         Ok(Self::decide(&self.state()?, act))
+    }
+    fn decide_in(tx: &Tx<'_>, state: &State, act: &Act) -> Result<Admit> {
+        if let Act::Open { via, .. } = act
+            && reservations::is_gone(tx, via)?
+        {
+            return Ok(Admit::No(Refusal::RunGone(via.clone())));
+        }
+        Ok(Self::decide(state, act))
     }
     pub fn admit(&self, tx: &mut Tx<'_>, cause: &str, act: &Act) -> Result<Admit> {
         let mut state = Self::in_tx(tx)?;
-        if state.causes.get(cause).is_some_and(|prior| prior != act) {
-            return Err(error("CauseReused"));
+        // Steady-state writes are a fresh admission decision, not a durable grant.
+        if matches!(act, Act::Write { .. }) {
+            return Ok(Self::decide(&state, act));
         }
-        state.causes.insert(cause.into(), act.clone());
-        if let Some(grant) = state.grants.get(cause) {
-            if &grant.act != act {
+        if let Some(prior) = reservations::get(tx, cause)? {
+            if &prior.act != act {
                 return Err(error("CauseReused"));
             }
-            return Ok(if matches!(act, Act::Write { .. }) || grant.recheck {
-                Self::decide(&state, act)
-            } else {
-                Admit::Go(grant.pass.clone())
-            });
+            if let Some(grant) = prior.grant {
+                if !grant.active {
+                    return Err(error("ReservationEnded"));
+                }
+                return if grant.recheck {
+                    Self::decide_in(tx, &state, act)
+                } else {
+                    Ok(Admit::Go(grant.pass))
+                };
+            }
         }
-        let decision = Self::decide(&state, act);
+        let decision = Self::decide_in(tx, &state, act)?;
+        let mut granted = None;
         if let Admit::Go(pass) = &decision {
             let mut reserved = None;
             if let Act::Open {
@@ -395,18 +425,16 @@ impl Exclusivity {
                     confirmed: false,
                 });
             }
-            state.grants.insert(
-                cause.into(),
-                Grant {
-                    act: act.clone(),
-                    pass: pass.clone(),
-                    active: true,
-                    recheck: false,
-                    bound: None,
-                    reserved,
-                },
-            );
+            granted = Some(Grant {
+                act: act.clone(),
+                pass: pass.clone(),
+                active: true,
+                recheck: false,
+                bound: None,
+                reserved,
+            });
         }
+        reservations::put(tx, cause, act, granted)?;
         self.commit(tx, &state)?;
         Ok(decision)
     }
@@ -463,7 +491,7 @@ impl Exclusivity {
         let mut state = Self::in_tx(tx)?;
         match observation {
             Observed::NeverOpened { cause } => {
-                let Some(grant) = state.grants.get(&cause) else {
+                let Some(grant) = reservations::get(tx, &cause)?.and_then(|r| r.grant) else {
                     return Err(error("UnknownReservation"));
                 };
                 let Act::Open { via, .. } = &grant.act else {
@@ -480,7 +508,7 @@ impl Exclusivity {
                     }
                     state.leases.remove(&bs.key());
                 }
-                state.grants.get_mut(&cause).unwrap().active = false;
+                reservations::remove(tx, &cause)?;
             }
             Observed::Recovered => state.recovery = Recovery::IdentitiesKnown,
             Observed::Holding {
@@ -546,7 +574,7 @@ impl Exclusivity {
                 generation,
                 kind,
             } => {
-                if state.gone.contains(&run) {
+                if reservations::is_gone(tx, &run)? {
                     return Ok(());
                 }
                 if let Some(old) = state.own.get(&run) {
@@ -579,17 +607,21 @@ impl Exclusivity {
                         identity.as_ref() == Some(&own.identity)
                             && !matches!(how, GoneHow::NeverLaunched)
                     }
-                    None => identity.is_none() && matches!(how, GoneHow::NeverLaunched),
+                    // A run may exit before initialize completes and reports Up.
+                    // Run ids are never reused; verified process death also ends
+                    // the reservation created before launch in that window.
+                    None => match (identity.as_ref(), &how) {
+                        (None, GoneHow::NeverLaunched) => true,
+                        (Some(identity), GoneHow::Exited | GoneHow::ProcGone) => {
+                            identity.matching() == Some(false)
+                        }
+                        _ => false,
+                    },
                 };
                 if matches {
                     state.leases.retain(|_, l| l.run != run);
                     state.own.remove(&run);
-                    state.gone.insert(run.clone());
-                    for grant in state.grants.values_mut() {
-                        if matches!(&grant.act, Act::Open { via, .. } if via == &run) {
-                            grant.active = false;
-                        }
-                    }
+                    reservations::gone(tx, &run)?;
                 } else {
                     Self::mark_unknown(&mut state, &run);
                 }
@@ -628,7 +660,7 @@ impl Exclusivity {
     /// Conflict is a value so the caller can commit the suspension of both holders.
     pub fn bind(&self, tx: &mut Tx<'_>, cause: &str, bs: &BackendSessionId) -> Result<BindResult> {
         let mut state = Self::in_tx(tx)?;
-        let Some(grant) = state.grants.get(cause) else {
+        let Some(mut grant) = reservations::get(tx, cause)?.and_then(|r| r.grant) else {
             return Err(error("BindWithoutReservation"));
         };
         if !grant.active {
@@ -672,7 +704,8 @@ impl Exclusivity {
         if grant.bound.as_ref().is_some_and(|old| old != bs) {
             return Err(error("ReservationAlreadyBound"));
         }
-        state.grants.get_mut(cause).unwrap().bound = Some(bs.clone());
+        grant.bound = Some(bs.clone());
+        reservations::put(tx, cause, &grant.act, Some(grant.clone()))?;
         let unknown = state.own.get(&via).is_some_and(|p| p.unknown);
         let lease = state.leases.entry(bs.key()).or_insert_with(|| Lease {
             bs: bs.clone(),
@@ -704,13 +737,7 @@ impl Exclusivity {
         if self.recovery()? == Recovery::IdentitiesPending {
             return Ok(());
         }
-        let scanned = registry::scan(&self.config).and_then(|mut entries| {
-            if self.interest.load(std::sync::atomic::Ordering::Acquire) > 0 {
-                let bytes = self.commands.agents().map_err(error)?;
-                registry::merge_agents(&mut entries, &bytes)?;
-            }
-            Ok(entries)
-        });
+        let scanned = registry::scan(&self.config);
         let entries = match scanned {
             Ok(entries) => entries,
             Err(e) => {
@@ -722,6 +749,7 @@ impl Exclusivity {
                 return Err(e);
             }
         };
+        let mut listed = entries.clone();
         self.store.write(|tx| {
             let mut state = Self::in_tx(tx)?;
             state.scan_failed = false;
@@ -736,13 +764,42 @@ impl Exclusivity {
                 .collect();
             state.recovery = Recovery::Ready;
             self.commit(tx, &state)
-        })
+        })?;
+        // List metadata is optional presentation, never an input to admission.
+        let next = if self.interest.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            Some(self.commands.agents().and_then(|bytes| {
+                registry::merge_agents(&mut listed, &bytes).map_err(|e| e.to_string())?;
+                Ok(listed)
+            }))
+        } else {
+            None
+        };
+        let mut listing = self.listing.lock().unwrap_or_else(|e| e.into_inner());
+        if *listing != next {
+            *listing = next;
+            self.changes.send_modify(|revision| *revision += 1);
+        }
+        Ok(())
     }
     pub fn externals(&self) -> Result<Vec<ExternalEntry>> {
         let state = self.state()?;
-        Ok(state
-            .external
+        let entries = if self.interest.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            self.listing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_else(|| Ok(state.external.clone()))
+                .map_err(error)?
+        } else {
+            state.external.clone()
+        };
+        Ok(entries
             .into_iter()
+            .filter(|e| {
+                !e.identity
+                    .as_ref()
+                    .is_some_and(|id| state.own.values().any(|own| &own.identity == id))
+            })
             .filter(|e| {
                 !e.bs
                     .as_ref()
@@ -787,16 +844,18 @@ impl Exclusivity {
     /// Only for a ticket the adapter proved Withheld (never written). Ordinary replay uses admit.
     /// Waiting does not release responsibility: NeverOpened/Holding/Gone must supply that evidence.
     pub fn readmit(&self, tx: &mut Tx<'_>, cause: &str, act: &Act) -> Result<Admit> {
-        let mut state = Self::in_tx(tx)?;
-        if let Some(grant) = state.grants.get(cause) {
-            if &grant.act != act {
+        let state = Self::in_tx(tx)?;
+        if let Some(prior) = reservations::get(tx, cause)? {
+            if &prior.act != act {
                 return Err(error("CauseReused"));
             }
-            let current = Self::decide(&state, act);
-            if !matches!(current, Admit::Go(_)) {
-                state.grants.get_mut(cause).unwrap().recheck = true;
-                self.commit(tx, &state)?;
-                return Ok(current);
+            if let Some(mut grant) = prior.grant {
+                let current = Self::decide_in(tx, &state, act)?;
+                if !matches!(current, Admit::Go(_)) {
+                    grant.recheck = true;
+                    reservations::put(tx, cause, act, Some(grant))?;
+                    return Ok(current);
+                }
             }
         }
         self.admit(tx, cause, act)
@@ -822,51 +881,6 @@ impl Exclusivity {
             owned: self.owned_leaf(bs)?,
             current: history.leaf().map(str::to_owned),
         })
-    }
-}
-
-impl Exclusivity {
-    /// Consume #6's already cgroup-checked observation. /proc is read before entering SQLite.
-    /// An unknown reason, missing identity, or still-live process never releases a lease.
-    pub fn observe_watchdog(
-        &self,
-        found: &nd_runs::Found,
-        generation: u64,
-        kind: BackendKind,
-    ) -> Result<()> {
-        let run = found.run.clone();
-        let observation = match (
-            found.state.as_str(),
-            found.identity.as_ref(),
-            found.reason.as_deref(),
-        ) {
-            ("Up", Some(identity), _) if identity.matching() == Some(true) => Observed::Up {
-                run,
-                identity: identity.clone(),
-                generation,
-                kind,
-            },
-            ("Gone", Some(identity), Some(reason @ ("ProcGone" | "Exited")))
-                if identity.matching() == Some(false) =>
-            {
-                Observed::Gone {
-                    run,
-                    identity: Some(identity.clone()),
-                    how: if reason == "Exited" {
-                        GoneHow::Exited
-                    } else {
-                        GoneHow::ProcGone
-                    },
-                }
-            }
-            ("Gone", None, Some("NeverLaunched")) => Observed::Gone {
-                run,
-                identity: None,
-                how: GoneHow::NeverLaunched,
-            },
-            _ => Observed::IdentityMismatch { run },
-        };
-        self.observe(observation)
     }
 }
 

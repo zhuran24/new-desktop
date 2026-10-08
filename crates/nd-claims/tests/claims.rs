@@ -2,6 +2,31 @@ use nd_claims::*;
 use std::sync::Arc;
 
 #[test]
+fn an_unavailable_optional_cli_list_does_not_block_registry_recovery_or_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
+    let claims = Exclusivity::open(store, RegistryConfig::new(dir.path().join("cli"))).unwrap();
+    let _interest = claims.want_list();
+    claims.observe(Observed::Recovered).unwrap();
+    claims.refresh().unwrap();
+    assert_eq!(claims.recovery().unwrap(), Recovery::Ready);
+    assert!(
+        claims.externals().is_err(),
+        "only the optional listing reports the command failure"
+    );
+    assert!(matches!(
+        claims
+            .peek(&Act::Open {
+                session: "s".into(),
+                bs: NewBs::Fresh(BackendKind::Codex),
+                via: "r".into(),
+            })
+            .unwrap(),
+        Admit::Go(_)
+    ));
+}
+
+#[test]
 fn opening_a_backend_session_reserves_it_for_one_run_and_rolls_back_with_the_caller() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
@@ -422,10 +447,11 @@ fn scripted_cli_lists_are_unverified_without_registry_identity_and_interest_drop
         session: "s".into(),
         bs: BackendSessionId::claude(id),
     };
-    assert!(matches!(
-        claims.peek(&act).unwrap(),
-        Admit::Wait(Obstacle::ExternalUnverified(_))
-    ));
+    assert!(matches!(claims.peek(&act).unwrap(), Admit::Go(_)));
+    assert!(
+        !claims.externals().unwrap().is_empty(),
+        "the listing still shows unverified metadata"
+    );
     drop(interest);
     let external = ShortProcess::start();
     support::registry(
@@ -446,7 +472,8 @@ fn scripted_cli_lists_are_unverified_without_registry_identity_and_interest_drop
 }
 
 #[test]
-fn real_background_job_without_a_pid_blocks_even_when_no_one_is_listing_external_sessions() {
+fn real_cli_background_session_without_a_pid_blocks_even_when_no_one_is_listing_external_sessions()
+{
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
     let claims = support::ready(store, dir.path());
@@ -557,52 +584,6 @@ fn record_checks_use_the_cli_selected_leaf_without_replacing_the_own_journal_bas
     std::fs::write(&path, b"{\"type\":").unwrap();
     assert!(claims.check_record(&bs, &path).is_err());
     assert_eq!(claims.owned_leaf(&bs).unwrap(), check.owned);
-}
-
-#[test]
-fn watchdog_identity_reports_cannot_turn_mismatched_or_live_processes_into_gone() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
-    let claims = support::ready(store.clone(), dir.path());
-    let mut child = ShortProcess::start();
-    let bs = BackendSessionId::claude("watchdog");
-    store
-        .write(|tx| {
-            claims.admit(
-                tx,
-                "open",
-                &Act::Open {
-                    session: "s".into(),
-                    bs: NewBs::Known(bs.clone()),
-                    via: "r".into(),
-                },
-            )
-        })
-        .unwrap();
-    let mut found = nd_runs::Found {
-        run: "r".into(),
-        identity: Some(child.identity()),
-        state: "Up".into(),
-        high: 0,
-        exit: None,
-        tail: "Available".into(),
-        reason: None,
-        detail: None,
-    };
-    claims
-        .observe_watchdog(&found, 1, BackendKind::Claude)
-        .unwrap();
-    found.state = "Gone".into();
-    found.reason = Some("ProcGone".into());
-    claims
-        .observe_watchdog(&found, 1, BackendKind::Claude)
-        .unwrap();
-    assert!(claims.lease(&bs).unwrap().unwrap().unknown);
-    child.stop();
-    claims
-        .observe_watchdog(&found, 1, BackendKind::Claude)
-        .unwrap();
-    assert_eq!(claims.lease(&bs).unwrap(), None);
 }
 
 #[test]
@@ -962,4 +943,108 @@ fn never_opened_releases_only_the_reservation_created_by_that_cause() {
         })
         .unwrap();
     assert_eq!(claims.lease(&bs).unwrap(), None);
+}
+
+#[test]
+fn steady_state_writes_do_not_accumulate_persistent_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let store = Arc::new(nd_store::Store::open(&path, 2).unwrap());
+    let claims = support::ready(store.clone(), dir.path());
+    let child = ShortProcess::start();
+    let bs = BackendSessionId::claude("steady");
+    claims
+        .observe(Observed::Up {
+            run: "r".into(),
+            identity: child.identity(),
+            generation: 1,
+            kind: BackendKind::Claude,
+        })
+        .unwrap();
+    claims
+        .observe(Observed::Holding {
+            run: "r".into(),
+            generation: 1,
+            at: 1,
+            now: vec![Held {
+                bs: bs.clone(),
+                session: "s".into(),
+                last_leaf: None,
+            }],
+        })
+        .unwrap();
+    for n in 0..2000 {
+        assert!(matches!(
+            store
+                .write(|tx| claims.admit(
+                    tx,
+                    &format!("write-{n}"),
+                    &Act::Write {
+                        session: "s".into(),
+                        bs: bs.clone()
+                    }
+                ))
+                .unwrap(),
+            Admit::Go(_)
+        ));
+    }
+    drop(claims);
+    drop(store);
+    assert!(
+        std::fs::metadata(&path).unwrap().len() < 256 * 1024,
+        "writes create no new ownership, so their admission must not grow the persistent database"
+    );
+}
+
+#[test]
+fn legacy_claims_reopen_with_reservations_and_exited_run_fences_intact() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(nd_store::Store::open(dir.path().join("state.db"), 2).unwrap());
+    let bs = BackendSessionId::claude("legacy");
+    let act = Act::Open {
+        session: "s".into(),
+        bs: NewBs::Known(bs.clone()),
+        via: "pending".into(),
+    };
+    // Frozen v1 storage format is an input fixture; assertions use Exclusivity only.
+    let old = json!({"causes":{"open":act}, "grants":{"open":{
+        "act":act,"pass":{"route":"Fresh"},"active":true,"recheck":false,"bound":null,"reserved":bs
+    }},"gone":["dead-run"],"leases":{
+        serde_json::to_string(&bs).unwrap(): {"bs":bs,"run":"pending","session":"s","unknown":false,"confirmed":false}
+    }});
+    store
+        .write(|tx| {
+            tx.execute_batch(
+                "CREATE TABLE claims_state(id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            )?;
+            tx.execute("INSERT INTO claims_state VALUES(1,?1)", [old.to_string()])?;
+            Ok(())
+        })
+        .unwrap();
+    let claims = support::ready(store.clone(), dir.path());
+    assert!(matches!(
+        store.write(|tx| claims.admit(tx, "open", &act)).unwrap(),
+        Admit::Go(_)
+    ));
+    assert_eq!(claims.lease(&bs).unwrap().unwrap().run, "pending");
+    assert_eq!(
+        claims
+            .peek(&Act::Open {
+                session: "s".into(),
+                bs: NewBs::Known(bs.clone()),
+                via: "dead-run".into()
+            })
+            .unwrap(),
+        Admit::No(Refusal::RunGone("dead-run".into()))
+    );
+    claims
+        .observe(Observed::NeverOpened {
+            cause: "open".into(),
+        })
+        .unwrap();
+    assert_eq!(claims.lease(&bs).unwrap(), None);
+    drop(claims);
+    let claims = support::ready(store.clone(), dir.path());
+    assert!(store.write(|tx| claims.bind(tx, "open", &bs)).is_err());
 }

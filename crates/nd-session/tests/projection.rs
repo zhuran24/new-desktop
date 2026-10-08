@@ -29,7 +29,7 @@ fn shown() -> impl Strategy<Value = Shown> {
                 id: format!("p{i}"),
                 text: "hi".into(),
                 intent: "fold".into(),
-                state: state.into(),
+                state: nd_wire::PromptState::from_value(&serde_json::json!(state)),
                 native: None,
                 reason: None,
             }),
@@ -55,4 +55,14 @@ proptest! {
             prop_assert_eq!(project(&log[..=cut]), incremental.items());
         }
     }
+}
+
+#[test]
+fn shell_fallback_reports_that_output_did_not_enter_the_conversation() {
+    let items = project(&[Shown::Invoke {
+        id: "shell".into(),
+        kind: "shell".into(),
+        data: json!({"state":"done","command":"pwd","exit":0,"stdout":"/p","appended":false}),
+    }]);
+    assert!(items[0].fallback.text.contains("输出没有进对话"));
 }

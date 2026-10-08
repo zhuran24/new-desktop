@@ -80,6 +80,7 @@ struct Inner {
     live: HashMap<CarrierId, RunId>,
     drain: Option<Drain>,
     acks: usize,
+    initial_settings: nd_backend::LiveSettings,
 }
 
 /// 重启之间留着的后端状态。
@@ -138,6 +139,9 @@ impl ScriptedAdapter {
     /// 拉起之后报的后台任务状态。
     pub fn set_drain(&self, drain: Drain) {
         self.inner.lock().unwrap().drain = Some(drain);
+    }
+    pub fn set_initial_settings(&self, settings: nd_backend::LiveSettings) {
+        self.inner.lock().unwrap().initial_settings = settings;
     }
     pub fn received(&self) -> Vec<(Ticket, Act)> {
         self.inner.lock().unwrap().received.clone()
@@ -281,10 +285,12 @@ impl ScriptedAdapter {
                 inner.applied.push(format!("open:{run}"));
                 inner.live.insert(carrier.clone(), run.clone());
                 let drain = inner.drain.clone().unwrap_or(Drain::Drained);
+                let settings = inner.initial_settings.clone();
                 drop(inner);
                 vec![
                     done(Outcome::Ok {
                         done: Done::Opened {
+                            settings: Box::new(settings),
                             bs: spec.origin.backend_session().clone(),
                             run: run.clone(),
                             readiness: Readiness::Full,
@@ -383,7 +389,10 @@ impl ScriptedAdapter {
                     vec![]
                 };
                 vec![done(Outcome::Ok {
-                    done: Done::Interrupted { cancelled },
+                    done: Done::Interrupted {
+                        cancelled,
+                        already_ended: false,
+                    },
                 })]
             }
             (Act::Configure { setting, .. }, Reply::Ok) => {
@@ -395,7 +404,7 @@ impl ScriptedAdapter {
                 let applied = serde_json::to_value(setting).unwrap();
                 vec![done(Outcome::Ok {
                     done: Done::Configured {
-                        settings: json!({"applied":applied}),
+                        settings: serde_json::from_value(json!({"applied":applied})).unwrap(),
                     },
                 })]
             }

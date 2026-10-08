@@ -11,6 +11,7 @@
 mod executor;
 mod feed;
 pub mod history;
+mod ids;
 pub mod journal;
 pub mod lineage;
 pub mod ops;
@@ -171,13 +172,14 @@ fn list_item(core: &state::Core) -> Item {
             "cwd": meta.cwd,
             "backend": format!("{:?}", meta.kind).to_lowercase(),
             "model": meta.model,
-            "title":meta.title,
+            "title":meta.title.text,
             "note": meta.note,
             "process_alive": alive,
         }),
         fallback: Fallback {
             title: meta
                 .title
+                .text
                 .clone()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| meta.cwd.display().to_string()),
@@ -193,6 +195,18 @@ fn list_item(core: &state::Core) -> Item {
 struct Handle {
     inputs: mpsc::Sender<Input>,
     shared: Arc<Shared>,
+    stop: Option<oneshot::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// 订阅一个会话流：开头（快照或续上的事件），之后的事件；丢掉它就不再算「有人在看」。
@@ -227,18 +241,15 @@ pub fn delivery(name: &str) -> bool {
 
 /// 由建会话的命令 id 派生会话 id：同一条命令重试落在同一个会话上。
 pub fn session_id_for(command_id: &str) -> SessionId {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("nd-session:{command_id}").as_bytes());
-    SessionId(format!(
-        "s-{}",
-        digest[..16]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    ))
+    SessionId(format!("s-{}", ids::derive_id("nd-session:", command_id)))
 }
 
 impl Sessions {
+    /// 已提交会话状态仍引用的 run；供看守回收使用，不能以展示列表代替此集合。
+    pub fn referenced_runs(&self) -> nd_store::Result<std::collections::BTreeSet<String>> {
+        state::referenced_runs(&self.deps.store)
+    }
+
     /// 建表、读回列表。独占登记的变化会唤醒全部装载中的会话（放行可能变了）。
     pub fn new(
         store: Arc<Store>,
@@ -347,18 +358,37 @@ impl Sessions {
         let deps = self.deps.clone();
         let session = id.clone();
         let thread_shared = shared.clone();
-        std::thread::Builder::new()
+        let (stop, stopped) = oneshot::channel();
+        let worker = std::thread::Builder::new()
             .name(format!("nd-session-{}", &id.0[..id.0.len().min(10)]))
-            .spawn(move || run_executor(session, deps, thread_shared, batches, rx, batch_rx, ready))
+            .spawn(move || {
+                run_executor(
+                    session,
+                    deps,
+                    thread_shared,
+                    batches,
+                    rx,
+                    batch_rx,
+                    ready,
+                    stopped,
+                )
+            })
             .map_err(nd_store::Error::Io)?;
         let born = born
             .recv()
             .map_err(|_| nd_store::Error::Aborted("session executor did not start".into()))??;
         if !born && !allow_unborn {
             drop(inputs);
+            drop(stop);
+            let _ = worker.join();
             return Ok(None);
         }
-        let handle = Arc::new(Handle { inputs, shared });
+        let handle = Arc::new(Handle {
+            inputs,
+            shared,
+            stop: Some(stop),
+            worker: Some(worker),
+        });
         executors.insert(id.clone(), handle.clone());
         Ok(Some(handle))
     }
@@ -403,6 +433,7 @@ impl Sessions {
                     Ok(nd_wire::ReceiptLookup::Conflict) => CommandReply::Conflict,
                     Ok(nd_wire::ReceiptLookup::Expired) => CommandReply::Expired,
                     _ => CommandReply::Unavailable {
+                        code: Some(nd_wire::UnavailableCode::Recovering),
                         reason: "守护进程恢复中，命令未受理".into(),
                     },
                 },
@@ -414,6 +445,7 @@ impl Sessions {
             Ok(None) => return Some(self.reject_without_session(command, "not_found")),
             Err(e) => {
                 return Some(CommandReply::Unavailable {
+                    code: None,
                     reason: e.to_string(),
                 });
             }
@@ -429,6 +461,7 @@ impl Sessions {
             .is_err()
         {
             return Some(CommandReply::Unavailable {
+                code: None,
                 reason: "会话执行器已停".into(),
             });
         }
@@ -444,6 +477,7 @@ impl Sessions {
                 Ok(nd_wire::ReceiptLookup::Conflict) => CommandReply::Conflict,
                 Ok(nd_wire::ReceiptLookup::Expired) => CommandReply::Expired,
                 _ => CommandReply::Unavailable {
+                    code: None,
                     reason: "会话执行器已停，命令没有受理".into(),
                 },
             },
@@ -477,6 +511,7 @@ impl Sessions {
                 })
             })
             .unwrap_or_else(|e| CommandReply::Unavailable {
+                code: None,
                 reason: e.to_string(),
             })
     }
@@ -530,6 +565,7 @@ fn run_executor(
     mut inputs: mpsc::Receiver<Input>,
     mut batch_rx: mpsc::Receiver<nd_backend::Batch>,
     ready: std::sync::mpsc::SyncSender<nd_store::Result<bool>>,
+    mut stopped: oneshot::Receiver<()>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -559,6 +595,7 @@ fn run_executor(
                 }
             }
             let input = tokio::select! {
+                _ = &mut stopped => return,
                 input = inputs.recv() => match input {
                     Some(input) => input,
                     None => return,

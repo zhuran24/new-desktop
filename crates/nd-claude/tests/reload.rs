@@ -80,3 +80,242 @@ async fn a_reloaded_mod_reports_a_new_generation_and_refuses_commands_for_the_ol
     drop(claude);
     fx.close();
 }
+
+async fn reload(fx: &Fixture, run: &mut nd_claude::ClaudeRun) {
+    let old = run
+        .recording()
+        .iter()
+        .rev()
+        .find_map(|r| match &r.event {
+            nd_claude::ModEvent::Hello { hello } if hello.module == ModName::Actions => {
+                Some(hello.mod_gen.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let path = fx
+        .scenario
+        .root()
+        .join("mods/new-desktop-actions/hooks/channel.ts");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    code.push_str("\n// reload timing scenario\n");
+    std::fs::write(path, code).unwrap();
+    run.write(&serde_json::json!({"type":"control_request","request_id":uuid::Uuid::new_v4().to_string(),"request":{"subtype":"reload_plugins"}})).await.unwrap();
+    let after = run
+        .wait_binding(Duration::from_secs(10), |b| {
+            b.mods
+                .get(&ModName::Actions)
+                .is_some_and(|h| h.mod_gen != old)
+        })
+        .await
+        .unwrap();
+    assert_ne!(after.mods[&ModName::Actions].mod_gen, old);
+}
+
+#[tokio::test]
+async fn real_reload_preserves_unsent_commands_and_rejects_the_old_session() {
+    for rebind in [false, true] {
+        let fx = Fixture::start(if rebind {
+            "reload-rebind"
+        } else {
+            "reload-pending"
+        })
+        .await;
+        let config = fx.config();
+        let socket = config.socket.clone();
+        let upstream = socket.with_file_name("upstream.sock");
+        let claude = fx.claude(config);
+        std::fs::rename(&socket, &upstream).unwrap();
+        let gates = fx.scenario.root().join("gates");
+        std::fs::create_dir(&gates).unwrap();
+        std::fs::write(gates.join("hold-next"), "").unwrap();
+        let mut proxy = tokio::process::Command::new("/usr/bin/python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/mod_proxy.py"
+            ))
+            .arg(&socket)
+            .arg(upstream)
+            .arg(&gates)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let session = session_id();
+        let mut run = claude
+            .open("reload", fx.fresh(&session), InitOptions::default())
+            .await
+            .unwrap();
+        let ping = run.send(ModName::Actions, Action::Ping).unwrap();
+        let compact = run
+            .send(
+                ModName::Actions,
+                Action::Compact {
+                    spec: nd_mod_proto::SummarizeSpec {
+                        scope: nd_mod_proto::CompactScope::From,
+                        sha256: "0".repeat(64),
+                        nth: 1,
+                        of: 1,
+                    },
+                },
+            )
+            .unwrap();
+        if rebind {
+            run.write(&serde_json::json!({"type":"user","message":{"role":"user","content":"/clear"},"parent_tool_use_id":null,"session_id":session})).await.unwrap();
+            let binding = run
+                .wait_binding(Duration::from_secs(3), |b| b.backend_session_id != session)
+                .await
+                .unwrap();
+            assert_ne!(binding.backend_session_id, session);
+        }
+        reload(&fx, &mut run).await;
+        assert_eq!(
+            run.result(&compact, Duration::from_millis(10)).await,
+            None,
+            "never delivered is still safe to dispatch after reload"
+        );
+        std::fs::remove_file(gates.join("hold-next")).unwrap();
+        let ping_result = run.result(&ping, Duration::from_secs(10)).await;
+        let compact_result = run.result(&compact, Duration::from_secs(10)).await;
+        if rebind {
+            for result in [ping_result, compact_result] {
+                assert!(
+                    matches!(
+                        result,
+                        Some(CommandResult::Outcome(Outcome::Rejected {
+                            reason: Rejection::StaleSession { .. }
+                        }))
+                    ),
+                    "{result:?}"
+                );
+            }
+        } else {
+            assert!(
+                matches!(
+                    ping_result,
+                    Some(CommandResult::Outcome(Outcome::Done { .. }))
+                ),
+                "{ping_result:?}"
+            );
+            assert!(
+                matches!(
+                    compact_result,
+                    Some(CommandResult::Outcome(Outcome::Done { .. }))
+                ),
+                "{compact_result:?}"
+            );
+            // 已交付的 Ping 的真实 result 请求被扣在传输层；重载后按同一 op_id 重发。
+            std::fs::write(gates.join("hold-result"), "").unwrap();
+            let _ = std::fs::remove_file(gates.join("result-seen"));
+            let inflight = uuid::Uuid::new_v4().to_string();
+            std::fs::write(
+                gates.join("drop-result"),
+                serde_json::json!({
+                    "op_id":inflight, "mod_gen":run.binding().mods[&ModName::Actions].mod_gen
+                })
+                .to_string(),
+            )
+            .unwrap();
+            // Replay the real Compact result at the transport boundary. Its
+            // duplicate must pass while the target Ping result gate is armed;
+            // otherwise the mod's serial result-report loop can never reach Ping.
+            let duplicate = run
+                .recording()
+                .iter()
+                .find_map(|r| match &r.event {
+                    nd_claude::ModEvent::Result { op_id, post } if op_id == &compact => {
+                        Some(serde_json::to_vec(post).unwrap())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(3), async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut connection = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let request = format!(
+                    "POST /result/{compact} HTTP/1.1\r\nHost: nd\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    duplicate.len()
+                );
+                connection.write_all(request.as_bytes()).await.unwrap();
+                connection.write_all(&duplicate).await.unwrap();
+                let mut response = String::new();
+                connection.read_to_string(&mut response).await.unwrap();
+                response
+            }).await.expect("the Ping gate must not hold a duplicate Compact result");
+            assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+            assert!(!gates.join("target-result-seen").exists());
+            assert!(!gates.join("result-dropped").exists());
+            assert!(run.send_as(ModName::Actions, &inflight, Action::Ping));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !gates.join("target-result-seen").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            reload(&fx, &mut run).await;
+            let generation = run.binding().mods[&ModName::Actions].mod_gen.clone();
+            // The same op in the NEW generation must pass even while the
+            // OLD generation's result is still held at the proxy.
+            assert!(matches!(
+                run.result(&inflight, Duration::from_secs(10)).await,
+                Some(CommandResult::Outcome(Outcome::Done { .. }))
+            ));
+            std::fs::remove_file(gates.join("hold-result")).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !gates.join("result-dropped").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the old result must be lost at the transport boundary");
+            let recording = run.recording();
+            assert_eq!(recording.iter().flat_map(|r| &r.facts).filter(|f|
+                matches!(f, nd_claude::Fact::Delivered { op_id, .. } if op_id == &inflight)).count(), 2,
+                "the same op must actually reach the new mod generation");
+            assert!(recording.iter().any(|r| matches!(&r.event,
+                nd_claude::ModEvent::Result { op_id, post } if op_id == &inflight && post.mod_gen == generation)
+                && r.facts.iter().any(|f| matches!(f, nd_claude::Fact::Finished { op_id, .. } if op_id == &inflight))));
+        }
+        let name = if rebind {
+            "reload-rebind"
+        } else {
+            "reload-pending"
+        };
+        let path = fx.scenario.root().join(format!("{name}.jsonl"));
+        nd_claude::fixture::write_fixture(
+            &path,
+            &nd_claude::fixture::FixtureMeta {
+                format: 1,
+                capability: "mod-channel".into(),
+                backend: "claude".into(),
+                version: "2.1.289".into(),
+                scenario: name.into(),
+            },
+            &session,
+            &run.recording(),
+        )
+        .unwrap();
+        if let Some(dest) = std::env::var_os("ND_MOD_FIXTURE_DIR") {
+            std::fs::copy(
+                path,
+                std::path::Path::new(&dest).join(format!("{name}.jsonl")),
+            )
+            .unwrap();
+        }
+        proxy.kill().await.unwrap();
+        drop(run);
+        drop(claude);
+        fx.close();
+    }
+}

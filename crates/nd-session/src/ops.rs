@@ -39,7 +39,13 @@ impl OpSpec {
     }
     /// 结构操作：一个会话同时至多一个，进行中代持给对话的新输入。
     pub fn structural(&self) -> bool {
-        !matches!(self, Self::Title(Title { generate: true, .. }))
+        !matches!(
+            self,
+            Self::Title(Title {
+                request: TitleRequest::Generate { .. },
+                ..
+            })
+        )
     }
     pub fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
         match self {
@@ -70,11 +76,7 @@ fn uuid_from_hex(hex: &str) -> String {
 fn profile(v: &View<'_>) -> Profile {
     let meta = v.meta();
     Profile {
-        effort: meta.effort.clone().or_else(|| {
-            meta.settings["applied"]["effort"]
-                .as_str()
-                .map(str::to_owned)
-        }),
+        effort: meta.effort.clone(),
         kind: meta.kind.clone(),
         model: meta.model.clone(),
         permission_mode: meta.permission_mode.clone(),
@@ -117,8 +119,11 @@ impl Create {
                     carrier: carrier.clone(),
                     run: run.clone(),
                     spec: OpenSpec {
-                        live_settings: v.meta().settings["applied"]["ultracodeRequested"]
-                            .as_bool()
+                        live_settings: v
+                            .meta()
+                            .settings
+                            .applied
+                            .ultracode_requested
                             .map(nd_wire::LiveSetting::Ultracode)
                             .into_iter()
                             .collect(),
@@ -204,8 +209,11 @@ impl Launch {
                     carrier: self.carrier.clone(),
                     run: run.clone(),
                     spec: OpenSpec {
-                        live_settings: v.meta().settings["applied"]["ultracodeRequested"]
-                            .as_bool()
+                        live_settings: v
+                            .meta()
+                            .settings
+                            .applied
+                            .ultracode_requested
                             .map(nd_wire::LiveSetting::Ultracode)
                             .into_iter()
                             .collect(),
@@ -266,11 +274,13 @@ pub struct Configure {
 }
 impl Configure {
     fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
-        j.wait("between-turns", v, |v| {
-            v.carrier(&self.carrier)
-                .filter(|c| !c.turn_running)
-                .map(|_| true)
-        })?;
+        if matches!(self.setting, nd_wire::LiveSetting::Model(_)) {
+            j.wait("between-turns", v, |v| {
+                v.carrier(&self.carrier)
+                    .filter(|c| !c.turn_running)
+                    .map(|_| true)
+            })?;
+        }
         if !v.carrier(&self.carrier).is_some_and(|c| c.alive) {
             Launch {
                 carrier: self.carrier.clone(),
@@ -290,17 +300,51 @@ impl Configure {
         match outcome {
             Outcome::Ok {
                 done: Done::Configured { settings },
-            } => Ok(settings),
+            } => Ok(serde_json::to_value(settings).expect("neutral settings")),
             other => Err(j.fail(other.reason())),
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TitleRequest {
+    Rename { title: String },
+    Generate { description: String },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TitleRecord")]
 pub struct Title {
     pub carrier: CarrierId,
-    pub title: String,
-    pub generate: bool,
+    pub request: TitleRequest,
+}
+#[derive(Deserialize)]
+struct TitleRecord {
+    carrier: CarrierId,
+    #[serde(default)]
+    request: Option<TitleRequest>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    generate: bool,
+}
+impl From<TitleRecord> for Title {
+    fn from(record: TitleRecord) -> Self {
+        Self {
+            carrier: record.carrier,
+            request: record.request.unwrap_or({
+                if record.generate {
+                    TitleRequest::Generate {
+                        description: record.title,
+                    }
+                } else {
+                    TitleRequest::Rename {
+                        title: record.title,
+                    }
+                }
+            }),
+        }
+    }
 }
 impl Title {
     fn run(&self, v: &View<'_>, j: &mut Journal<'_>) -> Result<Value, Halt> {
@@ -316,14 +360,15 @@ impl Title {
                 &self.carrier,
                 Act::Invoke {
                     to: self.carrier.clone(),
-                    invocation: if self.generate {
-                        nd_backend::Invocation::GenerateTitle {
-                            description: self.title.clone(),
+                    invocation: match &self.request {
+                        TitleRequest::Generate { description } => {
+                            nd_backend::Invocation::GenerateTitle {
+                                description: description.clone(),
+                            }
                         }
-                    } else {
-                        nd_backend::Invocation::Title {
-                            title: self.title.clone(),
-                        }
+                        TitleRequest::Rename { title } => nd_backend::Invocation::Title {
+                            title: title.clone(),
+                        },
                     },
                 },
             )

@@ -1,0 +1,25 @@
+{
+  "pinned_cli": "/mnt/wd_external/nd-build/cli/claude-2.1.289",
+  "environment": {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "HOME": "/sandbox/home",
+    "CLAUDE_CONFIG_DIR": "/sandbox/claude",
+    "XDG_CONFIG_HOME": "/sandbox/config",
+    "XDG_DATA_HOME": "/sandbox/data",
+    "XDG_STATE_HOME": "/sandbox/state",
+    "XDG_CACHE_HOME": "/sandbox/cache",
+    "XDG_RUNTIME_DIR": "/sandbox/runtime"
+  },
+  "offline_claude": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8765",
+    "ANTHROPIC_API_KEY": "offline-fixture",
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_EAGER_FLUSH": "1",
+    "CLAUDE_CODE_SDK_READS_SESSION_STATE": "1",
+    "TERM": "dumb"
+  }
+}

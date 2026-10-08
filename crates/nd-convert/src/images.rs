@@ -6,7 +6,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 pub struct FrozenImage {
     pub media_type: String,
     pub data: String,
-    pub sha256: String,
+    pub sha256: nd_id::BlobId,
 }
 
 impl FrozenImage {
@@ -14,14 +14,14 @@ impl FrozenImage {
         Self {
             media_type: media_type.into(),
             data: STANDARD.encode(bytes),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: nd_id::BlobId::of(bytes),
         }
     }
 }
 
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
-fn unavailable(label: &str) -> Part {
+pub(crate) fn unavailable(label: &str) -> Part {
     Part::Notice {
         reason: "image_unavailable".into(),
         value: json!(label),
@@ -58,20 +58,38 @@ pub(crate) fn reference(input: &FrozenInput, reference: &str) -> Result<Part, Co
     let bytes = STANDARD
         .decode(&image.data)
         .map_err(|_| ConvertError::Invalid("invalid frozen image base64".into()))?;
-    if format!("{:x}", Sha256::digest(&bytes)) != image.sha256 {
+    if nd_id::BlobId::of(&bytes) != image.sha256 {
         return Err(ConvertError::Invalid("frozen image hash mismatch".into()));
     }
     Ok(inline(&image.media_type, &image.data))
 }
 
+/// One reference vocabulary for decoding and synchronization fingerprints.
+pub(crate) fn reference_key(block: &Value) -> Option<&str> {
+    match block["type"].as_str() {
+        Some("localImage") => block["path"].as_str(),
+        Some("input_image") => block["image_url"]
+            .as_str()
+            .or_else(|| block["file_id"].as_str()),
+        Some("image") => block["url"]
+            .as_str()
+            .or_else(|| block["source"]["url"].as_str())
+            .or_else(|| block["fileId"].as_str())
+            .or_else(|| block["source"]["file_id"].as_str()),
+        _ => None,
+    }
+}
+
+pub(crate) fn decode_reference(input: &FrozenInput, block: &Value) -> Result<Part, ConvertError> {
+    match reference_key(block) {
+        Some(key) => reference(input, key),
+        None => Ok(unavailable(&block.to_string())),
+    }
+}
+
 pub(crate) fn prefix_hash(input: &FrozenInput, count: usize) -> String {
     fn walk<'a>(v: &'a Value, refs: &mut BTreeSet<&'a str>) {
-        if let Some(s) = match v["type"].as_str() {
-            Some("localImage") => v["path"].as_str(),
-            Some("input_image") => v["image_url"].as_str(),
-            Some("image") => v["url"].as_str().or_else(|| v["source"]["url"].as_str()),
-            _ => None,
-        } {
+        if let Some(s) = reference_key(v) {
             refs.insert(s);
         }
         match v {

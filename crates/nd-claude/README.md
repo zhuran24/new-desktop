@@ -1,6 +1,6 @@
 # Claude 适配：拉起后端进程与 mod 通道
 
-日期：2026-10-06。`nd-claude` 按规格「进程」的启动模板拉起 Claude Code 后端进程（交给看守进程托管），开 mod 通道等两个 mod 报到，再写 initialize 判定就绪。mod 协议类型在 [`nd-mod-proto`](../nd-mod-proto/src/lib.rs)，两个 mod 在仓库根的 [`mods/`](../../mods/README.md)。实现遵循 ADR 0004、0005、0011、0013。`ClaudeBackend` 是后端端口 `BackendAdapter`（[`nd-backend`](../nd-backend/src/lib.rs)）的 Claude 实现，由守护进程装配给会话组件；本 crate 不持有持久状态，检查点由会话执行器随批次提交。
+日期：2026-10-08。`nd-claude` 按规格「进程」的启动模板拉起 Claude Code 后端进程（交给看守进程托管），开 mod 通道等两个 mod 报到，再写 initialize 判定就绪。mod 协议类型在 [`nd-mod-proto`](../nd-mod-proto/src/lib.rs)，两个 mod 在仓库根的 [`mods/`](../../mods/README.md)。实现遵循 ADR 0004、0005、0011、0013。`ClaudeBackend` 是后端端口 `BackendAdapter`（[`nd-backend`](../nd-backend/src/lib.rs)）的 Claude 实现，由守护进程装配给会话组件；本 crate 不持有持久状态，检查点由会话执行器随批次提交。
 
 ## 接口
 
@@ -34,6 +34,8 @@ argv 逐项传入，不拼 shell：`--output-format stream-json --input-format s
 4. 读看守流水直到这条 initialize 的成功回应。不等 `system/init`；能力按回应实际列出的为准。进程先退出或回应超时是拉起失败。
 
 就绪＝initialize 已回应＋两个 hello＋会话 id 一致。任一 mod 没在时限内报到（或报的 id 不对）：拉起仍算成功，`Readiness::ChatOnly{why}`，`Caps.features` 里退役、Codex 子代理、给子代理发消息、总结、`!` 模式、fork 型子代理、设置行、转接任务操作全部 `Unsupported{why}`；`why` 写明哪个 mod、等了多久，供会话头显示。只能聊天的进程以后即使 mod 迟到也不升级。
+
+权限目录的 bypass 授权随启动解析结果保存在 Caps 和检查点。P-36 有两种旧格式不迁移：`f8003de` 写出的 `bypass_permissions=false` 记录，以及 v1（`bb28bcd`）缺该字段且原 initialize 流水已回收的记录；接回这些记录时，目录仍可能缺少 bypass。owner 确认 `f8003de` 只是审查分支的中间提交，v1 也从未在其日常环境部署，两者没有需要迁移的真实数据，因此这两种情况未改。
 
 `Caps.interrupt_spares_background` 表示 Esc（`interrupt`）不停后台子代理与 Workflow：声明了 `perTaskStopAffordance` 且 stdin 开着时成立（R10-E1 已实测）。
 
@@ -122,3 +124,5 @@ CLI 依赖逐条登记在 [CLI 契约清单](../../docs/cli-contracts.md) 的「
 
 
 #19 集成后，检查点的 writes 覆盖用户输入和控制请求的实际输入序号，controls 只保留回应配对。对旧版不含 writes 的控制检查点按旧格式兼容；无法证明未写出时保持 Unknown。接回先追平并报 Recovered，写过的控制继续等原回应；已终结 Unknown 的票只对账，不重新执行。明确回应同时提供 Clarified，供引擎更新原 Unknown 的当前结论。
+
+中断携带按 Esc 时的 `TurnRef{run,key}`；重启补发与普通写入走同一核对。目标已结束或无法确认时只回「目标回合已结束，无需中断」，不写 CLI interrupt。桌面用已呈现的 `process.turn` 填入 expect，未提供 expect 的终端调用在签票时钉住当前回合。CLI 没有原子的期望回合字段，核对与实际写入之间仍有竞态；会话头的 `process.interrupt_scope` 明示这一界限。

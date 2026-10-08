@@ -4162,7 +4162,6 @@ name = "nd-claims"
 version = "0.1.0"
 dependencies = [
  "nd-claude-records",
- "nd-runs",
  "nd-store",
  "nd-watchdog-proto",
  "notify",
@@ -4228,6 +4227,7 @@ name = "nd-convert"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "nd-id",
  "proptest",
  "serde",
  "serde_json",
@@ -4258,7 +4258,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4282,6 +4281,17 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "nd-id"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4315,10 +4325,13 @@ name = "nd-runs"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "nd-claims",
+ "nd-store",
  "nd-watchdog-proto",
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -4344,8 +4357,8 @@ dependencies = [
 name = "nd-store"
 version = "0.1.0"
 dependencies = [
+ "nd-id",
  "rusqlite",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -4355,6 +4368,7 @@ name = "nd-testkit"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "fs2",
  "futures",
  "http-body-util",
  "hyper",
@@ -4382,7 +4396,6 @@ dependencies = [
  "hyper-util",
  "nd-wire",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
@@ -4426,6 +4439,7 @@ dependencies = [
 name = "nd-wire"
 version = "0.1.0"
 dependencies = [
+ "nd-id",
  "schemars",
  "serde",
  "serde_json",
