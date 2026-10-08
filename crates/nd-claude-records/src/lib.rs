@@ -563,10 +563,12 @@ impl<'a> RecordIndex<'a> {
                     );
                 }
                 let members = batch.clone();
-                for member in members
+                // CLI recovers attachments for every chunk of a tool reply,
+                // including text-only chunks sharing its message ID.
+                let tool_reply = members
                     .iter()
-                    .filter(|m| !m.tool_uses.is_empty() || m.tool_result)
-                {
+                    .any(|m| !m.tool_uses.is_empty() || m.tool_result);
+                for member in members.iter().filter(|_| tool_reply) {
                     let mut pending = vec![*member];
                     let mut seen = HashSet::new();
                     while let Some(parent) = pending.pop() {

@@ -607,3 +607,27 @@ fn attachments_below_selected_tool_metadata_are_recovered() {
         ["u", "a", "r", "meta", "date", "done"]
     );
 }
+
+#[test]
+fn attachment_below_text_only_member_of_a_tool_reply_is_recovered() {
+    let mut a1 = message("a1", Some("u"), "assistant", "");
+    a1["message"]["id"] = json!("batch");
+    a1["message"]["content"] = json!([{"type":"tool_use","id":"t","name":"Read","input":{}}]);
+    let mut a2 = message("a2", Some("a1"), "assistant", "text after call");
+    a2["message"]["id"] = json!("batch");
+    let mut r = message("r", Some("a1"), "user", "");
+    r["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"t","content":"ok"}]);
+    let data = transcript(&[
+        message("u", None, "user", "read"),
+        a1,
+        a2,
+        r,
+        json!({"type":"attachment","uuid":"date","parentUuid":"a2","attachment":{"type":"date","date":"2026-10-08"}}),
+        message("done", Some("r"), "assistant", "done"),
+    ]);
+    let index = RecordIndex::parse(&data).unwrap();
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        ["u", "a1", "a2", "r", "date", "done"]
+    );
+}
