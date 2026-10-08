@@ -5066,3 +5066,127 @@ async fn legacy_ultracode_settings_survive_upgrade_after_idle_reclaim() {
         fx.close();
     }
 }
+
+#[tokio::test]
+async fn global_replay_overflow_releases_an_existing_session_subscription() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let fx = Fixture::with_env(
+        "replay-reclaim",
+        700,
+        "\n[wire]\nsend_queue = 32\nsend_timeout_ms = 500",
+    )
+    .await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("overflow-create", "/sandbox/project", "hello")
+        .await;
+    fx.wait(&session, "ready", |s| {
+        texts(s) == ["ready"] && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let mut ui = fx.ui().await;
+    let initial = ui.subscribe("global").await.unwrap();
+    ui.close().await.unwrap();
+    let (mut wire, _) = tokio_tungstenite::client_async(
+        "ws://localhost/wire",
+        tokio::net::UnixStream::connect(fx.socket()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    for request in [
+        nd_wire::Request::Hello {
+            version: 1,
+            namespaces: Default::default(),
+        },
+        nd_wire::Request::Subscribe {
+            stream: format!("session/{session}"),
+            since: None,
+        },
+    ] {
+        wire.send(Message::Text(
+            serde_json::to_string(&request).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+        wire.next().await.unwrap().unwrap();
+    }
+    let mut commands = fx.ui().await;
+    for revision in 0..31 {
+        let reply = commands
+            .command(&Command {
+                id: format!("note-{revision}"),
+                device: "test".into(),
+                name: "diagnostics.set_note".into(),
+                args: json!({"text":format!("{revision}:{}", "x".repeat(60_000))}),
+                expect: json!({"revision":revision}),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reply,
+            CommandReply::Receipt {
+                receipt: Receipt::Done { .. }
+            }
+        ));
+    }
+    commands.close().await.unwrap();
+    assert_eq!(
+        listed(&fx, &session).await.unwrap().data["process_alive"],
+        true
+    );
+    // Fill the transport and leave responses queued without overflowing it.
+    // The 31-event replay is smaller than the queue capacity (32), so it must
+    // replay, yet cannot fit beside these outstanding large page responses.
+    for id in 0..12 {
+        wire.send(Message::Text(
+            serde_json::to_string(&nd_wire::Request::Get {
+                id,
+                res: "global".into(),
+                page: Default::default(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    }
+    wire.send(Message::Text(
+        serde_json::to_string(&nd_wire::Request::Subscribe {
+            stream: "global".into(),
+            since: Some(initial.position()),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    // The replay loop overflows while the same connection owns the session guard.
+    // Let the Unix socket fill before consuming the best-effort Bye.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match wire.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let response: nd_wire::Response = serde_json::from_str(&text).unwrap();
+                    if matches!(response, nd_wire::Response::Bye { resume: true }) { break; }
+                    assert!(!matches!(response, nd_wire::Response::Snapshot { ref snapshot } if snapshot.stream == "global"),
+                        "must take the replay path, not a replacement snapshot");
+                }
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                _ => {},
+            }
+        }
+    }).await.expect("replay overflow must disconnect the wire");
+    drop(wire);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while listed(&fx, &session).await.unwrap().data["process_alive"] == true {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("overflow cleanup must release the session watcher so idle reclaim can finish");
+    fx.close();
+}
