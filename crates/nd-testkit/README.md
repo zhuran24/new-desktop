@@ -20,7 +20,7 @@ scripts/test-scenarios.sh
 
 | 接口 | 用法与边界 |
 |---|---|
-| `Scenario::start(ScenarioOptions)` | 名称限小写字母、数字、连字符；每次追加 UUID。同名场景也能并行。参数含真 daemon 路径、config.toml 内容、slice 内存上限、连接超时 |
+| `Scenario::start(ScenarioOptions)` | 名称限小写字母、数字、连字符；每次追加 UUID。同名场景也能并行。参数含真 daemon 路径、config.toml 内容、slice 内存上限、连接超时、场景总寿命 `max_lifetime`（默认 300 秒） |
 | `ScenarioOptions::{watchdog,disk_scratch}` | 启用真实看守；可选 E 盘临时目录映射为 `/scratch`，供普通磁盘页缓存测试，结束自动删除 |
 | `Scenario::{watchdogs,watchdog_spec,claude_watchdog_spec}` | 提供真实托管 API、白名单环境与固定 CLI 规格，运行诊断经同步副本 `Get("runs")` 观察 |
 | `ModelReply::streaming_text(text,chunk_chars,pause_ms)` | 将文字拆成真实 SSE delta 并按配置节奏发送，用于 CLI 流式输出实测 |
@@ -43,7 +43,7 @@ scripts/test-scenarios.sh
 
 端点支持 `POST /v1/messages`（允许 query string）、非流式 JSON 与 SSE 的 text/tool_use；usage 是固定夹具值，不用于额度或 token 准确性测试。其他 API 未实现。工具应答中的程序必须由场景显式安排，真实工具结果通过下一次真实 CLI 请求观察。
 
-Rust 运行器、原生窗口场景和 CLI 现场生成器共用 `python/isolation.json` 中的 CLI 路径、基础环境与离线模型环境。Rust 的 `isolation` 模块读取同一策略；Python 的 `isolation.Sandbox` 负责 transient slice、bwrap、限额验证及清理。原生场景只增加私有 KWin/总线和渲染所需的只读挂载。所有 transient 服务带 `RuntimeMaxSec` 兜底。
+Rust 运行器、原生窗口场景和 CLI 现场生成器共用 `python/isolation.json` 中的 CLI 路径、基础环境与离线模型环境。Rust 的 `isolation` 模块读取同一策略；Python 的 `isolation.Sandbox` 负责 transient slice、bwrap、限额验证及清理。原生场景只增加私有 KWin/总线和渲染所需的只读挂载。Rust `Scenario` 使用 slice 外的独立 transient timer，到期显式停止整个 slice；Python 运行器的服务使用 `RuntimeMaxSec` 限时。
 
 `ScenarioOptions::new(...).default_paths()` 验证产品的默认 XDG 路径；`Scenario::socket()` 给出对应宿主 socket。配置文本通过 `ScenarioOptions::config(...)` 设置。
 
@@ -55,12 +55,12 @@ Rust 运行器、原生窗口场景和 CLI 现场生成器共用 `python/isolati
 
 伪端点只监听场景 UDS；CLI 所在的独立网络命名空间有一个环回 TCP 代理，转到这个 UDS。场景不共享端口、目录或端点状态。两个同名场景用同一命令 id 写出不同结果的并行测试验证这一边界。
 
-Rust 进程被 SIGKILL 或机器掉电时不能运行 Drop；这类中断后按失败日志/`Scenario::units()` 记录的**完整单元名**停止对应 slice，再删除对应临时目录。不要批量停止其他席位的 `nd-test-*` 单元。关闭一次场景不会删除 systemd journal；journal 是排障证据。
+Rust 进程被 SIGKILL 时，独立 timer 仍在场景创建后的 `max_lifetime` 到期执行清理：显式停止 slice（不会触发 daemon 的失败重启），再删除该场景的运行目录和磁盘临时目录。daemon 的自动或手动重启不重置这个期限。正常清理同时撤销 timer 和清理服务；`units()` 包含这两个单元。机器掉电或用户 systemd 实例被结束时无法保证定时清理；此时按失败日志/`Scenario::units()` 记录的**完整单元名**确认对应单元已退出，再删除对应临时目录。不要批量停止其他席位的 `nd-test-*` 单元。关闭一次场景不会删除 systemd journal；journal 是排障证据。
 
 ## 验证范围与后续接入
 
 - [端点测试](tests/endpoint.rs)：route、真实 HTTP 请求记录、扣放不阻塞其他 agent、取消与关闭。
-- [场景测试](tests/scenarios.rs)：真 daemon + SyncReplica 样例、同名并行、故障与重启隔离、cgroup 限额、断网/环境隔离、FIFO、启动失败及进程树清理；真 CLI 的 SSE 回答和 Bash 工具结果往返。
+- [场景测试](tests/scenarios.rs)：真 daemon + SyncReplica 样例、同名并行、故障与重启隔离、cgroup 限额、断网/环境隔离、FIFO、启动失败、进程树清理和杀掉测试进程后的独立限时清理；真 CLI 的 SSE 回答和 Bash 工具结果往返。
 - [看守场景](tests/watchdogs.rs)：真实 nd-watchdog/nd-runs、nd-wire 运行诊断、独立单元、流水连续性、输入去重、溢出、进程树清理、N7/V6。高吞吐序号测试用真实 Python stdout 生产器，不冒充 CLI；V6 用固定真 CLI 执行 Workflow。
 - 默认 N7 在 `/mnt/wd_external/nd-build/tmp/` 的普通磁盘文件上施加页缓存压力，断言没有 OOM；会触发桌面通知的匿名内存 OOM 测试明确 `#[ignore]`，只能按验证记录的专用命令手动运行。
 - 后续 #11/#13 接入完整会话、两个 mod、适配器与提交水位；本库没有假 CLI、假看守、假 app-server 或 SQLite mock。R10-E1/N5/E2b 仍归对应工单，不把本单的存活或录制通过当成它们的验收。

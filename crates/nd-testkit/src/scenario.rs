@@ -133,6 +133,8 @@ pub struct ScenarioOptions {
     pub config: String,
     pub memory_max: u64,
     pub timeout: Duration,
+    /// Absolute lifetime of the whole scenario, including automatic daemon restarts.
+    pub max_lifetime: Duration,
     pub watchdog: Option<PathBuf>,
     pub disk_scratch: bool,
     pub default_paths: bool,
@@ -145,6 +147,7 @@ impl ScenarioOptions {
             config: String::new(),
             memory_max: 2 * 1024 * 1024 * 1024,
             timeout: Duration::from_secs(10),
+            max_lifetime: Duration::from_secs(300),
             watchdog: None,
             disk_scratch: false,
             default_paths: false,
@@ -168,6 +171,7 @@ pub struct Scenario {
     daemon_args: Vec<String>,
     default_paths: bool,
     timeout: Duration,
+    expiry: Option<String>,
     endpoint: Option<ClaudeEndpoint>,
     watchdog_config: Option<nd_runs::Config>,
 }
@@ -256,6 +260,7 @@ impl Scenario {
             daemon_args: Vec::new(),
             default_paths: options.default_paths,
             timeout: options.timeout,
+            expiry: None,
             endpoint: None,
             watchdog_config: None,
         };
@@ -285,6 +290,7 @@ impl Scenario {
                 "0",
             ],
         )?;
+        this.arm_expiry(options.max_lifetime)?;
         if let Some(watchdog) = options.watchdog {
             let watchdog = watchdog.canonicalize()?;
             // Keep host PIDs for /proc identity checks. Network and home remain isolated.
@@ -369,6 +375,44 @@ impl Scenario {
         Ok(this)
     }
 
+    /// A separate timer stops the slice explicitly: service RuntimeMaxSec would
+    /// count as failure and trigger Restart=on-failure again. Neither daemon
+    /// restarts nor the test process lifetime can reset this deadline.
+    fn arm_expiry(&mut self, lifetime: Duration) -> Result<()> {
+        if lifetime.is_zero() {
+            return Err("scenario lifetime must be positive".into());
+        }
+        let expiry = self.services[0].replace("-daemon.service", "-expiry");
+        let cleanup = "import subprocess,shutil,sys; subprocess.run(['/usr/bin/systemctl','--user','stop',sys.argv[1]],check=True); [shutil.rmtree(p,ignore_errors=True) for p in sys.argv[2:] if p]";
+        checked(
+            "systemd-run",
+            &[
+                "--user",
+                "--quiet",
+                "--collect",
+                "--unit",
+                &expiry,
+                &format!("--on-active={}s", lifetime.as_secs_f64()),
+                "--timer-property=AccuracySec=100ms",
+                "--timer-property=RemainAfterElapse=no",
+                "-p",
+                "Type=oneshot",
+                "-p",
+                "TimeoutStartSec=30s",
+                "-p",
+                "Restart=no",
+                "/usr/bin/python3",
+                "-c",
+                cleanup,
+                &self.slice,
+                self.root().to_str().ok_or("non-UTF8 scenario root")?,
+                self.disk_root().and_then(Path::to_str).unwrap_or(""),
+            ],
+        )?;
+        self.expiry = Some(expiry);
+        Ok(())
+    }
+
     fn service_args(&self, unit: &str, restart: bool) -> Vec<String> {
         let mut args = vec![
             "--user",
@@ -386,8 +430,6 @@ impl Scenario {
             "TimeoutStopSec=3s",
             "-p",
             "KillMode=control-group",
-            "-p",
-            "RuntimeMaxSec=300",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -632,6 +674,11 @@ impl Scenario {
         self.services
             .iter()
             .cloned()
+            .chain(
+                self.expiry
+                    .iter()
+                    .flat_map(|name| [format!("{name}.timer"), format!("{name}.service")]),
+            )
             .chain([self.slice.clone()])
             .collect()
     }
@@ -712,6 +759,17 @@ impl Scenario {
     fn cleanup(&mut self) -> Result<()> {
         if self.dir.is_none() {
             return Ok(());
+        }
+        if let Some(expiry) = self.expiry.take() {
+            // The expiry units may already have run and been collected.
+            let _ = command("systemctl")
+                .args([
+                    "--user",
+                    "stop",
+                    &format!("{expiry}.timer"),
+                    &format!("{expiry}.service"),
+                ])
+                .output()?;
         }
         // Stopping the slice also kills any descendant unit launched by the product.
         checked("systemctl", &["--user", "stop", &self.slice])?;
