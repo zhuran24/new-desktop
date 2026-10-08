@@ -4783,7 +4783,6 @@ async fn settings_title_waits_for_eligible_prompt_and_keeps_summary_on_empty_gen
 async fn disabling_mcp_backgrounding_removes_the_send_now_preservation_promise() {
     for (name, value) in [
         ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"),
-        ("CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "true"),
         ("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS", "0"),
     ] {
         let fx = Fixture::with_env(
@@ -4792,9 +4791,24 @@ async fn disabling_mcp_backgrounding_removes_the_send_now_preservation_promise()
             &format!("{name} = {value:?}"),
         )
         .await;
-        fx.scenario
-            .endpoint()
-            .enqueue(fx.main(), ModelReply::text("ready"));
+        std::fs::write(
+            fx.scenario.root().join("project/fifo_mcp.py"),
+            include_str!("fixtures/fifo_mcp.py"),
+        )
+        .unwrap();
+        std::fs::write(
+            fx.scenario.root().join("project/.mcp.json"),
+            r#"{"mcpServers":{"fifo":{"command":"python3","args":["/sandbox/project/fifo_mcp.py"]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fx.scenario.root().join("claude/settings.json"),
+            r#"{"enableAllProjectMcpServers":true,"permissions":{"allow":["mcp__fifo__wait"]}}"#,
+        )
+        .unwrap();
+        let mut fifo = fx.scenario.fifo("mcp").unwrap();
+        let endpoint = fx.scenario.endpoint();
+        endpoint.enqueue(fx.main(), ModelReply::text("ready"));
         let session = fx.create("disabled", "/sandbox/project", "hello").await;
         let ready = fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
         assert_eq!(
@@ -4802,6 +4816,45 @@ async fn disabling_mcp_backgrounding_removes_the_send_now_preservation_promise()
             false,
             "{name}"
         );
+        endpoint.enqueue(
+            fx.main(),
+            ModelReply::tool("toolu_disabled_mcp", "mcp__fifo__wait", json!({})),
+        );
+        fx.send("disabled-mcp-call", &session, "call MCP").await;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !fx.scenario.root().join("project/mcp-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("MCP must actually start before immediate send");
+        endpoint.enqueue(fx.main(), ModelReply::text("immediate completed"));
+        fx.command(
+            "disabled-mcp-now",
+            "session.send",
+            json!({"session":session,"text":"now","intent":"interrupting"}),
+        )
+        .await;
+        let immediate = fx
+            .wait(&session, "immediate completed", |s| {
+                texts(s).contains(&"immediate completed".into())
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !fx.scenario.root().join("project/mcp-cancelled").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name}: CLI must cancel the in-flight MCP"));
+        assert!(
+            !immediate.items.iter().any(|i| i.kind == "tool_result"
+                && i.data["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("moved to the background"))),
+            "{name}"
+        );
+        fifo.release("finish").unwrap();
         fx.close();
     }
 }
@@ -5189,4 +5242,115 @@ async fn global_replay_overflow_releases_an_existing_session_subscription() {
     .await
     .expect("overflow cleanup must release the session watcher so idle reclaim can finish");
     fx.close();
+}
+
+#[tokio::test]
+async fn mcp_task_background_switch_controls_inflight_task_handles() {
+    for disabled in [false, true] {
+        let extra = if disabled {
+            "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND = \"1\"\n"
+        } else {
+            ""
+        };
+        let fx = Fixture::with_env("mcp-task-switch", 3_600_000,
+            &format!("{extra}CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF = \"1\"\nMCP_PROTOCOL_NEGOTIATION = \"auto\"")).await;
+        std::fs::write(
+            fx.scenario.root().join("project/fifo_mcp.py"),
+            include_str!("fixtures/fifo_mcp.py"),
+        )
+        .unwrap();
+        std::fs::write(fx.scenario.root().join("project/task-mode"), "").unwrap();
+        std::fs::write(fx.scenario.root().join("project/.mcp.json"),
+            r#"{"mcpServers":{"fifo":{"command":"python3","args":["/sandbox/project/fifo_mcp.py"]}}}"#).unwrap();
+        std::fs::write(
+            fx.scenario.root().join("claude/settings.json"),
+            r#"{"enableAllProjectMcpServers":true,"permissions":{"allow":["mcp__fifo__wait"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fx.scenario.root().join("claude/.config.json"),
+            json!({"cachedGrowthBookFeatures":{"tengu_mcp_tasks":true}}).to_string(),
+        )
+        .unwrap();
+        // Read the isolated feature cache with telemetry disabled; the real
+        // CLI negotiates modern task handles with this local stdio MCP server.
+        let mut fifo = fx.scenario.fifo("mcp").unwrap();
+        let endpoint = fx.scenario.endpoint();
+        endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+        let session = fx.create("task-create", "/sandbox/project", "hello").await;
+        fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
+        endpoint.enqueue(
+            fx.main(),
+            ModelReply::tool("toolu_task", "mcp__fifo__wait", json!({})),
+        );
+        endpoint.enqueue(fx.main(), ModelReply::text("task backgrounded"));
+        fx.send("task-call", &session, "start task MCP").await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let marker = if disabled {
+                "project/mcp-started"
+            } else {
+                "project/task-polled"
+            };
+            while !fx.scenario.root().join(marker).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the real MCP invocation must enter its negotiated execution path");
+        if disabled {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let foreground = fx.peek(&session).await;
+            assert!(
+                !texts(&foreground).contains(&"task backgrounded".into()),
+                "disabled task backgrounding must keep the call in the foreground"
+            );
+            assert_eq!(header(&foreground)["process"]["turn_running"], true);
+        } else {
+            fx.wait(&session, "task automatically backgrounded", |s| {
+                texts(s).contains(&"task backgrounded".into())
+            })
+            .await;
+        }
+        fx.command(
+            "task-interrupt",
+            "session.interrupt",
+            json!({"session":session}),
+        )
+        .await;
+        if disabled {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !fx.scenario.root().join("project/mcp-cancelled").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("interrupt must cancel the foreground call at the MCP server");
+        } else {
+            endpoint.enqueue(fx.main(), ModelReply::text("task result received"));
+            fifo.release("finish").unwrap();
+            fx.wait(&session, "background task result", |s| {
+                texts(s).contains(&"task result received".into())
+            })
+            .await;
+            assert!(!fx.scenario.root().join("project/mcp-cancelled").exists());
+            assert!(
+                endpoint
+                    .requests()
+                    .iter()
+                    .any(|r| request_text(&r.body).contains("MCP_FINISHED"))
+            );
+        }
+        let call: Value = serde_json::from_slice(
+            &std::fs::read(fx.scenario.root().join("project/mcp-request.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            call["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                .get("io.modelcontextprotocol/tasks")
+                .is_some(),
+            !disabled,
+            "the CLI must negotiate task responses according to the task background switch"
+        );
+        fx.close();
+    }
 }
