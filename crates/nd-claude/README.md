@@ -1,6 +1,6 @@
 # Claude 适配：拉起后端进程与 mod 通道
 
-日期：2026-10-06。`nd-claude` 按规格「进程」的启动模板拉起 Claude Code 后端进程（交给看守进程托管），开 mod 通道等两个 mod 报到，再写 initialize 判定就绪。mod 协议类型在 [`nd-mod-proto`](../nd-mod-proto/src/lib.rs)，两个 mod 在仓库根的 [`mods/`](../../mods/README.md)。实现遵循 ADR 0004、0005、0011、0013。`ClaudeBackend` 是后端端口 `BackendAdapter`（[`nd-backend`](../nd-backend/src/lib.rs)）的 Claude 实现，由守护进程装配给会话组件；本 crate 不持有持久状态，检查点由会话执行器随批次提交。
+日期：2026-10-08。`nd-claude` 按规格「进程」的启动模板拉起 Claude Code 后端进程（交给看守进程托管），开 mod 通道等两个 mod 报到，再写 initialize 判定就绪。mod 协议类型在 [`nd-mod-proto`](../nd-mod-proto/src/lib.rs)，两个 mod 在仓库根的 [`mods/`](../../mods/README.md)。实现遵循 ADR 0004、0005、0011、0013。`ClaudeBackend` 是后端端口 `BackendAdapter`（[`nd-backend`](../nd-backend/src/lib.rs)）的 Claude 实现，由守护进程装配给会话组件；本 crate 不持有持久状态，检查点由会话执行器随批次提交。
 
 ## 接口
 
@@ -34,6 +34,8 @@ argv 逐项传入，不拼 shell：`--output-format stream-json --input-format s
 4. 读看守流水直到这条 initialize 的成功回应。不等 `system/init`；能力按回应实际列出的为准。进程先退出或回应超时是拉起失败。
 
 就绪＝initialize 已回应＋两个 hello＋会话 id 一致。任一 mod 没在时限内报到（或报的 id 不对）：拉起仍算成功，`Readiness::ChatOnly{why}`，`Caps.features` 里退役、Codex 子代理、给子代理发消息、总结、`!` 模式、fork 型子代理、设置行、转接任务操作全部 `Unsupported{why}`；`why` 写明哪个 mod、等了多久，供会话头显示。只能聊天的进程以后即使 mod 迟到也不升级。
+
+权限目录的 bypass 授权随启动解析结果保存在 Caps 和检查点。P-36 有两种旧格式不迁移：`f8003de` 写出的 `bypass_permissions=false` 记录，以及 v1（`bb28bcd`）缺该字段且原 initialize 流水已回收的记录；接回这些记录时，目录仍可能缺少 bypass。owner 确认 `f8003de` 只是审查分支的中间提交，v1 也从未在其日常环境部署，两者没有需要迁移的真实数据，因此这两种情况未改。
 
 `Caps.interrupt_spares_background` 表示 Esc（`interrupt`）不停后台子代理与 Workflow：声明了 `perTaskStopAffordance` 且 stdin 开着时成立（R10-E1 已实测）。
 
