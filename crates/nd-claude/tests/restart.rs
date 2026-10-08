@@ -81,3 +81,78 @@ fn before_pid(fx: &Fixture) -> u32 {
         .unwrap()
         .pid
 }
+
+#[tokio::test]
+async fn adapter_adoption_numbers_after_the_large_input_still_blocked_in_the_pipe() {
+    let fx = Fixture::start("adapter-blocked-input").await;
+    let session = session_id();
+    let claude = fx.claude(fx.config());
+    let mut run = claude
+        .open("blocked", fx.fresh(&session), InitOptions::default())
+        .await
+        .unwrap();
+    let caps = run.ready().caps.clone();
+    let pid = rustix::process::Pid::from_raw(run.ready().identity.pid as i32).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+    let first = tokio::spawn(async move {
+        run.write(
+            &serde_json::json!({"type":"control_request","request_id":"before-adopt",
+            "request":{"subtype":"get_settings"},"padding":"x".repeat(256*1024)}),
+        )
+        .await
+    });
+    let runs = fx.scenario.watchdogs().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runs
+                .records("blocked", 0, 1000)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r.event, nd_watchdog_proto::Event::In { in_seq: 2, .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !first.is_finished(),
+        "the input must still be blocked in the real CLI pipe"
+    );
+    first.abort();
+    let _ = first.await;
+    drop(claude);
+    let mut config = fx.config();
+    config.hello_timeout = Duration::from_millis(100);
+    let claude = fx.claude(config);
+    let mut adopted = claude.adopt("blocked", &session, caps).await.unwrap();
+    // Sequence allocation is entirely in Claude::adopt / ClaudeRun::write.
+    // Both responses must come from the pinned CLI after the blocked write drains.
+    let second = tokio::spawn(async move {
+        adopted
+            .write(
+                &serde_json::json!({"type":"control_request","request_id":"after-adopt",
+            "request":{"subtype":"get_settings"}}),
+            )
+            .await
+            .unwrap();
+        adopted
+    });
+    rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
+    let mut adopted = second.await.unwrap();
+    let frames = adopted
+        .wait_frame(Duration::from_secs(5), |f| {
+            f["type"] == "control_response" && f["response"]["request_id"] == "after-adopt"
+        })
+        .await
+        .unwrap();
+    for id in ["before-adopt", "after-adopt"] {
+        assert!(frames.iter().any(|f| f["response"]["request_id"] == id
+            && f["response"]["subtype"] == "success"), "missing real CLI response {id}");
+    }
+    drop(adopted);
+    drop(claude);
+    fx.close();
+}
