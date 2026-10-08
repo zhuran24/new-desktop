@@ -540,6 +540,7 @@ impl<'a> RecordIndex<'a> {
         // Match CLI mAr: merge recovered rows into selected windows, but insert
         // tails of selected metadata immediately after their anchor. Sorting the
         // selected rows and those tails together loses this distinction.
+        let mut effective = HashMap::new();
         let mut known = selected.clone();
         let mut handled = HashSet::new();
         type RecoveryWindow<'n> = (usize, usize, Vec<&'n Node>, HashMap<&'n str, Vec<&'n Node>>);
@@ -556,16 +557,54 @@ impl<'a> RecordIndex<'a> {
                 continue;
             }
             let group = &groups[&(message, node.sidechain, node.agent_id.as_deref())];
+            let group_ids: HashSet<_> = group.iter().map(|n| n.id.as_str()).collect();
             let mut members = group.clone();
+            let mut stale = Vec::new();
+            let mut seen_results = HashSet::new();
             for assistant in group {
-                members.extend(
-                    results
-                        .get(assistant.id.as_str())
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .filter(|r| r.sidechain == node.sidechain && r.agent_id == node.agent_id),
-                );
+                for result in results.get(assistant.id.as_str()).into_iter().flatten() {
+                    if result.sidechain != node.sidechain
+                        || result.agent_id != node.agent_id
+                        || known.contains(&result.id)
+                        || !seen_results.insert(&result.id)
+                    {
+                        continue;
+                    }
+                    if result
+                        .parent
+                        .as_deref()
+                        .is_some_and(|id| group_ids.contains(id))
+                    {
+                        members.push(result);
+                    } else {
+                        stale.push(*result);
+                    }
+                }
+            }
+            // CLI mAr puts recovered stale-parent results after the final chunk,
+            // at max(file position, last chunk + 0.5). Doubled integer positions
+            // preserve that half-step and the original file-order tie breaker.
+            let floor = group
+                .iter()
+                .map(|n| self.by_id[&n.id] * 2 + 1)
+                .max()
+                .unwrap();
+            let mut returned = already_returned.clone();
+            returned.extend(members.iter().flat_map(|n| &n.tool_results));
+            stale.sort_by_key(|n| self.by_id[&n.id]);
+            for result in stale {
+                if result.tool_results.iter().any(|id| {
+                    !returned.contains(id)
+                        && calls
+                            .get(&(id.as_str(), result.sidechain, result.agent_id.as_deref()))
+                            .is_some_and(|owner| {
+                                owner.is_some_and(|n| group_ids.contains(n.id.as_str()))
+                            })
+                }) {
+                    returned.extend(&result.tool_results);
+                    effective.insert(result.id.as_str(), (self.by_id[&result.id] * 2).max(floor));
+                    members.push(result);
+                }
             }
             let mut recovered = Vec::new();
             for member in &members {
@@ -589,6 +628,7 @@ impl<'a> RecordIndex<'a> {
                 // qfe accepts each unambiguous transparent tail as a whole. A
                 // fork, cycle, or non-transparent descendant rejects that tail.
                 let mut recover_tail = |parent: &Node| {
+                    let parent_position = effective.get(parent.id.as_str()).copied();
                     let mut tails = Vec::new();
                     for child in children.get(parent.id.as_str()).into_iter().flatten() {
                         let mut chain = Vec::new();
@@ -620,6 +660,10 @@ impl<'a> RecordIndex<'a> {
                         }
                         for n in chain {
                             known.insert(&n.id);
+                            if let Some(position) = parent_position {
+                                effective
+                                    .insert(n.id.as_str(), (self.by_id[&n.id] * 2).max(position));
+                            }
                             tails.push(n);
                         }
                     }
@@ -637,11 +681,20 @@ impl<'a> RecordIndex<'a> {
                     }
                 }
             }
-            recovered.sort_by_key(|n| self.by_id[&n.id]);
+            let order = |n: &&Node| {
+                (
+                    effective
+                        .get(n.id.as_str())
+                        .copied()
+                        .unwrap_or(self.by_id[&n.id] * 2),
+                    self.by_id[&n.id],
+                )
+            };
+            recovered.sort_by_key(order);
             if let Some(previous) = windows.last_mut().filter(|w| start < w.1) {
                 previous.1 = previous.1.max(end);
                 previous.2.extend(recovered);
-                previous.2.sort_by_key(|n| self.by_id[&n.id]);
+                previous.2.sort_by_key(order);
                 for (id, tails) in anchored {
                     previous.3.entry(id).or_default().extend(tails);
                 }
@@ -655,10 +708,13 @@ impl<'a> RecordIndex<'a> {
             output.extend_from_slice(&path[cursor..=start]);
             let mut recovered = recovered.into_iter().peekable();
             for node in &path[start + 1..end] {
-                while recovered
-                    .peek()
-                    .is_some_and(|r| self.by_id[&r.id] < self.by_id[&node.id])
-                {
+                while recovered.peek().is_some_and(|r| {
+                    effective
+                        .get(r.id.as_str())
+                        .copied()
+                        .unwrap_or(self.by_id[&r.id] * 2)
+                        < self.by_id[&node.id] * 2
+                }) {
                     output.push(recovered.next().unwrap());
                 }
                 output.push(node);

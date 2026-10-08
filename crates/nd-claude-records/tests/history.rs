@@ -708,3 +708,64 @@ fn an_attachment_at_the_selected_leaf_is_returned_only_once() {
         ["u", "a", "r", "meta1", "date"]
     );
 }
+
+#[test]
+fn stale_results_and_their_attachments_use_the_cli_effective_order() {
+    // Independent audit fixtures and literal mAr output from pinned CLI 2.1.289.
+    for (data, expected) in [
+        (
+            include_bytes!("fixtures/stale-result-early-attachment.jsonl").as_slice(),
+            ["u", "a1", "a2", "date", "r2"],
+        ),
+        (
+            include_bytes!("fixtures/stale-result-early-result.jsonl").as_slice(),
+            ["u", "a1", "a2", "r2", "date"],
+        ),
+    ] {
+        let index = RecordIndex::parse(data).unwrap();
+        let history = index.current().unwrap();
+        assert_eq!(history.ids().collect::<Vec<_>>(), expected);
+        for size in [1, 2, 3, 10] {
+            let mut before = None;
+            let mut pages = Vec::new();
+            loop {
+                let page = history
+                    .page(before, std::num::NonZeroUsize::new(size).unwrap())
+                    .unwrap();
+                before = page.next_before;
+                pages.push(page.records.iter().map(|r| r.uuid()).collect::<Vec<_>>());
+                if before.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(
+                pages.into_iter().rev().flatten().collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn stale_result_order_variants_match_the_pinned_cli() {
+    let cases: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/stale-result-orders.json")).unwrap();
+    for case in cases {
+        let mut rows = case["rows"].as_array().unwrap().clone();
+        rows.push(json!({"type":"last-prompt","leafUuid":"a2","explicit":true}));
+        let data = transcript(&rows);
+        let index = RecordIndex::parse(&data).unwrap();
+        let expected: Vec<_> = case["expected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            index.current().unwrap().ids().collect::<Vec<_>>(),
+            expected,
+            "{}",
+            case["name"]
+        );
+    }
+}
