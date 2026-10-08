@@ -537,111 +537,139 @@ impl<'a> RecordIndex<'a> {
                 children.entry(parent).or_default().push(node);
             }
         }
-        let mut output = Vec::new();
-        let mut emitted = HashSet::new();
-        for node in path {
-            if emitted.contains(&node.id) {
+        // Match CLI mAr: merge recovered rows into selected windows, but insert
+        // tails of selected metadata immediately after their anchor. Sorting the
+        // selected rows and those tails together loses this distinction.
+        let mut known = selected.clone();
+        let mut handled = HashSet::new();
+        type RecoveryWindow<'n> = (usize, usize, Vec<&'n Node>, HashMap<&'n str, Vec<&'n Node>>);
+        let mut windows: Vec<RecoveryWindow<'_>> = Vec::new();
+        for (start, node) in path.iter().enumerate() {
+            let Some(message) = node
+                .message_id
+                .as_deref()
+                .filter(|_| node.kind == "assistant")
+            else {
+                continue;
+            };
+            if !handled.insert((message, node.sidechain, node.agent_id.as_deref())) {
                 continue;
             }
-            if node.kind == "assistant"
-                && let Some(group) = node
-                    .message_id
-                    .as_deref()
-                    .and_then(|id| groups.get(&(id, node.sidechain, node.agent_id.as_deref())))
-            {
-                let mut batch = group.clone();
-                for assistant in group {
-                    batch.extend(
-                        results
-                            .get(assistant.id.as_str())
-                            .into_iter()
-                            .flatten()
-                            .copied()
-                            .filter(|r| {
-                                r.sidechain == node.sidechain && r.agent_id == node.agent_id
-                            }),
-                    );
+            let group = &groups[&(message, node.sidechain, node.agent_id.as_deref())];
+            let mut members = group.clone();
+            for assistant in group {
+                members.extend(
+                    results
+                        .get(assistant.id.as_str())
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|r| r.sidechain == node.sidechain && r.agent_id == node.agent_id),
+                );
+            }
+            let mut recovered = Vec::new();
+            for member in &members {
+                if known.insert(&member.id) {
+                    recovered.push(*member);
                 }
-                let members = batch.clone();
-                // CLI recovers attachments for every chunk of a tool reply,
-                // including text-only chunks sharing its message ID.
-                let tool_reply = members
-                    .iter()
-                    .any(|m| !m.tool_uses.is_empty() || m.tool_result);
-                for member in members.iter().filter(|_| tool_reply) {
-                    let mut pending = vec![*member];
-                    let mut seen = HashSet::new();
-                    while let Some(parent) = pending.pop() {
-                        if !seen.insert(&parent.id) {
-                            continue;
-                        }
-                        let descendants: Vec<_> = children
-                            .get(parent.id.as_str())
-                            .into_iter()
-                            .flatten()
-                            .copied()
-                            .filter(|n| {
-                                n.transparent
-                                    && n.sidechain == member.sidechain
-                                    && n.agent_id == member.agent_id
-                            })
-                            .collect();
-                        // Selected metadata still leads to attachments beside the
-                        // selected continuation. Each sibling may root its own
-                        // attachment chain; ambiguity within a chain still aborts it.
-                        for child in &descendants {
-                            if selected.contains(&child.id) {
-                                batch.push(*child);
-                                pending.push(*child);
+            }
+            let mut end = path
+                .iter()
+                .enumerate()
+                .skip(start)
+                .filter(|(_, n)| group.iter().any(|m| m.id == n.id))
+                .map(|(i, _)| i + 1)
+                .max()
+                .unwrap();
+            while end < path.len() && Self::in_batch(path[end], message) {
+                end += 1;
+            }
+            let mut anchored = HashMap::new();
+            if group.iter().any(|m| !m.tool_uses.is_empty()) {
+                // qfe accepts each unambiguous transparent tail as a whole. A
+                // fork, cycle, or non-transparent descendant rejects that tail.
+                let mut recover_tail = |parent: &Node| {
+                    let mut tails = Vec::new();
+                    for child in children.get(parent.id.as_str()).into_iter().flatten() {
+                        let mut chain = Vec::new();
+                        let mut next = Some(*child);
+                        let mut seen = HashSet::new();
+                        while let Some(n) = next {
+                            if known.contains(&n.id)
+                                || !n.transparent
+                                || n.sidechain != parent.sidechain
+                                || n.agent_id != parent.agent_id
+                                || !seen.insert(&n.id)
+                            {
+                                chain.clear();
+                                break;
                             }
-                        }
-                        for child in descendants
-                            .into_iter()
-                            .filter(|n| !selected.contains(&n.id))
-                        {
-                            let mut chain = Vec::new();
-                            let mut next = Some(child);
-                            let mut chain_seen = HashSet::new();
-                            while let Some(node) = next {
-                                if !node.transparent
-                                    || node.sidechain != member.sidechain
-                                    || node.agent_id != member.agent_id
-                                    || selected.contains(&node.id)
-                                    || !chain_seen.insert(&node.id)
-                                {
-                                    chain.clear();
-                                    break;
-                                }
-                                chain.push(node);
-                                let remaining: Vec<_> = children
-                                    .get(node.id.as_str())
-                                    .into_iter()
-                                    .flatten()
-                                    .copied()
-                                    .filter(|n| !selected.contains(&n.id))
-                                    .collect();
-                                if remaining.len() > 1 {
-                                    chain.clear();
-                                    break;
-                                }
-                                next = remaining.first().copied();
+                            chain.push(n);
+                            let remaining: Vec<_> = children
+                                .get(n.id.as_str())
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .filter(|n| !known.contains(&n.id))
+                                .collect();
+                            if remaining.len() > 1 {
+                                chain.clear();
+                                break;
                             }
-                            batch.extend(chain);
+                            next = remaining.first().copied();
+                        }
+                        for n in chain {
+                            known.insert(&n.id);
+                            tails.push(n);
+                        }
+                    }
+                    tails
+                };
+                for member in &members {
+                    recovered.extend(recover_tail(member));
+                }
+                for anchor in &path[start + 1..end] {
+                    if anchor.transparent {
+                        let tails = recover_tail(anchor);
+                        if !tails.is_empty() {
+                            anchored.insert(anchor.id.as_str(), tails);
                         }
                     }
                 }
-                batch.sort_by_key(|n| self.by_id[&n.id]);
-                for member in batch {
-                    if emitted.insert(&member.id) {
-                        output.push(member);
-                    }
-                }
-                continue;
             }
-            if emitted.insert(&node.id) {
-                output.push(node);
+            recovered.sort_by_key(|n| self.by_id[&n.id]);
+            if let Some(previous) = windows.last_mut().filter(|w| start < w.1) {
+                previous.1 = previous.1.max(end);
+                previous.2.extend(recovered);
+                previous.2.sort_by_key(|n| self.by_id[&n.id]);
+                for (id, tails) in anchored {
+                    previous.3.entry(id).or_default().extend(tails);
+                }
+            } else {
+                windows.push((start, end, recovered, anchored));
             }
         }
+        let mut output = Vec::new();
+        let mut cursor = 0;
+        for (start, end, recovered, anchored) in windows {
+            output.extend_from_slice(&path[cursor..=start]);
+            let mut recovered = recovered.into_iter().peekable();
+            for node in &path[start + 1..end] {
+                while recovered
+                    .peek()
+                    .is_some_and(|r| self.by_id[&r.id] < self.by_id[&node.id])
+                {
+                    output.push(recovered.next().unwrap());
+                }
+                output.push(node);
+                if let Some(tails) = anchored.get(node.id.as_str()) {
+                    output.extend(tails);
+                }
+            }
+            output.extend(recovered);
+            cursor = end;
+        }
+        output.extend_from_slice(&path[cursor..]);
         output
     }
 
@@ -732,6 +760,8 @@ impl<'a> RecordIndex<'a> {
         }
         path.reverse();
         path = self.recover_batches(path);
+        // Batch recovery may already have inserted the selected leaf's tail.
+        seen.extend(path.iter().map(|n| &n.id));
         if let Some(leaf) = leaf {
             let mut children: HashMap<&str, Vec<&Node>> = HashMap::new();
             for n in self.nodes.iter().filter(|n| n.active) {

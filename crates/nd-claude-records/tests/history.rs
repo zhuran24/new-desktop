@@ -365,7 +365,7 @@ fn parallel_assistant_blocks_and_sibling_tool_results_are_not_lost() {
     let index = RecordIndex::parse(&data).unwrap();
     assert_eq!(
         index.current().unwrap().ids().collect::<Vec<_>>(),
-        ["u", "a1", "a2", "r1", "date", "other", "r2", "done"]
+        ["u", "a2", "a1", "r1", "date", "other", "r2", "done"]
     );
 }
 
@@ -629,5 +629,82 @@ fn attachment_below_text_only_member_of_a_tool_reply_is_recovered() {
     assert_eq!(
         index.current().unwrap().ids().collect::<Vec<_>>(),
         ["u", "a1", "a2", "r", "date", "done"]
+    );
+}
+
+#[test]
+fn recovered_attachments_stay_at_their_selected_metadata_anchor() {
+    // mAr from pinned CLI 2.1.289: p24-cli-probe.js, independent audit input.
+    let data = include_bytes!("fixtures/anchored-metadata.jsonl");
+    let index = RecordIndex::parse(data).unwrap();
+    let history = index.current().unwrap();
+    let expected = ["u", "a", "r", "meta1", "date", "meta2", "done"];
+    assert_eq!(history.ids().collect::<Vec<_>>(), expected);
+    let mut before = None;
+    let mut pages = Vec::new();
+    loop {
+        let page = history
+            .page(before, std::num::NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        before = page.next_before;
+        pages.push(page.records.iter().map(|r| r.uuid()).collect::<Vec<_>>());
+        if before.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        pages.into_iter().rev().flatten().collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn anchored_tails_ignore_file_position_and_keep_sibling_chains_in_order() {
+    let rows: Vec<Value> = include_str!("fixtures/anchored-metadata.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // Literal expected sequences independently evaluated with pinned mAr.
+    for position in [0, 3, 5, 6] {
+        let mut variant = rows.clone();
+        let date = variant.remove(5);
+        variant.insert(position, date);
+        variant.push(json!({"type":"last-prompt","leafUuid":"done","explicit":true}));
+        let data = transcript(&variant);
+        let index = RecordIndex::parse(&data).unwrap();
+        assert_eq!(
+            index.current().unwrap().ids().collect::<Vec<_>>(),
+            ["u", "a", "r", "meta1", "date", "meta2", "done"],
+            "position {position}"
+        );
+    }
+    let mut variant = rows;
+    variant.insert(
+        6,
+        json!({"type":"attachment","uuid":"tail","parentUuid":"date","attachment":{"type":"date"}}),
+    );
+    variant.insert(7, json!({"type":"attachment","uuid":"second","parentUuid":"meta1","attachment":{"type":"date"}}));
+    let data = transcript(&variant);
+    let index = RecordIndex::parse(&data).unwrap();
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        [
+            "u", "a", "r", "meta1", "date", "tail", "second", "meta2", "done"
+        ]
+    );
+}
+
+#[test]
+fn an_attachment_at_the_selected_leaf_is_returned_only_once() {
+    let mut rows: Vec<Value> = include_str!("fixtures/anchored-metadata.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows.push(json!({"type":"last-prompt","leafUuid":"meta1","explicit":true}));
+    let data = transcript(&rows);
+    let index = RecordIndex::parse(&data).unwrap();
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        ["u", "a", "r", "meta1", "date"]
     );
 }
