@@ -217,20 +217,41 @@ async fn real_reload_preserves_unsent_commands_and_rejects_the_old_session() {
             // 已交付的 Ping 的真实 result 请求被扣在传输层；重载后按同一 op_id 重发。
             std::fs::write(gates.join("hold-result"), "").unwrap();
             let _ = std::fs::remove_file(gates.join("result-seen"));
-            let inflight = run.send(ModName::Actions, Action::Ping).unwrap();
+            let inflight = uuid::Uuid::new_v4().to_string();
+            std::fs::write(
+                gates.join("drop-result"),
+                serde_json::json!({
+                    "op_id":inflight, "mod_gen":run.binding().mods[&ModName::Actions].mod_gen
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(run.send_as(ModName::Actions, &inflight, Action::Ping));
             tokio::time::timeout(Duration::from_secs(3), async {
-                while !gates.join("result-seen").exists() {
+                while !gates.join("target-result-seen").exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .unwrap();
             reload(&fx, &mut run).await;
+            let generation = run.binding().mods[&ModName::Actions].mod_gen.clone();
             std::fs::remove_file(gates.join("hold-result")).unwrap();
             assert!(matches!(
                 run.result(&inflight, Duration::from_secs(10)).await,
                 Some(CommandResult::Outcome(Outcome::Done { .. }))
             ));
+            assert!(
+                gates.join("result-dropped").exists(),
+                "the old result must be lost at the transport boundary"
+            );
+            let recording = run.recording();
+            assert_eq!(recording.iter().flat_map(|r| &r.facts).filter(|f|
+                matches!(f, nd_claude::Fact::Delivered { op_id, .. } if op_id == &inflight)).count(), 2,
+                "the same op must actually reach the new mod generation");
+            assert!(recording.iter().any(|r| matches!(&r.event,
+                nd_claude::ModEvent::Result { op_id, post } if op_id == &inflight && post.mod_gen == generation)
+                && r.facts.iter().any(|f| matches!(f, nd_claude::Fact::Finished { op_id, .. } if op_id == &inflight))));
         }
         let name = if rebind {
             "reload-rebind"

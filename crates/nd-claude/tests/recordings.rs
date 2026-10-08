@@ -95,6 +95,19 @@ fn recorded_reloads_preserve_unsent_work_and_the_original_session_target() {
             );
         } else {
             assert!(!facts.iter().any(|f| matches!(f, Fact::Unknown { .. })));
+            let resent = facts.iter().enumerate().find_map(|(at, f)| match f {
+                Fact::Resent { op_id, .. } if facts[..at].iter().any(|earlier|
+                    matches!(earlier, Fact::Delivered { op_id: sent, .. } if sent == op_id)) => Some(op_id),
+                _ => None,
+            }).expect("an already delivered op must be resent");
+            assert_eq!(
+                facts
+                    .iter()
+                    .filter(|f| matches!(f, Fact::Delivered { op_id, .. } if op_id == resent))
+                    .count(),
+                2
+            );
+
             assert!(facts.iter().enumerate().any(|(at, f)| match f {
                 Fact::Resent { op_id, .. } => facts[..at].iter().any(|earlier| matches!(earlier, Fact::Delivered { op_id: sent, .. } if sent == op_id)),
                 _ => false,
