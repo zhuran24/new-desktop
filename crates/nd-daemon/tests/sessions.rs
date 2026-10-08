@@ -5054,7 +5054,7 @@ async fn messages_held_during_creation_reach_the_real_cli_in_arrival_order() {
 }
 
 #[tokio::test]
-async fn legacy_ultracode_settings_survive_upgrade_after_idle_reclaim() {
+async fn legacy_settings_survive_upgrade_after_idle_reclaim() {
     for requested in [true, false] {
         let fx = Fixture::start("legacy-ultracode", 900).await;
         fx.scenario
@@ -5092,10 +5092,24 @@ async fn legacy_ultracode_settings_survive_upgrade_after_idle_reclaim() {
             fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
         }
         watcher.close().await.unwrap();
-        fx.wait(&session, "reclaimed", |s| {
-            header(s)["process"]["alive"] == false && header(s)["op"].is_null()
-        })
-        .await;
+        let reclaimed = fx
+            .wait(&session, "reclaimed", |s| {
+                header(s)["process"]["alive"] == false && header(s)["op"].is_null()
+            })
+            .await;
+        let expected_models = header(&reclaimed)["settings"]["models"].clone();
+        let models = expected_models.as_array().unwrap();
+        assert!(
+            models
+                .iter()
+                .any(|m| !m["label"].as_str().unwrap().is_empty())
+        );
+        assert!(models.iter().any(|m| m["resolved_model"].is_string()));
+        assert!(
+            models
+                .iter()
+                .any(|m| !m["effort_levels"].as_array().unwrap().is_empty())
+        );
         fx.scenario.stop_daemon().unwrap();
         // Upgrade fixture: exactly the former opaque settings shape in real
         // SQLite, while no adapter exists to perform the live adopt migration.
@@ -5108,6 +5122,17 @@ async fn legacy_ultracode_settings_survive_upgrade_after_idle_reclaim() {
                     })?;
                 let mut core: Value = serde_json::from_str(&text).unwrap();
                 let settings = &mut core["meta"]["settings"];
+                for model in settings["models"].as_array_mut().unwrap() {
+                    let model = model.as_object_mut().unwrap();
+                    for (neutral, legacy) in [
+                        ("label", "displayName"),
+                        ("resolved_model", "resolvedModel"),
+                        ("effort_levels", "supportedEffortLevels"),
+                    ] {
+                        let value = model.remove(neutral).unwrap();
+                        model.insert(legacy.into(), value);
+                    }
+                }
                 let applied = settings["applied"].as_object_mut().unwrap();
                 assert_eq!(
                     applied.remove("ultracode_requested"),
@@ -5129,6 +5154,12 @@ async fn legacy_ultracode_settings_survive_upgrade_after_idle_reclaim() {
         drop(store);
         fx.scenario.start_daemon().unwrap();
         let upgraded = fx.peek(&session).await;
+        assert_eq!(header(&upgraded)["process"]["alive"], false);
+        assert_eq!(
+            header(&upgraded)["settings"]["models"],
+            expected_models,
+            "reclaimed sessions must retain labels, resolved models and effort options without a live adapter"
+        );
         assert_eq!(
             header(&upgraded)["settings"]["applied"]["ultracode_requested"],
             requested

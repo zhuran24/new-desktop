@@ -507,6 +507,19 @@ fn read_settings<'de, D: serde::Deserializer<'de>>(
     {
         applied.entry("ultracode_requested").or_insert(requested);
     }
+    if let Some(models) = value.get_mut("models").and_then(Value::as_array_mut) {
+        for model in models.iter_mut().filter_map(Value::as_object_mut) {
+            for (legacy, neutral) in [
+                ("displayName", "label"),
+                ("resolvedModel", "resolved_model"),
+                ("supportedEffortLevels", "effort_levels"),
+            ] {
+                if let Some(old) = model.remove(legacy) {
+                    model.entry(neutral).or_insert(old);
+                }
+            }
+        }
+    }
     serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
