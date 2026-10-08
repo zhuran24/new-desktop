@@ -226,6 +226,35 @@ async fn real_reload_preserves_unsent_commands_and_rejects_the_old_session() {
                 .to_string(),
             )
             .unwrap();
+            // Replay the real Compact result at the transport boundary. Its
+            // duplicate must pass while the target Ping result gate is armed;
+            // otherwise the mod's serial result-report loop can never reach Ping.
+            let duplicate = run
+                .recording()
+                .iter()
+                .find_map(|r| match &r.event {
+                    nd_claude::ModEvent::Result { op_id, post } if op_id == &compact => {
+                        Some(serde_json::to_vec(post).unwrap())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(3), async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut connection = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let request = format!(
+                    "POST /result/{compact} HTTP/1.1\r\nHost: nd\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    duplicate.len()
+                );
+                connection.write_all(request.as_bytes()).await.unwrap();
+                connection.write_all(&duplicate).await.unwrap();
+                let mut response = String::new();
+                connection.read_to_string(&mut response).await.unwrap();
+                response
+            }).await.expect("the Ping gate must not hold a duplicate Compact result");
+            assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+            assert!(!gates.join("target-result-seen").exists());
+            assert!(!gates.join("result-dropped").exists());
             assert!(run.send_as(ModName::Actions, &inflight, Action::Ping));
             tokio::time::timeout(Duration::from_secs(3), async {
                 while !gates.join("target-result-seen").exists() {
@@ -236,15 +265,20 @@ async fn real_reload_preserves_unsent_commands_and_rejects_the_old_session() {
             .unwrap();
             reload(&fx, &mut run).await;
             let generation = run.binding().mods[&ModName::Actions].mod_gen.clone();
-            std::fs::remove_file(gates.join("hold-result")).unwrap();
+            // The same op in the NEW generation must pass even while the
+            // OLD generation's result is still held at the proxy.
             assert!(matches!(
                 run.result(&inflight, Duration::from_secs(10)).await,
                 Some(CommandResult::Outcome(Outcome::Done { .. }))
             ));
-            assert!(
-                gates.join("result-dropped").exists(),
-                "the old result must be lost at the transport boundary"
-            );
+            std::fs::remove_file(gates.join("hold-result")).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !gates.join("result-dropped").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the old result must be lost at the transport boundary");
             let recording = run.recording();
             assert_eq!(recording.iter().flat_map(|r| &r.facts).filter(|f|
                 matches!(f, nd_claude::Fact::Delivered { op_id, .. } if op_id == &inflight)).count(), 2,

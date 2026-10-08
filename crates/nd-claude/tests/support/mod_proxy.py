@@ -32,7 +32,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 (gates / 'target-result-seen').touch()
         if gate:
             (gates / (gate + '-seen')).touch()
-            while (gates / ('hold-' + gate)).exists():
+            # Only the selected op in the selected generation may be held.
+            # Other results must drain so the mod can reach the target Ping.
+            while (gates / ('hold-' + gate)).exists() and (gate != 'result' or discard):
                 time.sleep(.01)
         if discard:
             (gates / 'result-dropped').touch()
