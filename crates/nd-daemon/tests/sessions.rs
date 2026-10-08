@@ -5495,3 +5495,114 @@ async fn bypass_launch_authorization_survives_mode_changes_and_live_adoption() {
     }
     fx.close();
 }
+
+#[tokio::test]
+async fn legacy_live_adoption_keeps_current_settings_instead_of_launch_snapshot() {
+    let fx = Fixture::start("legacy-live-settings", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("legacy-live-create", "/sandbox/project", "hello")
+        .await;
+    let initial = fx
+        .wait(&session, "ready", |s| {
+            texts(s) == ["ready"] && header(s)["op"].is_null()
+        })
+        .await;
+    let pid = cli_pid(&fx, &initial).await;
+    let mut stale = header(&initial)["settings"].clone();
+    for (round, requested) in [true, false].into_iter().enumerate() {
+        for (id, setting) in [
+            ("model", json!({"model":"opus"})),
+            ("effort", json!({"effort":"high"})),
+            ("mode", json!({"permission_mode":"acceptEdits"})),
+            ("ultra", json!({"ultracode":requested})),
+        ] {
+            let reply = fx
+                .command(
+                    &format!("{round}-{id}"),
+                    "session.configure",
+                    json!({"session":session,"setting":setting}),
+                )
+                .await;
+            assert!(
+                matches!(
+                    reply,
+                    CommandReply::Receipt {
+                        receipt: Receipt::Accepted { .. }
+                    }
+                ),
+                "{reply:?}"
+            );
+            fx.wait(&session, id, |s| header(s)["op"].is_null()).await;
+        }
+        let current = fx.peek(&session).await;
+        let expected = header(&current)["settings"].clone();
+        assert_eq!(expected["applied"]["ultracode_requested"], requested);
+        fx.scenario.stop_daemon().unwrap();
+        // Install a v1 persistence fixture while the real watchdog and CLI stay
+        // alive. Current settings and the stale Open snapshot deliberately differ.
+        let legacy = |mut value: Value| {
+            let applied = value["applied"].as_object_mut().unwrap();
+            if let Some(v) = applied.remove("ultracode_requested") {
+                applied.insert("ultracodeRequested".into(), v);
+            }
+            applied.insert("ultracodeAvailable".into(), json!(true));
+            for model in value["models"].as_array_mut().unwrap() {
+                let model = model.as_object_mut().unwrap();
+                for (neutral, old) in [
+                    ("label", "displayName"),
+                    ("resolved_model", "resolvedModel"),
+                    ("effort_levels", "supportedEffortLevels"),
+                ] {
+                    if let Some(v) = model.remove(neutral) {
+                        model.insert(old.into(), v);
+                    }
+                }
+            }
+            value
+        };
+        let store = nd_store::Store::open(fx.scenario.root().join("state.sqlite"), 2).unwrap();
+        store
+            .write(|tx| {
+                let text: String =
+                    tx.query_row("SELECT core FROM sessions WHERE id=?1", [&session], |r| {
+                        r.get(0)
+                    })?;
+                let mut core: Value = serde_json::from_str(&text).unwrap();
+                core["meta"]["settings"] = legacy(expected.clone());
+                for carrier in core["carriers"].as_object_mut().unwrap().values_mut() {
+                    carrier["adopt"]["settings"] = legacy(stale.clone());
+                }
+                tx.execute(
+                    "UPDATE sessions SET core=?1 WHERE id=?2",
+                    nd_store::params![core.to_string(), session],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        fx.scenario.start_daemon().unwrap();
+        for _ in 0..2 {
+            let adopted = fx
+                .wait(&session, "live adoption finished", |s| {
+                    header(s)["recovering"] == false && header(s)["op"].is_null()
+                })
+                .await;
+            assert_eq!(
+                cli_pid(&fx, &adopted).await,
+                pid,
+                "must adopt the original live CLI"
+            );
+            assert_eq!(
+                header(&adopted)["settings"],
+                expected,
+                "launch snapshot must not overwrite current settings"
+            );
+            fx.scenario.restart_daemon().unwrap();
+        }
+        stale = expected;
+    }
+    fx.close();
+}

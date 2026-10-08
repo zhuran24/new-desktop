@@ -979,17 +979,6 @@ impl Inner {
             self.deliver_facts(session, &record.carrier, facts).await;
             return;
         };
-        if let Some(legacy) = record.adopt.get("settings") {
-            facts.push(fact(
-                format!("legacy-settings:{run}"),
-                FactBody::SettingsObserved {
-                    settings: settings_with_caps(
-                        legacy.clone(),
-                        claude_run.ready().caps.bypass_permissions,
-                    ),
-                },
-            ));
-        }
         let convo = checkpoint.convo.clone();
         let recover_through = claude_run.cursor();
         claude_run.seek(cursor);
