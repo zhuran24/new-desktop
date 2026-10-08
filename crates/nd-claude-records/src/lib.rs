@@ -24,10 +24,14 @@ struct Node {
     parent: Option<String>,
     kind: String,
     sidechain: bool,
+    sidechain_field: Option<Value>,
     range: Range<usize>,
     timestamp: Option<String>,
     message_id: Option<String>,
     agent_id: Option<String>,
+    agent_field: Option<Value>,
+    source_assistant: Option<String>,
+    tool_use: bool,
     tool_result: bool,
     transparent: bool,
     attachment_tool: Option<String>,
@@ -153,18 +157,35 @@ impl<'a> RecordIndex<'a> {
                     parent: row["parentUuid"].as_str().map(str::to_owned),
                     kind: row["type"].as_str().unwrap().into(),
                     sidechain: row["isSidechain"] == true,
+                    sidechain_field: row.get("isSidechain").cloned(),
                     range: start..start + line.len(),
                     timestamp: row["timestamp"].as_str().map(str::to_owned),
                     message_id: row["message"]["id"].as_str().map(str::to_owned),
                     agent_id: row["agentId"].as_str().map(str::to_owned),
+                    agent_field: row.get("agentId").cloned(),
+                    source_assistant: row["sourceToolAssistantUUID"].as_str().map(str::to_owned),
+                    tool_use: row["type"] == "assistant"
+                        && row["message"]["content"]
+                            .as_array()
+                            .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use")),
                     transparent: row["type"] == "attachment"
                         || (row["type"] == "system" && row["subtype"] != "compact_boundary")
                         || (row["type"] == "user"
                             && row["isMeta"] == true
-                            && block_ids(&row, "tool_result", "tool_use_id").is_empty()),
+                            && !row["message"]["content"].as_array().is_some_and(|blocks| {
+                                blocks.iter().any(|b| b["type"] == "tool_result")
+                            })),
                     attachment_tool: row["attachment"]["toolUseID"].as_str().map(str::to_owned),
-                    tool_uses: block_ids(&row, "tool_use", "id"),
-                    tool_results: block_ids(&row, "tool_result", "tool_use_id"),
+                    tool_uses: if row["type"] == "assistant" {
+                        block_ids(&row, "tool_use", "id")
+                    } else {
+                        Vec::new()
+                    },
+                    tool_results: if row["type"] == "user" {
+                        block_ids(&row, "tool_result", "tool_use_id")
+                    } else {
+                        Vec::new()
+                    },
                     tool_result: row["type"] == "user"
                         && row["message"]["content"].as_array().is_some_and(|blocks| {
                             blocks.iter().any(|b| b["type"] == "tool_result")
@@ -476,82 +497,104 @@ impl<'a> RecordIndex<'a> {
     }
 
     fn recover_batches<'s>(&'s self, path: Vec<&'s Node>) -> Vec<&'s Node> {
-        let mut groups: HashMap<(&str, bool, Option<&str>), Vec<&Node>> = HashMap::new();
+        if !path.iter().any(|n| n.kind == "assistant") {
+            return path;
+        }
+        // A message ID defines the batch. Agent/sidechain checks apply only to
+        // fallback result association, not to message grouping or direct parents.
+        let mut groups: HashMap<&str, Vec<&Node>> = HashMap::new();
         let mut results: HashMap<&str, Vec<&Node>> = HashMap::new();
-        for node in self.nodes.iter().filter(|n| n.active) {
-            if node.kind == "assistant" {
-                if let Some(id) = node.message_id.as_deref() {
-                    groups
-                        .entry((id, node.sidechain, node.agent_id.as_deref()))
-                        .or_default()
-                        .push(node);
-                }
-            } else if node.tool_result
-                && let Some(parent) = node.parent.as_deref()
-            {
-                results.entry(parent).or_default().push(node);
-            }
-        }
-        // A result can carry a stale parent in parallel output. Recover only when
-        // the call ID has one unambiguous assistant message in the same agent.
-        let mut calls: HashMap<(&str, bool, Option<&str>), Option<&Node>> = HashMap::new();
-        for node in self
-            .nodes
-            .iter()
-            .filter(|n| n.active && n.kind == "assistant")
-        {
-            for id in &node.tool_uses {
-                calls
-                    .entry((id, node.sidechain, node.agent_id.as_deref()))
-                    .and_modify(|owner| {
-                        if owner.is_some_and(|old| {
-                            old.message_id.is_none() || old.message_id != node.message_id
-                        }) {
-                            *owner = None;
-                        }
-                    })
-                    .or_insert(Some(node));
-            }
-        }
-        let already_returned: HashSet<_> = path.iter().flat_map(|n| &n.tool_results).collect();
-        for node in self.nodes.iter().filter(|n| n.active && n.tool_result) {
-            let parent = self.parent(node).ok().flatten();
-            if parent.is_some_and(|p| node.tool_results.iter().all(|id| p.tool_uses.contains(id))) {
-                continue;
-            }
-            for id in &node.tool_results {
-                if already_returned.contains(id) {
-                    continue;
-                }
-                if let Some(Some(owner)) =
-                    calls.get(&(id.as_str(), node.sidechain, node.agent_id.as_deref()))
-                {
-                    results.entry(owner.id.as_str()).or_default().push(node);
-                }
-            }
-        }
-        let selected: HashSet<_> = path.iter().map(|n| &n.id).collect();
         let mut children: HashMap<&str, Vec<&Node>> = HashMap::new();
+        let mut calls: HashMap<&str, Option<&Node>> = HashMap::new();
         for node in self.nodes.iter().filter(|n| n.active) {
             if let Some(parent) = node.parent.as_deref() {
                 children.entry(parent).or_default().push(node);
             }
+            if node.kind == "assistant"
+                && let Some(message) = node.message_id.as_deref().filter(|id| !id.is_empty())
+            {
+                groups.entry(message).or_default().push(node);
+                for call in &node.tool_uses {
+                    // Within one message, the last chunk owns the call. Once
+                    // different messages claim it, it stays ambiguous.
+                    calls
+                        .entry(call)
+                        .and_modify(|owner| {
+                            if owner.is_some_and(|old| old.message_id == node.message_id) {
+                                *owner = Some(node);
+                            } else {
+                                *owner = None;
+                            }
+                        })
+                        .or_insert(Some(node));
+                }
+            }
         }
-        // Match CLI mAr: merge recovered rows into selected windows, but insert
-        // tails of selected metadata immediately after their anchor. Sorting the
-        // selected rows and those tails together loses this distinction.
-        // Index the last selected chunk once; scanning each remaining suffix
-        // makes ordinary histories quadratic in the number of message groups.
+        for result in self.nodes.iter().filter(|n| n.active && n.tool_result) {
+            let mut owners = Vec::new();
+            if let Some(parent) = result.parent.as_deref() {
+                owners.push(parent);
+            }
+            let parent = result
+                .parent
+                .as_ref()
+                .and_then(|id| self.by_id.get(id))
+                .map(|i| &self.nodes[*i]);
+            let correctly_parented = !result.tool_results.is_empty()
+                && parent.is_some_and(|p| {
+                    result
+                        .tool_results
+                        .iter()
+                        .all(|id| p.tool_uses.contains(id))
+                });
+            if !correctly_parented {
+                let source = result
+                    .source_assistant
+                    .as_ref()
+                    .and_then(|id| self.by_id.get(id))
+                    .map(|i| &self.nodes[*i]);
+                for owner in source.into_iter().chain(
+                    result
+                        .tool_results
+                        .iter()
+                        .filter_map(|id| calls.get(id.as_str()).copied().flatten()),
+                ) {
+                    if owner.sidechain == result.sidechain
+                        && owner.agent_field == result.agent_field
+                    {
+                        owners.push(&owner.id);
+                    }
+                }
+            }
+            let mut unique = HashSet::new();
+            for owner in owners {
+                if unique.insert(owner) {
+                    results.entry(owner).or_default().push(result);
+                }
+            }
+        }
+        let already_returned: HashSet<_> = path.iter().flat_map(|n| &n.tool_results).collect();
+        let mut known: HashSet<_> = path.iter().map(|n| &n.id).collect();
+        // Index selected batch ends once: ordinary long histories stay linear.
         let mut group_ends = HashMap::new();
         for (position, node) in path.iter().enumerate() {
             if node.kind == "assistant"
                 && let Some(id) = node.message_id.as_deref()
             {
-                group_ends.insert((id, node.sidechain, node.agent_id.as_deref()), position + 1);
+                group_ends.insert(id, position + 1);
             }
         }
         let mut effective = HashMap::new();
-        let mut known = selected.clone();
+        let order = |node: &Node, effective: &HashMap<&str, usize>| {
+            let position = self.by_id[&node.id];
+            (
+                effective
+                    .get(node.id.as_str())
+                    .copied()
+                    .unwrap_or(position * 2),
+                position,
+            )
+        };
         let mut handled = HashSet::new();
         type RecoveryWindow<'n> = (usize, usize, Vec<&'n Node>, HashMap<&'n str, Vec<&'n Node>>);
         let mut windows: Vec<RecoveryWindow<'_>> = Vec::new();
@@ -559,25 +602,26 @@ impl<'a> RecordIndex<'a> {
             let Some(message) = node
                 .message_id
                 .as_deref()
-                .filter(|_| node.kind == "assistant")
+                .filter(|id| node.kind == "assistant" && !id.is_empty())
             else {
                 continue;
             };
-            if !handled.insert((message, node.sidechain, node.agent_id.as_deref())) {
+            if !handled.insert(message) {
                 continue;
             }
-            let group = &groups[&(message, node.sidechain, node.agent_id.as_deref())];
+            let group = &groups[message];
             let group_ids: HashSet<_> = group.iter().map(|n| n.id.as_str()).collect();
-            let mut members = group.clone();
+            let mut recovered: Vec<_> = group
+                .iter()
+                .copied()
+                .filter(|n| !known.contains(&n.id))
+                .collect();
+            let mut direct = Vec::new();
             let mut stale = Vec::new();
             let mut seen_results = HashSet::new();
             for assistant in group {
                 for result in results.get(assistant.id.as_str()).into_iter().flatten() {
-                    if result.sidechain != node.sidechain
-                        || result.agent_id != node.agent_id
-                        || known.contains(&result.id)
-                        || !seen_results.insert(&result.id)
-                    {
+                    if known.contains(&result.id) || !seen_results.insert(&result.id) {
                         continue;
                     }
                     if result
@@ -585,53 +629,53 @@ impl<'a> RecordIndex<'a> {
                         .as_deref()
                         .is_some_and(|id| group_ids.contains(id))
                     {
-                        members.push(result);
+                        direct.push(*result);
                     } else {
                         stale.push(*result);
                     }
                 }
             }
-            // CLI mAr puts recovered stale-parent results after the final chunk,
-            // at max(file position, last chunk + 0.5). Doubled integer positions
-            // preserve that half-step and the original file-order tie breaker.
+            // Keep the selected path's call set shared; only batch-local
+            // additions need copying. Positions are doubled to represent .5.
+            let mut returned: HashSet<_> = direct.iter().flat_map(|n| &n.tool_results).collect();
+            stale.sort_by_key(|n| order(n, &effective));
             let floor = group
                 .iter()
                 .map(|n| self.by_id[&n.id] * 2 + 1)
                 .max()
                 .unwrap();
-            // Keep the selected path's result set shared. Cloning it per
-            // group makes long tool histories quadratic even without recovery.
-            let mut returned: HashSet<_> = members.iter().flat_map(|n| &n.tool_results).collect();
-            stale.sort_by_key(|n| self.by_id[&n.id]);
             for result in stale {
                 if result.tool_results.iter().any(|id| {
                     !already_returned.contains(id)
                         && !returned.contains(id)
-                        && calls
-                            .get(&(id.as_str(), result.sidechain, result.agent_id.as_deref()))
-                            .is_some_and(|owner| {
-                                owner.is_some_and(|n| group_ids.contains(n.id.as_str()))
-                            })
+                        && calls.get(id.as_str()).is_some_and(|owner| {
+                            owner.is_some_and(|n| group_ids.contains(n.id.as_str()))
+                        })
                 }) {
                     returned.extend(&result.tool_results);
                     effective.insert(result.id.as_str(), (self.by_id[&result.id] * 2).max(floor));
-                    members.push(result);
+                    direct.push(result);
                 }
             }
-            let mut recovered = Vec::new();
-            for member in &members {
-                if known.insert(&member.id) {
-                    recovered.push(*member);
-                }
-            }
-            let mut end = group_ends[&(message, node.sidechain, node.agent_id.as_deref())];
+            recovered.extend(direct);
+            known.extend(recovered.iter().map(|n| &n.id));
+            let mut end = group_ends[message];
             while end < path.len() && Self::in_batch(path[end], message) {
                 end += 1;
             }
             let mut anchored = HashMap::new();
-            if group.iter().any(|m| !m.tool_uses.is_empty()) {
-                // qfe accepts each unambiguous transparent tail as a whole. A
-                // fork, cycle, or non-transparent descendant rejects that tail.
+            if group.iter().any(|n| n.tool_use) {
+                // Every known result associated with this batch is a root,
+                // including results that were already on the selected path.
+                let mut roots = group.clone();
+                let mut root_ids = group_ids.clone();
+                for assistant in group {
+                    for result in results.get(assistant.id.as_str()).into_iter().flatten() {
+                        if known.contains(&result.id) && root_ids.insert(&result.id) {
+                            roots.push(result);
+                        }
+                    }
+                }
                 let mut recover_tail = |parent: &Node| {
                     let parent_position = effective.get(parent.id.as_str()).copied();
                     let mut tails = Vec::new();
@@ -640,28 +684,29 @@ impl<'a> RecordIndex<'a> {
                         let mut next = Some(*child);
                         let mut seen = HashSet::new();
                         while let Some(n) = next {
+                            // Tail acceptance is all-or-nothing. Unlike fallback
+                            // association, it compares the raw sidechain fields
+                            // (absent differs from false), and ignores agent ID.
                             if known.contains(&n.id)
                                 || !n.transparent
-                                || n.sidechain != parent.sidechain
-                                || n.agent_id != parent.agent_id
+                                || n.sidechain_field != parent.sidechain_field
                                 || !seen.insert(&n.id)
                             {
                                 chain.clear();
                                 break;
                             }
                             chain.push(n);
-                            let remaining: Vec<_> = children
+                            let mut remaining = children
                                 .get(n.id.as_str())
                                 .into_iter()
                                 .flatten()
                                 .copied()
-                                .filter(|n| !known.contains(&n.id))
-                                .collect();
-                            if remaining.len() > 1 {
+                                .filter(|n| !known.contains(&n.id));
+                            next = remaining.next();
+                            if remaining.next().is_some() {
                                 chain.clear();
                                 break;
                             }
-                            next = remaining.first().copied();
                         }
                         for n in chain {
                             known.insert(&n.id);
@@ -674,8 +719,8 @@ impl<'a> RecordIndex<'a> {
                     }
                     tails
                 };
-                for member in &members {
-                    recovered.extend(recover_tail(member));
+                for root in roots {
+                    recovered.extend(recover_tail(root));
                 }
                 for anchor in &path[start + 1..end] {
                     if anchor.transparent {
@@ -686,40 +731,35 @@ impl<'a> RecordIndex<'a> {
                     }
                 }
             }
-            let order = |n: &&Node| {
-                (
-                    effective
-                        .get(n.id.as_str())
-                        .copied()
-                        .unwrap_or(self.by_id[&n.id] * 2),
-                    self.by_id[&n.id],
-                )
-            };
-            recovered.sort_by_key(order);
-            if let Some(previous) = windows.last_mut().filter(|w| start < w.1) {
+            if !recovered.is_empty() || !anchored.is_empty() {
+                windows.push((start, end, recovered, anchored));
+            }
+        }
+        // Finish all recovery before merging overlapping intervals. Effective
+        // positions may have been assigned while processing a later batch.
+        let mut merged: Vec<RecoveryWindow<'_>> = Vec::new();
+        for (start, end, recovered, anchored) in windows {
+            if let Some(previous) = merged.last_mut().filter(|w| start < w.1) {
                 previous.1 = previous.1.max(end);
                 previous.2.extend(recovered);
-                previous.2.sort_by_key(order);
                 for (id, tails) in anchored {
                     previous.3.entry(id).or_default().extend(tails);
                 }
             } else {
-                windows.push((start, end, recovered, anchored));
+                merged.push((start, end, recovered, anchored));
             }
         }
         let mut output = Vec::new();
         let mut cursor = 0;
-        for (start, end, recovered, anchored) in windows {
+        for (start, end, mut recovered, anchored) in merged {
+            recovered.sort_by_key(|n| order(n, &effective));
             output.extend_from_slice(&path[cursor..=start]);
             let mut recovered = recovered.into_iter().peekable();
             for node in &path[start + 1..end] {
-                while recovered.peek().is_some_and(|r| {
-                    effective
-                        .get(r.id.as_str())
-                        .copied()
-                        .unwrap_or(self.by_id[&r.id] * 2)
-                        < self.by_id[&node.id] * 2
-                }) {
+                while recovered
+                    .peek()
+                    .is_some_and(|r| order(r, &effective).0 < self.by_id[&node.id] * 2)
+                {
                     output.push(recovered.next().unwrap());
                 }
                 output.push(node);

@@ -686,6 +686,15 @@ fn anchored_tails_ignore_file_position_and_keep_sibling_chains_in_order() {
     variant.insert(7, json!({"type":"attachment","uuid":"second","parentUuid":"meta1","attachment":{"type":"date"}}));
     let data = transcript(&variant);
     let index = RecordIndex::parse(&data).unwrap();
+    // Tail sidechain equality is strict: absent is not the anchor's false.
+    assert_eq!(
+        index.current().unwrap().ids().collect::<Vec<_>>(),
+        ["u", "a", "r", "meta1", "meta2", "done"]
+    );
+    variant[6]["isSidechain"] = json!(false);
+    variant[7]["isSidechain"] = json!(false);
+    let data = transcript(&variant);
+    let index = RecordIndex::parse(&data).unwrap();
     assert_eq!(
         index.current().unwrap().ids().collect::<Vec<_>>(),
         [
