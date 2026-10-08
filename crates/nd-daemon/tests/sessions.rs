@@ -266,19 +266,51 @@ async fn a_recovered_source_accepts_escape_while_another_session_is_still_recove
         .unwrap();
     signal(blocked_pid, rustix::process::Signal::STOP);
     fx.scenario.restart_daemon().unwrap();
+    // restart_daemon returns before the wire listener is ready.
+    assert_eq!(header(&fx.peek(&a).await)["recovering"], true);
+    let client = nd_ui_core::CommandClient::start(fx.socket()).unwrap();
+    // Poll this future first so it enters the SAME command queue before Esc.
+    // The paused source keeps its recovering response pending until CONT below.
+    let blocked = client.command(Command {
+        id: "blocked-b".into(),
+        device: "desktop".into(),
+        name: "session.send".into(),
+        args: json!({"session":b,"text":"after recovery"}),
+        expect: json!({}),
+    });
+    tokio::pin!(blocked);
+    let initial = tokio::time::timeout(Duration::from_secs(1), &mut blocked).await;
+    assert!(
+        initial.is_err(),
+        "the first command must still be recovering beyond ordinary retries: {initial:?}"
+    );
     let result = tokio::time::timeout(
         Duration::from_secs(6),
-        fx.command("esc-a", "session.interrupt", json!({"session":a})),
+        client.command(Command {
+            id: "esc-a".into(),
+            device: "desktop".into(),
+            name: "session.interrupt".into(),
+            args: json!({"session":a}),
+            expect: json!({}),
+        }),
     )
     .await;
     let still_recovering = header(&fx.peek(&a).await)["recovering"] == true;
+    let first_still_pending = tokio::time::timeout(Duration::from_millis(100), &mut blocked)
+        .await
+        .is_err();
+    endpoint.enqueue(fx.main(), ModelReply::text("recovered b"));
     signal(blocked_pid, rustix::process::Signal::CONT);
+    assert!(
+        first_still_pending,
+        "Esc must finish before the recovering command"
+    );
     assert!(
         matches!(
             result,
-            Ok(CommandReply::Receipt {
+            Ok(Ok(CommandReply::Receipt {
                 receipt: Receipt::Done { .. }
-            })
+            }))
         ),
         "Esc must use source readiness, not the global write gate: {result:?}"
     );
@@ -290,6 +322,15 @@ async fn a_recovered_source_accepts_escape_while_another_session_is_still_recove
         has_header(s, |h| h["process"]["turn_running"] == false)
     })
     .await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(20), blocked)
+            .await
+            .unwrap()
+            .unwrap(),
+        CommandReply::Receipt {
+            receipt: Receipt::Done { .. }
+        }
+    ));
     drop(gate);
     fx.close();
 }
