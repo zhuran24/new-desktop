@@ -47,7 +47,14 @@ struct Step {
     until: fn(&Snapshot) -> bool,
 }
 
+struct ReplyCheck {
+    command_id: &'static str,
+    within: Duration,
+    check: fn(&Harness, &Option<nd_wire::CommandReply>),
+}
+
 struct Scenario {
+    reply_check: Option<ReplyCheck>,
     prepare: fn(&Harness),
     observe_ms: u64,
     name: &'static str,
@@ -99,16 +106,35 @@ async fn run(scenario: &Scenario, crash: Option<(Fault, usize)>) -> (Harness, Sn
             .is_some_and(|f| f.fired.load(Ordering::Acquire))
     };
     let mut restarted = false;
+    // The assertion may release a held backend operation. A later crash retries
+    // the command, but must not require that already-released operation again.
+    let mut reply_checked = false;
     let mut index = 0;
     while index < scenario.steps.len() {
         let step = &scenario.steps[index];
         // 与同步副本一样：仅明确未受理的 unavailable 可同 id 重试。
         let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while matches!(
-            h.sessions.execute(&step.command).await,
-            Some(nd_wire::CommandReply::Unavailable { .. })
-        ) {
+        loop {
+            let check = scenario
+                .reply_check
+                .as_ref()
+                .filter(|check| !reply_checked && check.command_id == step.command.id);
+            let call = h.sessions.execute(&step.command);
+            let reply = if let Some(check) = check {
+                tokio::time::timeout(check.within, call)
+                    .await
+                    .expect("execute must return while the backend operation is still held")
+            } else {
+                call.await
+            };
             if fired() && !restarted {
+                break;
+            }
+            if !matches!(reply, Some(nd_wire::CommandReply::Unavailable { .. })) {
+                if let Some(check) = check {
+                    (check.check)(&h, &reply);
+                    reply_checked = true;
+                }
                 break;
             }
             assert!(
@@ -166,6 +192,7 @@ async fn run(scenario: &Scenario, crash: Option<(Fault, usize)>) -> (Harness, Sn
         let header = header(&snapshot).clone();
         let alive = header["process"]["alive"] == true;
         if header["op"].is_null() && h.adapter.live().len() == usize::from(alive) {
+            assert!(scenario.reply_check.is_none() || reply_checked);
             return (h, snapshot, fired());
         }
         assert!(
@@ -268,6 +295,7 @@ async fn draft_conflict_and_send_consumption_recover_at_every_commit_point() {
         expect: json!({"draft_version":1}),
     };
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "send/draft-conflict-consume-retry",
@@ -320,6 +348,7 @@ async fn draft_conflict_and_send_consumption_recover_at_every_commit_point() {
 #[tokio::test(flavor = "multi_thread")]
 async fn create_reaches_active_or_is_compensated_at_every_commit_point() {
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "create/ok",
@@ -342,6 +371,7 @@ async fn create_reaches_active_or_is_compensated_at_every_commit_point() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_create_that_cannot_start_is_withdrawn_at_every_commit_point() {
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "create/open-fails",
@@ -361,6 +391,7 @@ async fn a_create_that_cannot_start_is_withdrawn_at_every_commit_point() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_create_whose_first_message_is_unknown_is_partial_at_every_commit_point() {
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "create/partial",
@@ -387,6 +418,7 @@ async fn a_create_whose_first_message_is_unknown_is_partial_at_every_commit_poin
 async fn idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_every_commit_point() {
     let session = session_id_for("matrix-idle");
     matrix(Scenario {
+        reply_check: None,
         prepare: |h| {
             h.adapter.set_initial_settings(
                 serde_json::from_value(json!({"applied":{"effort":"medium"}})).unwrap(),
@@ -441,6 +473,7 @@ async fn confirmed_loss_and_user_resend_are_atomic_at_every_commit_point() {
         json!([{"blob":blob,"name":"resend.txt","media_type":"text/plain","size":bytes.len()}]);
     let session = session_id_for("matrix-resend");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "send/lost-and-user-resend",
@@ -520,6 +553,7 @@ async fn attachment_create_and_send_recover_at_every_commit_point() {
     let mut first = create(id, "带附件的首条");
     first.args["attachments"] = attachments.clone();
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "create-and-send/attachments",
@@ -555,6 +589,7 @@ async fn attachment_creation_compensation_releases_unused_uploads_at_every_commi
     first.args["attachments"] =
         json!([{"blob":blob,"name":"材料.txt","media_type":"text/plain","size":bytes.len()}]);
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "create/attachments-open-fails",
@@ -595,6 +630,7 @@ async fn attached_draft_conflict_and_send_consumption_recover_at_every_commit_po
         expect: json!({"draft_version":1}),
     };
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "send/attached-draft-conflict-consume-retry",
@@ -659,6 +695,7 @@ async fn withdrawal_restores_once_at_every_commit_point() {
     let returned_ref = json!({"blob":format!("{:x}",Sha256::digest(returned)),"name":"returned.txt","media_type":"text/plain","size":returned.len()});
     let session = session_id_for("matrix-withdraw");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         auto_title: false,
@@ -708,6 +745,7 @@ async fn withdrawal_restores_once_at_every_commit_point() {
 async fn interrupt_is_accepted_during_a_wait_and_recovers_at_every_commit_point() {
     let session = session_id_for("matrix-interrupt");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         auto_title: false,
@@ -759,6 +797,7 @@ async fn interrupt_is_accepted_during_a_wait_and_recovers_at_every_commit_point(
 async fn cancelling_the_queue_restores_once_at_every_commit_point() {
     let session = session_id_for("matrix-cancel");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         auto_title: false,
@@ -802,6 +841,7 @@ async fn cancelling_the_queue_restores_once_at_every_commit_point() {
 async fn settings_and_manual_title_recover_at_every_commit_point() {
     let session = session_id_for("matrix-settings");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "configure-and-title/success",
@@ -843,6 +883,7 @@ async fn settings_and_manual_title_recover_at_every_commit_point() {
 async fn settings_and_title_failures_keep_previous_values_at_every_commit_point() {
     let session = session_id_for("matrix-settings-failure");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         name: "configure-and-title/refused",
@@ -899,6 +940,7 @@ async fn settings_and_title_failures_keep_previous_values_at_every_commit_point(
 async fn settings_automatic_title_recovers_or_keeps_summary_at_every_commit_point() {
     for fail in [false, true] {
         matrix(Scenario {
+            reply_check: None,
             prepare: |_| {},
             observe_ms: 0,
             name: if fail {
@@ -958,6 +1000,7 @@ fn receipt(h: &Harness, id: &str) -> nd_wire::Receipt {
 async fn summarize_from_here_backfills_the_draft_once_at_every_commit_point() {
     let session = session_id_for("matrix-sum-create");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         auto_title: false,
@@ -1025,6 +1068,7 @@ async fn summarize_from_here_backfills_the_draft_once_at_every_commit_point() {
 async fn a_bang_whose_result_is_lost_is_unknown_and_never_rerun_at_every_commit_point() {
     let session = session_id_for("matrix-bang-create");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         auto_title: false,
@@ -1061,6 +1105,7 @@ async fn a_bang_whose_result_is_lost_is_unknown_and_never_rerun_at_every_commit_
 async fn a_subtask_dispatches_one_fork_subagent_at_every_commit_point() {
     let session = session_id_for("matrix-fork-create");
     matrix(Scenario {
+        reply_check: None,
         prepare: |_| {},
         observe_ms: 0,
         auto_title: false,
@@ -1100,6 +1145,7 @@ async fn a_subtask_dispatches_one_fork_subagent_at_every_commit_point() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_background_work_remains_unreclaimable_at_every_commit_point() {
     matrix(Scenario {
+        reply_check: None,
         name: "reclaim/unknown-task-table",
         prepare: |h| {
             h.adapter.set_drain(nd_backend::Drain::Unknown {
@@ -1133,46 +1179,30 @@ async fn unknown_background_work_remains_unreclaimable_at_every_commit_point() {
 async fn shell_during_pending_title_recovers_at_every_commit_point() {
     let session = session_id_for("matrix-title-hold");
     matrix(Scenario {
-        prepare: |h| {
-            let adapter = h.adapter.clone();
-            let store = h.store.clone();
-            tokio::spawn(async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                while !adapter.received().iter().any(|(_, act)| {
+        reply_check: Some(ReplyCheck {
+            command_id: "matrix-title-shell",
+            within: Duration::from_millis(500),
+            check: |h, reply| {
+                assert!(
                     matches!(
-                        act,
-                        nd_backend::Act::Invoke {
-                            invocation: nd_backend::Invocation::Shell { .. },
-                            ..
-                        }
-                    )
-                }) {
-                    assert!(tokio::time::Instant::now() < deadline);
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-                while !matches!(
-                    nd_ledger::lookup(&store, "matrix-title-shell", None).unwrap(),
-                    nd_wire::ReceiptLookup::Found {
-                        receipt: nd_wire::Receipt::Done { .. }
-                    }
-                ) {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "shell must return Done while the title is still held"
-                    );
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                assert!(adapter.held().iter().any(|(_, act)| matches!(
+                        reply,
+                        Some(nd_wire::CommandReply::Receipt {
+                            receipt: nd_wire::Receipt::Done { .. }
+                        })
+                    ),
+                    "shell execute must return Done while the title is held: {reply:?}"
+                );
+                assert!(h.adapter.held().iter().any(|(_, act)| matches!(
                     act,
                     nd_backend::Act::Invoke {
                         invocation: nd_backend::Invocation::GenerateTitle { .. },
                         ..
                     }
                 )));
-                assert!(adapter.release(Reply::Ok));
-            });
-        },
+                assert!(h.adapter.release(Reply::Ok));
+            },
+        }),
+        prepare: |_| {},
         observe_ms: 0,
         name: "pending-title+shell",
         uploads: vec![],
@@ -1217,6 +1247,7 @@ async fn shell_during_pending_title_recovers_at_every_commit_point() {
 async fn pending_send_then_idle_reclaim_recovers_at_every_commit_point() {
     let session = session_id_for("matrix-busy-idle");
     matrix(Scenario {
+        reply_check: None,
         prepare: |h| {
             let adapter = h.adapter.clone();
             tokio::spawn(async move {
