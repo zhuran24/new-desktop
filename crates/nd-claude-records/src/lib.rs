@@ -585,48 +585,47 @@ impl<'a> RecordIndex<'a> {
                             })
                             .collect();
                         // Selected metadata still leads to attachments beside the
-                        // selected continuation. Do not guess an unselected fork.
+                        // selected continuation. Each sibling may root its own
+                        // attachment chain; ambiguity within a chain still aborts it.
                         for child in &descendants {
                             if selected.contains(&child.id) {
                                 batch.push(*child);
                                 pending.push(*child);
                             }
                         }
-                        let mut chain = Vec::new();
-                        let mut next = descendants
+                        for child in descendants
                             .into_iter()
-                            .filter(|n| !selected.contains(&n.id));
-                        let first = next.next();
-                        if next.next().is_some() {
-                            continue;
-                        }
-                        let mut next = first;
-                        let mut chain_seen = HashSet::new();
-                        while let Some(node) = next {
-                            if !node.transparent
-                                || node.sidechain != member.sidechain
-                                || node.agent_id != member.agent_id
-                                || selected.contains(&node.id)
-                                || !chain_seen.insert(&node.id)
-                            {
-                                chain.clear();
-                                break;
+                            .filter(|n| !selected.contains(&n.id))
+                        {
+                            let mut chain = Vec::new();
+                            let mut next = Some(child);
+                            let mut chain_seen = HashSet::new();
+                            while let Some(node) = next {
+                                if !node.transparent
+                                    || node.sidechain != member.sidechain
+                                    || node.agent_id != member.agent_id
+                                    || selected.contains(&node.id)
+                                    || !chain_seen.insert(&node.id)
+                                {
+                                    chain.clear();
+                                    break;
+                                }
+                                chain.push(node);
+                                let remaining: Vec<_> = children
+                                    .get(node.id.as_str())
+                                    .into_iter()
+                                    .flatten()
+                                    .copied()
+                                    .filter(|n| !selected.contains(&n.id))
+                                    .collect();
+                                if remaining.len() > 1 {
+                                    chain.clear();
+                                    break;
+                                }
+                                next = remaining.first().copied();
                             }
-                            chain.push(node);
-                            let remaining: Vec<_> = children
-                                .get(node.id.as_str())
-                                .into_iter()
-                                .flatten()
-                                .copied()
-                                .filter(|n| !selected.contains(&n.id))
-                                .collect();
-                            if remaining.len() > 1 {
-                                chain.clear();
-                                break;
-                            }
-                            next = remaining.first().copied();
+                            batch.extend(chain);
                         }
-                        batch.extend(chain);
                     }
                 }
                 batch.sort_by_key(|n| self.by_id[&n.id]);
