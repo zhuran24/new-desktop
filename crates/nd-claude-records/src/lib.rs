@@ -540,6 +540,16 @@ impl<'a> RecordIndex<'a> {
         // Match CLI mAr: merge recovered rows into selected windows, but insert
         // tails of selected metadata immediately after their anchor. Sorting the
         // selected rows and those tails together loses this distinction.
+        // Index the last selected chunk once; scanning each remaining suffix
+        // makes ordinary histories quadratic in the number of message groups.
+        let mut group_ends = HashMap::new();
+        for (position, node) in path.iter().enumerate() {
+            if node.kind == "assistant"
+                && let Some(id) = node.message_id.as_deref()
+            {
+                group_ends.insert((id, node.sidechain, node.agent_id.as_deref()), position + 1);
+            }
+        }
         let mut effective = HashMap::new();
         let mut known = selected.clone();
         let mut handled = HashSet::new();
@@ -589,12 +599,14 @@ impl<'a> RecordIndex<'a> {
                 .map(|n| self.by_id[&n.id] * 2 + 1)
                 .max()
                 .unwrap();
-            let mut returned = already_returned.clone();
-            returned.extend(members.iter().flat_map(|n| &n.tool_results));
+            // Keep the selected path's result set shared. Cloning it per
+            // group makes long tool histories quadratic even without recovery.
+            let mut returned: HashSet<_> = members.iter().flat_map(|n| &n.tool_results).collect();
             stale.sort_by_key(|n| self.by_id[&n.id]);
             for result in stale {
                 if result.tool_results.iter().any(|id| {
-                    !returned.contains(id)
+                    !already_returned.contains(id)
+                        && !returned.contains(id)
                         && calls
                             .get(&(id.as_str(), result.sidechain, result.agent_id.as_deref()))
                             .is_some_and(|owner| {
@@ -612,14 +624,7 @@ impl<'a> RecordIndex<'a> {
                     recovered.push(*member);
                 }
             }
-            let mut end = path
-                .iter()
-                .enumerate()
-                .skip(start)
-                .filter(|(_, n)| group.iter().any(|m| m.id == n.id))
-                .map(|(i, _)| i + 1)
-                .max()
-                .unwrap();
+            let mut end = group_ends[&(message, node.sidechain, node.agent_id.as_deref())];
             while end < path.len() && Self::in_batch(path[end], message) {
                 end += 1;
             }

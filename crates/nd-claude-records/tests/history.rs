@@ -769,3 +769,71 @@ fn stale_result_order_variants_match_the_pinned_cli() {
         );
     }
 }
+
+#[test]
+fn ordinary_history_recovery_scales_with_record_count() {
+    fn measure(count: usize) -> std::time::Duration {
+        let rows: Vec<_> = (0..count)
+            .map(|i| {
+                message(
+                    &format!("m{i}"),
+                    (i > 0).then(|| format!("m{}", i - 1)).as_deref(),
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    "text",
+                )
+            })
+            .collect();
+        let data = transcript(&rows);
+        let index = RecordIndex::parse(&data).unwrap();
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let history = index.current().unwrap();
+                assert_eq!(history.ids().count(), count);
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+    // Eight times the input allows a generous 24x runtime, but rejects the
+    // previous per-message suffix scan (quadratic, approximately 64x).
+    let small = measure(4_000);
+    let large = measure(32_000);
+    eprintln!("current(): 4000={small:?}, 32000={large:?}");
+    assert!(
+        large < small * 24,
+        "history recovery regressed: {small:?} -> {large:?}"
+    );
+}
+
+#[test]
+fn tool_history_recovery_does_not_rescan_all_selected_results_per_message() {
+    fn measure(count: usize) -> std::time::Duration {
+        let rows: Vec<_> = (0..count).map(|i| {
+            let mut row = message(&format!("m{i}"), (i > 0).then(|| format!("m{}", i-1)).as_deref(), if i % 3 == 1 { "assistant" } else { "user" }, "text");
+            if i % 3 == 1 {
+                row["message"]["content"] = json!([{"type":"tool_use","id":format!("tool{i}"),"name":"Read","input":{}}]);
+            } else if i % 3 == 2 {
+                row["message"]["content"] = json!([{"type":"tool_result","tool_use_id":format!("tool{}",i-1),"content":"ok"}]);
+            }
+            row
+        }).collect();
+        let data = transcript(&rows);
+        let index = RecordIndex::parse(&data).unwrap();
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                assert_eq!(index.current().unwrap().ids().count(), count);
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+    let small = measure(16_000);
+    let large = measure(256_000);
+    eprintln!("tool current(): 16000={small:?}, 256000={large:?}");
+    assert!(
+        large < small * 40,
+        "tool history recovery regressed: {small:?} -> {large:?}"
+    );
+}
