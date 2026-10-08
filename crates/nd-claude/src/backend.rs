@@ -1526,6 +1526,16 @@ impl Actor {
         }
     }
     async fn send_control(&mut self, kind: &str, ticket: Ticket, request: Value) {
+        if let Some(fact) = self.queue_control(kind, ticket, request).await {
+            self.inner
+                .deliver_facts(&self.session, &self.carrier, vec![fact])
+                .await;
+        }
+    }
+
+    // A readback failure belongs to the current checkpointed batch; command
+    // admission failures are delivered immediately by send_control.
+    async fn queue_control(&mut self, kind: &str, ticket: Ticket, request: Value) -> Option<Fact> {
         let id = format!("{kind}:{ticket}");
         self.settings_controls.insert(id.clone(), ticket.clone());
         if let Err(error) = self
@@ -1533,19 +1543,14 @@ impl Actor {
             .await
         {
             self.settings_controls.remove(&id);
-            self.inner
-                .deliver_facts(
-                    &self.session,
-                    &self.carrier,
-                    vec![done(
-                        &ticket,
-                        Outcome::Unknown {
-                            evidence: error.to_string(),
-                        },
-                    )],
-                )
-                .await;
+            return Some(done(
+                &ticket,
+                Outcome::Unknown {
+                    evidence: error.to_string(),
+                },
+            ));
         }
+        None
     }
     async fn encode(&self, msg: &Msg) -> Result<Vec<Value>, String> {
         let blobs = self.inner.blobs.clone();
@@ -1957,12 +1962,14 @@ impl Actor {
                                     },
                                 ));
                             } else if request_id.starts_with("configure:") {
-                                let id = format!("settings:{ticket}");
-                                self.settings_controls.insert(id.clone(), ticket.clone());
-                                if let Err(error) = self.write_control(&json!({"type":"control_request","request_id":id,"request":{"subtype":"get_settings"}})).await {
-                                    self.settings_controls.remove(&id);
-                                    facts.push(done(&ticket, Outcome::Unknown {evidence:error.to_string()}));
-                                }
+                                facts.extend(
+                                    self.queue_control(
+                                        "settings",
+                                        ticket,
+                                        json!({"subtype":"get_settings"}),
+                                    )
+                                    .await,
+                                );
                             } else {
                                 facts.push(done(
                                     &ticket,
