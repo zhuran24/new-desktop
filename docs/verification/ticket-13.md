@@ -30,7 +30,7 @@
 |---|---|
 | 新建成功、拉起失败、首条消息不明的提交点恢复 | `create_reaches_active_or_is_compensated_at_every_commit_point`、`a_create_that_cannot_start_is_withdrawn_at_every_commit_point`、`a_create_whose_first_message_is_unknown_is_partial_at_every_commit_point` |
 | 闲置回收与按需续接的提交点恢复 | `idle_reclaim_then_on_demand_launch_deliver_the_held_message_once_at_every_commit_point` |
-| 任务表 Unknown 的保守判断跨重启保留 | `unknown_background_work_remains_unreclaimable_across_restart` |
+| 任务表 Unknown 在提交前、提交后及发件交出后逐提交点崩溃恢复仍不回收 | `unknown_background_work_remains_unreclaimable_at_every_commit_point` |
 | 连续忙碌输入压住 Tick 后重新计时，与重启后重新计时 | `busy_inputs_reset_idle_time_without_waiting_for_a_tick` |
 | 在途自动标题跨重启不占结构槽位、不挡发送台 | `a_pending_automatic_title_does_not_hold_shell_invocations` |
 

@@ -12,7 +12,7 @@
 | `recover()` | 启动时核对单元 cgroup、后端与看守的 PID/启动 ticks/boot id，以及 socket 对端 uid/pid；为存活看守取新控制连接，读取 hello 后交还，不确认流水 |
 | `inspect()` | 返回 `Up`、`Gone`、`IdentityMismatch`；`Gone.reason` 为 `NeverLaunched`、`Exited` 或 `ProcGone`。观察失败、单元与身份不符都保留为 `IdentityMismatch`，不能用于释放租约 |
 | `inspect_run(run)` / `inspect_run_async(run)` | 核对一个运行；异步版本把 systemctl 等阻塞检查移出执行器线程。紧凑 Gone 墓碑直接返回已核实的退出观察 |
-| `collect_unused(referenced)` | 仅清理已核实 Gone 且不在持久引用集合中的运行；保留紧凑幂等墓碑，防止同一 run 再次启动后端 |
+| `collect_unused(read_references)` | 启动持共享文件锁，回收持独占锁；锁内先枚举目录，再调用回调读取持久引用，仅清理已核实 Gone 且无引用的运行。启动竞争时延后回收；保留紧凑幂等墓碑，防止同一 run 再次启动后端 |
 | `link(run)` | 仅供适配器。取得唯一控制连接，新连接顶掉旧连接；已经受理的输入写入继续执行 |
 | `records(run, after, limit)` | 只读本地流水，供结束后的恢复、诊断和录制使用；不是控制连接，也不推进确认点 |
 
