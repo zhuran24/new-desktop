@@ -33,7 +33,7 @@ def rendered(app):
 
 
 def inner():
-    assert os.environ["WAYLAND_DISPLAY"] == "nd-test-ticket7"
+    assert os.environ["WAYLAND_DISPLAY"] == "nd-test-native"
     assert os.environ["HOME"] == "/sandbox/home"
     root = Path("/sandbox")
     out = root / "out"
