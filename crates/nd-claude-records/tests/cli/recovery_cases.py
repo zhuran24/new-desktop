@@ -30,6 +30,7 @@ def finish(name, rows):
 
 
 def cases():
+    yield from field_cases()
     # Every transparent kind, root type, ambiguous/linear tail, raw sidechain
     # value, and file position. Consecutive metadata exercises anchored insertion.
     for kind, anchor, shape, side in product(
@@ -154,3 +155,26 @@ def cases():
                 if agent != 'absent':
                     item['agentId'] = agent
             yield finish(f'raw-tail-fields/{side}/{agent}', rows)
+
+
+def field_cases():
+    # JSON field domains, including values not known to be emitted by the CLI.
+    # Exercise them through record recovery, never through a private predicate.
+    missing = object()
+    values = [missing, None, False, True, 0, 0.0, 1, 1.0, '', 'false',
+              [], {}, [0], {'x': 0}, 9007199254740992, 9007199254740993]
+    for mode, (li, left), (ri, right) in product(
+            ['fallback-side', 'fallback-agent', 'tail-side'],
+            enumerate(values), enumerate(values)):
+        a = assistant('a', 'u', 'batch', 't')
+        r = result('r', 'a' if mode == 'tail-side' else 'u', 't')
+        x = meta('x', 'r', 'attachment')
+        field = 'agentId' if mode == 'fallback-agent' else 'isSidechain'
+        first, second = (r, x) if mode == 'tail-side' else (a, r)
+        for item, value in [(first, left), (second, right)]:
+            if value is missing:
+                item.pop(field, None)
+            else:
+                item[field] = deepcopy(value)
+        yield finish(f'field-types/{mode}/{li}/{ri}',
+                     [row('u', None, 'user'), a, r, x, row('done', 'a')])

@@ -40,6 +40,30 @@ struct Node {
     active: bool,
 }
 
+// Record fields use scalar equality, not JSON structural equality. Each object
+// or array parsed from JSON belongs to that occurrence, even when its contents
+// equal another field. Missing and null remain distinct unless the caller
+// explicitly supplies a default. Numbers share the JSON consumer's f64 domain.
+fn same_field(left: Option<&Value>, right: Option<&Value>) -> bool {
+    match (left, right) {
+        (Some(Value::Array(_) | Value::Object(_)), _)
+        | (_, Some(Value::Array(_) | Value::Object(_))) => {
+            left.zip(right).is_some_and(|(a, b)| std::ptr::eq(a, b))
+        }
+        (Some(Value::Number(a)), Some(Value::Number(b))) => a.as_f64() == b.as_f64(),
+        _ => left == right,
+    }
+}
+
+fn sidechain_scope(node: &Node) -> Option<&Value> {
+    Some(
+        node.sidechain_field
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .unwrap_or(&Value::Bool(false)),
+    )
+}
+
 /// An immutable view of a caller-owned JSONL snapshot. No file I/O is performed.
 #[derive(Debug)]
 pub struct RecordIndex<'a> {
@@ -559,8 +583,8 @@ impl<'a> RecordIndex<'a> {
                         .iter()
                         .filter_map(|id| calls.get(id.as_str()).copied().flatten()),
                 ) {
-                    if owner.sidechain == result.sidechain
-                        && owner.agent_field == result.agent_field
+                    if same_field(sidechain_scope(owner), sidechain_scope(result))
+                        && same_field(owner.agent_field.as_ref(), result.agent_field.as_ref())
                     {
                         owners.push(&owner.id);
                     }
@@ -689,7 +713,10 @@ impl<'a> RecordIndex<'a> {
                             // (absent differs from false), and ignores agent ID.
                             if known.contains(&n.id)
                                 || !n.transparent
-                                || n.sidechain_field != parent.sidechain_field
+                                || !same_field(
+                                    n.sidechain_field.as_ref(),
+                                    parent.sidechain_field.as_ref(),
+                                )
                                 || !seen.insert(&n.id)
                             {
                                 chain.clear();

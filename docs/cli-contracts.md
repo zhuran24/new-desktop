@@ -1,6 +1,6 @@
 # CLI 与 Codex 契约清单
 
-日期：2026-10-06。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#5 的离线端点、#6 的 Workflow 流水和 #8 的只读记录契约已通过真 CLI 离线验收；#9 的转换契约区分格式回归与后续真实后端验证。
+日期：2026-10-08。各工单引入的 CLI/Codex 行为在此各占一个独立条目。#5 的离线端点、#6 的 Workflow 流水和 #8 的只读记录契约已通过真 CLI 离线验收；#9 的转换契约区分格式回归与后续真实后端验证。
 
 ## 条目格式
 
@@ -48,16 +48,16 @@
 | 主记录是 JSONL，user/assistant/system/attachment 带 UUID 和父指针；元数据不入对话链；重复 UUID 后写覆盖，未知字段保留 | `rbn` @211932344；既有 `research/round7/cc-import.md` §3.1–3.4 | `history.rs` 的原始记录、偏移、重复 UUID、错误信封案例 | 解析失败返回字节偏移；完整重读仍失败则标记录不可判定，不绕过登记继续写 |
 | 主对话叶子受 `last-prompt`、explicit、后续对话、父链、时间戳影响；空 explicit 清空；无叶子标题不等于新对话 | `rbn` @211932344；`Okn` @211930929；`AN` @211874654、`Kut` @211874772；`FAr` @211958891 | `history.rs` 的真实回退前缀、标题/sidechain、清空、时钟倒序、并行结果选择、fork briefing | 叶子无法确定时不给独占登记一个猜出的 UUID；等待写完/扩大读取，仍不确定则不给续接放行 |
 | 最新 compact 边界、摘要、保留尾段重接；`preservedMessages` 优先于旧 `preservedSegment`；旧上下文不能经分块恢复复活 | `dAr` @211872778；`cAr` @211874082；既有 `research/round4/switch-branch.md` §1、`research/round9/VERIFY.md` E4/E5 | 真 CLI 两次 `/compact` + `--resume` 的 `cli_live`；录制默认回归；旧段格式衍生输入 | 保留列表或父链不全返回 `BrokenCompaction`/`MissingParent`；完整重读仍失败则不导出/不放行续接，不伪造摘要或手写父指针 |
-| 同 message.id 的回复分块、并行工具结果属于同一回复；旧 progress 桥接；有效链后有附件尾部 | `mAr` @211878079；`Kut` @211874772；`rbn` @211932344 | `recovery.rs` 默认逐例比对 372 条独立参照 UUID 顺序与 1/2/7 条分页；本机提取差分覆盖原有 3525 例及新增 1163 例，方法见下文；旧 progress、叶子附件另有行为测试。构造输入不是模型续接证明 | 不清洗未知块；不按歧义工具 ID 猜关联。升级发现结构变化时停用相关转换/导出，保留原始记录以便修复 |
+| 同 message.id 的回复分块、并行工具结果属于同一回复；旧 progress 桥接；有效链后有附件尾部 | `mAr` @211878079；`Kut` @211874772；`rbn` @211932344 | `recovery.rs` 默认逐例比对 480 条独立参照 UUID 顺序与 1/2/7 条分页；本机提取差分覆盖原有 3525 例、独立复核 1640 例及生成器的 1931 例，方法见下文；旧 progress、叶子附件另有行为测试。构造输入不是模型续接证明 | 不清洗未知块；不按歧义工具 ID 猜关联。升级发现结构变化时停用相关转换/导出，保留原始记录以便修复 |
 | 现场回归使用 stream-json initialize、rewind_conversation、export_conversation、/compact、--resume；只能模型端点被替换 | `research/impl/BUILD.md`；`research/round4/switch-branch.md` §1–2；真实夹具生成器 | `cargo test -p nd-claude-records --test cli_live -- --ignored`，真实 CLI 自己写文件，续接请求与解析摘要/保留回复对比 | 场景失败使测试失败；候选版本不通过这条关卡，继续钉住已验证版 |
 
 测试文件都在 [nd-claude-records/tests](../crates/nd-claude-records/tests/)。默认回归与现场回归的区别、完整命令和分页契约见 [库说明](../crates/nd-claude-records/README.md)。
 
-P-24 的恢复契约按消息 ID 归组；工具结果先按父节点关联，旧 parent 再用 source UUID 和无歧义工具 ID 关联。同消息的工具 ID 归最后分块，不同消息重复声明则保持歧义。已在选链上的结果也参与附件尾链恢复。尾链要求整条透明、无分叉，且原始 `isSidechain` 字段相同（缺省与 false 不同）；不额外比较 agent。恢复条目按有效文件位置进入窗口，metadata 子链紧跟其锚点；重叠窗口合并后输出，原始选链的相对顺序不变。
+P-24 的恢复契约按消息 ID 归组；工具结果先按父节点关联，旧 parent 再用 source UUID 和无歧义工具 ID 关联。同消息的工具 ID 归最后分块，不同消息重复声明则保持歧义。已在选链上的结果也参与附件尾链恢复。回退关联仅将缺省/null 的 `isSidechain` 视为 false；其他值不做布尔归一化。尾链要求整条透明、无分叉，且原始 `isSidechain` 字段严格相等（缺省、null、false 不同）；不额外比较 agent。字段比较不把 JSON 对象/数组按内容判等，数字按 binary64 比较；回退关联的 `agentId` 同样保留字段类型。异常类型是解析器接受输入的兼容边界，不表示 CLI 正常会产出这些类型。恢复条目按有效文件位置进入窗口，metadata 子链紧跟其锚点；重叠窗口合并后输出，原始选链的相对顺序不变。
 
-差分夹具 [recovery-orders.jsonl](../crates/nd-claude-records/tests/fixtures/recovery-orders.jsonl) 共 372 例、700775 字节，只含人工构造输入和 CLI 给出的期望 UUID 序列。覆盖连续 metadata、主链结果附件、system/isMeta 尾链、并行结果、旧 parent、侧链、跨消息 ID、原始侧链字段、重复工具 ID、区间重叠及文件顺序。默认测试不需要本机 CLI。期望值由参照生成，不从 Rust 实现更新。
+差分夹具 [recovery-orders.jsonl](../crates/nd-claude-records/tests/fixtures/recovery-orders.jsonl) 共 480 例、814855 字节，只含人工构造输入和 CLI 给出的期望 UUID 序列。覆盖连续 metadata、主链结果附件、system/isMeta 尾链、并行结果、旧 parent、侧链、跨消息 ID、原始侧链字段、重复工具 ID、区间重叠及文件顺序；另含异常字段类型及跨类型比较。默认测试不需要本机 CLI。期望值由参照生成，不从 Rust 实现更新。
 
-升级时手动运行 `recovery_matches_locally_extracted_cli`（默认 `#[ignore]`，需要本机闭源二进制和完整外部语料）：
+升级时手动运行 `recovery_matches_locally_extracted_cli`（默认 `#[ignore]`，需要本机闭源二进制和完整外部语料）。以下命令验证原 3525 例加生成器 1931 例。完整复核另将 `last-p24-evidence/independent.jsonl` 的 1616 例和 `malformed.jsonl` 的 24 例与原语料拼接到仓库外的 JSONL，把环境变量指向该文件，即验证合计 7096 例；本次拼接文件及日志在 `/mnt/wd_external/nd-build/tmp/r9-p24/`。外部语料均为输入数据，不需复制 oracle 源码到仓库。
 
 ```bash
 export CARGO_TARGET_DIR=/mnt/wd_external/nd-build/target/review-fixes
@@ -68,7 +68,7 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 -- \
   recovery_matches_locally_extracted_cli -- --ignored --exact --nocapture
 ```
 
-[recovery_oracle.py](../crates/nd-claude-records/tests/cli/recovery_oracle.py) 校验钉版 SHA-256，按已核对偏移和括号边界现场抽出 `mAr` 及其纯函数依赖，仅在 Node 子进程内执行；启用工具 ID 恢复开关，关闭遥测和诊断登记。脚本不运行 CLI、不读取配置或凭据，子进程清空继承环境；仓库不存储抽出的函数或它们的 JavaScript 改写。脚本输出提取函数的散列供留证，将完整外部语料与 [recovery_cases.py](../crates/nd-claude-records/tests/cli/recovery_cases.py) 的 1163 例分支定向输入一起送入参照，Rust 测试逐例核对完整历史和分页。新版必须先复核符号、依赖、开关及二进制散列，再更新抽取清单；抽取或比对失败不放行。该差分只证明记录恢复顺序，实际压缩和续接仍由 `cli_live` 验证。
+[recovery_oracle.py](../crates/nd-claude-records/tests/cli/recovery_oracle.py) 校验钉版 SHA-256，按已核对偏移和括号边界现场抽出 `mAr` 及其纯函数依赖，仅在 Node 子进程内执行；启用工具 ID 恢复开关，关闭遥测和诊断登记。脚本不运行 CLI、不读取配置或凭据，子进程清空继承环境；现场抽出的函数体不写入仓库或夹具；禁止提交这些函数的源码或任何语言的源码改写。脚本输出提取函数的散列供留证，将完整外部语料与 [recovery_cases.py](../crates/nd-claude-records/tests/cli/recovery_cases.py) 的 1931 例分支定向输入（含 768 例字段类型交叉组合）一起送入参照，Rust 测试逐例核对完整历史和分页。新版必须先复核符号、依赖、开关及二进制散列，再更新抽取清单；抽取或比对失败不放行。该差分只证明记录恢复顺序，实际压缩和续接仍由 `cli_live` 验证。
 
 当前实现对破损文件比 CLI 更严格：不使用它的邻近时间戳猜父节点、忽略坏行或返回部分历史作为登记基线。错误必须由调用方处理，不能转成空历史/空叶子。库只做原生记录顺序和原始内容读取；模型请求的规范化与转换有各自契约。
 
