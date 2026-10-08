@@ -1252,6 +1252,9 @@ impl Fixture {
         Self::with_env(name, idle_reclaim_ms, "").await
     }
     async fn with_env(name: &str, idle_reclaim_ms: u64, extra_env: &str) -> Self {
+        Self::with_tick(name, idle_reclaim_ms, 50, extra_env).await
+    }
+    async fn with_tick(name: &str, idle_reclaim_ms: u64, tick_ms: u64, extra_env: &str) -> Self {
         let auto_title = name.starts_with("nd21-title-ai");
         let poll_timeout_ms = if name == "nd20-thousand" { 20 } else { 5000 };
         let config = format!(
@@ -1287,7 +1290,7 @@ DISABLE_ERROR_REPORTING = "1"
 [sessions]
 auto_title = {auto_title}
 idle_reclaim_ms = {idle_reclaim_ms}
-tick_ms = 50
+tick_ms = {tick_ms}
 "#
         );
         let mut options = ScenarioOptions::new(
@@ -5604,5 +5607,110 @@ async fn legacy_live_adoption_keeps_current_settings_instead_of_launch_snapshot(
         }
         stale = expected;
     }
+    fx.close();
+}
+
+#[tokio::test]
+async fn busy_inputs_start_a_fresh_idle_interval_without_waiting_for_a_tick() {
+    let fx = Fixture::with_tick("busy-idle-clock", 1500, 500, "").await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("busy-idle-create", "/sandbox/project", "first")
+        .await;
+    fx.wait(&session, "ready", |s| {
+        texts(s) == ["ready"] && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    // Let idle_since exist, then keep the real executor busy between ticks.
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    let gate = fx
+        .scenario
+        .endpoint()
+        .enqueue_held(fx.main(), ModelReply::text("finished"));
+    fx.send("busy-idle-send", &session, "second").await;
+    let mut ui = fx.ui().await;
+    let start = tokio::time::Instant::now();
+    let mut version = 0;
+    while start.elapsed() < Duration::from_millis(2100)
+        || fx.scenario.endpoint().count(&fx.main()) < 2
+    {
+        assert!(start.elapsed() < Duration::from_secs(15));
+        let reply = ui
+            .command(&Command {
+                id: format!("idle-draft-{version}"),
+                device: "test".into(),
+                name: "session.draft.update".into(),
+                args: json!({"session":session,"text":format!("draft-{version}"),"attachments":[]}),
+                expect: json!({"draft_version":version}),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                reply,
+                CommandReply::Receipt {
+                    receipt: Receipt::Done { .. }
+                }
+            ),
+            "{reply:?}"
+        );
+        version += 1;
+    }
+    ui.close().await.unwrap();
+    gate.release();
+    // Read public history/list pages without subscribing: a subscription would
+    // itself reset idle_since and conceal a stale clock.
+    async fn alive(fx: &Fixture, session: &str) -> bool {
+        fx.ui()
+            .await
+            .get("sessions", Default::default())
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .find(|i| i.data["session"] == session)
+            .unwrap()
+            .data["process_alive"]
+            == true
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let page = fx
+            .ui()
+            .await
+            .get(&format!("session/{session}"), Default::default())
+            .await
+            .unwrap();
+        if page
+            .items
+            .iter()
+            .any(|i| i.kind == "text" && i.data["complete"] == true && i.data["text"] == "finished")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "missing final assistant: {:?}",
+            page.items
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let finished = tokio::time::Instant::now();
+    assert!(alive(&fx, &session).await);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let observed = fx.peek(&session).await;
+    assert!(
+        header(&observed)["op"].is_null(),
+        "reclaim began before a full idle interval: {}",
+        header(&observed)
+    );
+    assert!(alive(&fx, &session).await, "busy time counted as idle");
+    while alive(&fx, &session).await {
+        assert!(finished.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(finished.elapsed() >= Duration::from_millis(1400));
     fx.close();
 }

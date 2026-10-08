@@ -1130,101 +1130,118 @@ async fn unknown_background_work_remains_unreclaimable_at_every_commit_point() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_pending_automatic_title_does_not_hold_shell_invocations() {
-    let mut cfg = config();
-    cfg.auto_title = true;
-    let h = Harness::new(cfg.clone()).await;
-    h.adapter.script(ActKind::Title, Reply::Hold);
-    let session = accepted_session(
-        &h.create("title-hold", "足够长的首条提示会在首轮结束后自动生成标题")
-            .await,
-    );
-    h.wait(&session, "title pending", |s| {
-        header(s)["status"] == "active"
-            && s.items
-                .iter()
-                .any(|i| i.kind == "op" && i.data["kind"] == "title")
+async fn shell_during_pending_title_recovers_at_every_commit_point() {
+    let session = session_id_for("matrix-title-hold");
+    matrix(Scenario {
+        prepare: |h| {
+            let adapter = h.adapter.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while !adapter.received().iter().any(|(_, act)| {
+                    matches!(
+                        act,
+                        nd_backend::Act::Invoke {
+                            invocation: nd_backend::Invocation::Shell { .. },
+                            ..
+                        }
+                    )
+                }) {
+                    assert!(tokio::time::Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                adapter.release(Reply::Ok);
+            });
+        },
+        observe_ms: 0,
+        name: "pending-title+shell",
+        uploads: vec![],
+        auto_title: true,
+        script: vec![(ActKind::Title, Reply::Hold)],
+        idle_ms: 3_600_000,
+        steps: vec![
+            Step {
+                command: create(
+                    "matrix-title-hold",
+                    "足够长的首条提示会在首轮结束后自动生成标题",
+                ),
+                until: |s| {
+                    header(s)["status"] == "active"
+                        && s.items
+                            .iter()
+                            .any(|i| i.kind == "op" && i.data["kind"] == "title")
+                },
+            },
+            Step {
+                command: command(
+                    "matrix-title-shell",
+                    "session.shell",
+                    json!({"session":session,"command":"pwd"}),
+                ),
+                until: |s| invoke_state(s, "matrix-title-shell").as_deref() == Some("done"),
+            },
+        ],
+        check: |h, _| {
+            assert_eq!(applied_counts(h).get("invoke:shell:pwd"), Some(&1));
+            assert_eq!(applied_counts(h).get("generate-title"), Some(&1));
+            assert!(matches!(
+                receipt(h, "matrix-title-shell"),
+                nd_wire::Receipt::Done { .. }
+            ));
+        },
     })
     .await;
-    let h = h.restart(cfg).await;
-    h.wait(&session, "title recovered in flight", |s| {
-        header(s)["recovering"] == false
-    })
-    .await;
-    let command = command(
-        "shell-during-title",
-        "session.shell",
-        json!({"session":session,"command":"pwd"}),
-    );
-    let reply = tokio::time::timeout(Duration::from_millis(500), h.sessions.execute(&command))
-        .await
-        .expect("nonstructural title must not block the sending queue")
-        .unwrap();
-    assert!(matches!(
-        reply,
-        nd_wire::CommandReply::Receipt {
-            receipt: nd_wire::Receipt::Done { .. }
-        }
-    ));
-    assert!(h.adapter.release(Reply::Ok));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn busy_inputs_reset_idle_time_without_waiting_for_a_tick() {
-    for restart in [false, true] {
-        let mut cfg = config();
-        cfg.tick = Duration::from_millis(500);
-        cfg.idle_reclaim = Duration::from_millis(1500);
-        let h = Harness::new(cfg.clone()).await;
-        let session = accepted_session(&h.create("idle-reset", "first").await);
-        h.wait(&session, "active", |s| header(s)["status"] == "active")
-            .await;
-        tokio::time::sleep(Duration::from_millis(650)).await;
-        h.adapter.script(ActKind::Send, Reply::Hold);
-        h.send("busy", &session, "busy").await;
-        h.wait(&session, "pending", |s| {
-            prompt(s, "busy").is_some_and(|p| p.data["state"] == "pending")
-        })
-        .await;
-        let start = tokio::time::Instant::now();
-        let mut version = 0;
-        // 每个事务都可见忙碌状态；连续输入让执行器的空闲等待达不到 Tick。
-        while start.elapsed() < Duration::from_millis(2100) {
-            let mut c = command(
-                &format!("edit-{version}"),
-                "session.draft.update",
-                json!({"session":session,"text":format!("draft-{version}"),"attachments":[]}),
-            );
-            c.expect = json!({"draft_version":version});
-            h.sessions.execute(&c).await.unwrap();
-            version += 1;
-            tokio::time::sleep(Duration::from_millis(3)).await;
-        }
-        assert!(h.adapter.release(Reply::Ok));
-        h.wait(&session, "landed", |s| {
-            prompt(s, "busy").is_some_and(|p| p.data["state"] == "landed")
-        })
-        .await;
-        let h = if restart { h.restart(cfg).await } else { h };
-        let finished = tokio::time::Instant::now();
-        loop {
-            if h.adapter
-                .received()
-                .iter()
-                .any(|(_, act)| matches!(act, nd_backend::Act::End { .. }))
-            {
-                assert!(
-                    finished.elapsed() >= Duration::from_millis(1400),
-                    "busy interval was counted as idle: {:?}",
-                    finished.elapsed()
-                );
-                break;
-            }
-            assert!(
-                finished.elapsed() < Duration::from_secs(5),
-                "idle process was never reclaimed"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
+async fn pending_send_then_idle_reclaim_recovers_at_every_commit_point() {
+    let session = session_id_for("matrix-busy-idle");
+    matrix(Scenario {
+        prepare: |h| {
+            let adapter = h.adapter.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                // Release only the second Send, including when it was adopted
+                // across a crash before its outcome was committed.
+                while !adapter.received().iter().any(|(_, act)| {
+                    matches!(act,
+                    nd_backend::Act::Send { msg, .. } if msg.text == "busy")
+                }) {
+                    assert!(tokio::time::Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                adapter.release(Reply::Ok);
+            });
+        },
+        observe_ms: 0,
+        name: "pending-send+idle-reclaim",
+        uploads: vec![],
+        auto_title: false,
+        script: vec![(ActKind::Send, Reply::Ok), (ActKind::Send, Reply::Hold)],
+        idle_ms: 60,
+        steps: vec![
+            Step {
+                command: create("matrix-busy-idle", "first"),
+                until: |s| status_is(s, "active"),
+            },
+            Step {
+                command: command(
+                    "matrix-busy-send",
+                    "session.send",
+                    json!({"session":session,"text":"busy"}),
+                ),
+                until: |s| {
+                    prompt(s, "busy").is_some_and(|p| p.data["state"] == "landed")
+                        && header(s)["process"]["alive"] == false
+                        && header(s)["op"].is_null()
+                },
+            },
+        ],
+        check: |h, s| {
+            assert_eq!(applied_counts(h).get("send:busy"), Some(&1));
+            assert_eq!(header(s)["process"]["alive"], false);
+            assert!(h.adapter.live().is_empty());
+        },
+    })
+    .await;
 }
