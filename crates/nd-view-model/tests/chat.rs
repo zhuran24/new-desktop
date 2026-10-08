@@ -317,6 +317,12 @@ fn completed_creation_is_out_of_the_chat_and_partial_failure_stays_explained() {
     assert!(view.header.contains("部分完成"));
     assert_eq!(view.messages[0].title, "新建会话");
     assert_eq!(view.messages[0].text, "首条消息交付不明");
+    assert_eq!(
+        view.messages[0].blocks,
+        vec![nd_view_model::MessageBlock::Plain(
+            "首条消息交付不明".into()
+        )]
+    );
 }
 
 #[test]
