@@ -5,10 +5,24 @@
 ## 装配与恢复
 
 1. 用守护进程的 `Arc<Store>` 和实际 `CLAUDE_CONFIG_DIR` 创建一个 `Exclusivity::open`。每个数据库只装一个实例；会话执行器共享它。模块不能按界面开关卸下。
-2. 看守枚举的 `nd_runs::Found` 经 `observe_watchdog` 报入。参数 `generation` 是控制连接代次；进程编号跨重连不变，重新拉起必须用新编号。辅助进程也报 `Up`，没有持有记录就不报假 `Holding`。
+2. 看守报告方先调用 `nd_runs::Found::observation(generation, kind)` 核对进程身份，得到中立的 `nd_claims::Observed`，再交给 `Exclusivity::observe`。参数 `generation` 是控制连接代次；进程编号跨重连不变，重新拉起必须用新编号。辅助进程也报 `Up`，没有持有记录就不报假 `Holding`。
 3. 适配器从自己的流水/恢复快照报 `Holding`。流水来的观察用 `observe_in(tx, ...)`，与批次、游标及会话事实同事务。`Held::last_leaf` 只收自有流水确认的 UUID，`None` 表示本批没有新的叶子证据。尚未确认的预留不因空 `Holding` 释放，须用明确的 `NeverOpened`/`Gone` 证据。
 4. 看守枚举完成、各适配器的身份/持有集合恢复完成后，协调者报 `Recovered`。不认识版本或身份不明的进程保留责任，不能为了完成恢复伪造空集合。
 5. 等 `recovery() == Ready` 再恢复操作。`Recovered` 只到 `IdentitiesKnown`；随后完整注册表扫描才到 `Ready`。可在事务外调用 `refresh()` 立即扫描，后台也会按默认 2 秒补扫。`watch()` 给出提交后失效通知，消费者醒来后重读公开查询；通知可以合并，不携带唯一的业务事实。
+
+看守报告方的装配调用：
+
+```rust,no_run
+fn report(
+    claims: &nd_claims::Exclusivity,
+    found: &nd_runs::Found,
+    generation: u64,
+) -> nd_store::Result<()> {
+    claims.observe(found.observation(generation, nd_claims::BackendKind::Claude))
+}
+```
+
+`nd-runs` 依赖 `nd-claims` 来构造中立观察；独占登记不依赖看守托管，也不解释 `Found`。
 
 创建实例会把持久租约标成身份待核，重置扫描阶段；不会按未报告、Drop、超时释放租约。退出登记实例只停止自己的扫描线程，不发任何进程停止命令。
 
@@ -28,7 +42,7 @@
 
 同一 `cause` 不能换动作，包括等待中的原因。已经授予的 `Open` 重放返回历史授予，不代表可以重复执行原生创建；创建执行去重由后端票与引擎负责。`Write` 则始终重判障碍。
 
-租约只因已核实的 `Gone`、较新 `Holding` 不再持有已确认的绑定、或适配器核实的 `NeverOpened` 离开。`Holding` 的控制代次必须匹配，流水位置严格递增。`IdentityMismatch` 只暂停写入；重复 PID、错误启动 ticks、错误 boot id 不把原身份换掉。`observe_watchdog` 对 `Gone` 额外核对 `/proc`，活着或观察失败时不能释放。直接 `observe_in(Gone)` 的调用方须已持有同等强度的身份/退出证据。
+租约只因已核实的 `Gone`、较新 `Holding` 不再持有已确认的绑定、或适配器核实的 `NeverOpened` 离开。`Holding` 的控制代次必须匹配，流水位置严格递增。`IdentityMismatch` 只暂停写入；重复 PID、错误启动 ticks、错误 boot id 不把原身份换掉。`nd-runs` 的 `Found::observation()` 负责 `/proc` 身份核对：`Up` 只有身份匹配才报入；`Gone(Exited/ProcGone)` 只有核实原身份已不在时才转成退出观察；仍活着或无法核对时转成 `IdentityMismatch`。`NeverLaunched` 仅在没有进程身份时成立。`nd-claims` 只接收中立观察并核对持久登记；直接调用 `observe(Gone)` 或 `observe_in(Gone)` 的报告方须已持有同等强度的身份/退出证据。
 
 ## 外部文件与命令
 
