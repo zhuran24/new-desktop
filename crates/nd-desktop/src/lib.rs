@@ -5,6 +5,7 @@ pub mod composer;
 mod controls;
 mod drafts;
 mod history;
+mod keyboard_repeat;
 mod scenario_view;
 mod settings;
 mod themes;

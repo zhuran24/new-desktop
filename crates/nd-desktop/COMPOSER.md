@@ -1,6 +1,6 @@
 # 桌面输入框
 
-状态：输入框状态机、GPUI 控件与离线验收入口已实现。真实豆包/Rime、候选框位置和性能由 owner 在日常桌面验收；合成事件不能替代它们。GPUI 和 Kit 沿用工作区锁定版本。
+状态：输入框状态机、GPUI 控件与离线验收入口已实现。日常桌面的豆包/Rime、候选框位置和性能由 owner 验收；私有显示里的真实 Rime 回归不能替代日常桌面和实体键盘验收。GPUI 和 Kit 沿用工作区锁定版本。
 
 ## 接入
 
@@ -11,7 +11,7 @@
 - 鼠标发送和会话导航在按下时调用 `begin_pointer_click`，点击完成时先检查 `finish_pointer_click`。守卫锁存最近一次 Composer 渲染中的组词状态，避免合成器先提交预编辑、再交付鼠标事件时放行同一次点击；被拦截时发出 `CompositionClickBlocked`，外壳提示先完成组词。KWin 6.7.5 自己提交拼音、重置候选的行为仍存在，范围与证据见 [#66 验证记录](../../docs/verification/issue-66-ime-clicks.md)。
 - `editor()` 提供真正的 `TextareaState`，供平台输入、附件粘贴、草稿恢复、选择区操作。Kit `set_selected_range` 的单位为 UTF-8 字节；`EntityInputHandler` 的 range 为 UTF-16，不能混用。
 - 提交动作保留正文，不代表后端受理。外壳先等草稿保存，再由守护进程在发送事务里按版本和正文清稿；界面只应用明确受理的对应修订结果，新编辑或正在组词时不清空。交付不明保留正文，不自动重投。已创建会话的草稿经 `session.draft.update` 持久化，版本冲突原文另存，详见 [桌面说明](README.md)；组词只留在编辑器。
-- Esc 取消组词时删除 marked range、结束标记，并消费按键；不会向会话再发一个 Esc。非组词时发出中立 `Escape`，外壳按面板、活动回合、空闲双 Esc 分派；它经 nd-wire 发停止命令。长按同一个键只处理一次，释放后才处理下一次。
+- Esc 取消组词时删除 marked range、结束标记，并消费按键；不会向会话再发一个 Esc。非组词时发出中立 `Escape`，外壳按面板、活动回合、空闲双 Esc 分派；它经 nd-wire 发停止命令。Fcitx 把重复改成松开/按下时，Composer 用系统 `wl_keyboard.repeat_info` 的节奏保护取消组词和长按；取消后有明显停顿才恢复新 Esc。普通双 Esc 同时检查松开间隔，规则和歧义边界见 [#67 验证](../../docs/verification/bug-67.md)。
 - 只对所属窗口里聚焦的输入框安装前置按键保护。订阅由实体持有，实体释放即撤回。父容器只接未被输入框消费的 Esc，不能绕过组词守卫或另装 Enter 发送器。
 - `set_theme` 更新输入框的应用主题；外壳 `set_theme` 同时更新 Kit/Base 的字体、光标和选择区等颜色。视图不读 CLI 数据或解析 stdout。
 
@@ -33,6 +33,8 @@ python crates/nd-desktop/tests/native_smoke.py --composer \
 纯函数测试验证键位决策；GPUI 测试经真实控件、平台输入 trait 和合成按键/鼠标验证组词守卫、UTF-16 范围、选择区换行、按钮保护与长按。原生冒烟在断网、临时 HOME/XDG、私有 D-Bus/虚拟 KWin 和独立限额 slice 中打开桌面与离线窗口，保存截图并验证实际 Wayland 缓冲提交。它们不声称豆包/Rime、候选框、上屏延迟或 CPU 已达标。
 
 `scripts/test-scenarios.sh` 还运行 `composing_clicks_do_not_send_or_navigate_with_real_rime`：真实 fcitx5/Rime 在私有 KWin 中处理拼音与确认键，私有 fake-input 协议驱动鼠标和键盘；断言三处点击不误发、不导航，正文、编辑焦点和提示保持，重新完成组词后正常执行。场景不创建 uinput 设备，不连接日常 `wayland-0`。这个回归没有证明被 KWin 重置的候选可以保留。
+
+#67 的自动回归通过独立 EIS 键盘进入私有 KWin、真实 Fcitx/Rime 和产品 Composer，验证取消组词后的长按、普通长按、快速及 500ms 内不同间隔的双 Esc、活动回合和回退菜单。套件还覆盖不同重复设置、运行中设置更新，以及关闭重复；具体证据和执行命令见 [#67 验证](../../docs/verification/bug-67.md)。
 
 ## owner 真机入口
 

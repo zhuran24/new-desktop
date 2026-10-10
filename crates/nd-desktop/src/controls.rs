@@ -309,7 +309,7 @@ impl Desktop {
                     }
                     let state = this.composer.update(cx,|c,cx|c.snapshot(window,cx));
                     let title_composing = this.title_editor.update(cx,|input,cx| input.marked_text_range(window,cx).is_some());
-                    let observation = json!({"title_composing":title_composing,"action":last_action,"text":state.text,"panel":this.state.active_panel,"settings_open":this.settings_open,"intent":this.send_intent,"warning":this.warning});
+                    let observation = json!({"composing":state.composing,"focused":state.focused,"title_composing":title_composing,"action":last_action,"text":state.text,"panel":this.state.active_panel,"settings_open":this.settings_open,"intent":this.send_intent,"warning":this.warning});
                     if observation != last_observation { println!("{}",json!({"native_controls":observation})); last_observation = observation; }
                 }).is_err() { break; }
             }

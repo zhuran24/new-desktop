@@ -1,10 +1,19 @@
 //! 输入法与编辑交给固定版 Kit，输入意图只从 nd-composer 产生。
+use crate::keyboard_repeat::{KeyboardRepeat, RepeatTiming};
 use crate::scenario_view::ScenarioBounds;
 use gpui_kit::component::input::{InputEvent as KitEvent, Textarea, TextareaState};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use nd_composer::{ComposerAction, ComposerState, InputEvent, Key, Modifiers, step};
 use nd_view_model::Theme;
+use std::time::{Duration, Instant};
+
+struct EscapeBurst {
+    last: Instant,
+    timing: RepeatTiming,
+    repeating: bool,
+    cancelled: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposerEvent {
@@ -27,6 +36,10 @@ pub struct Composer {
     pressed: [bool; 2],
     painted_composing: bool,
     pointer_composing: bool,
+    escape_released_at: Option<Instant>,
+    keyboard_repeat: KeyboardRepeat,
+    uncommitted: Option<String>,
+    escape_burst: Option<EscapeBurst>,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -43,6 +56,9 @@ impl Composer {
             if matches!(event, KitEvent::Change | KitEvent::Focus | KitEvent::Blur) {
                 if matches!(event, KitEvent::Blur) {
                     this.pressed = [false; 2];
+                    this.escape_released_at = None;
+                    this.uncommitted = None;
+                    this.escape_burst = None;
                 }
                 let state = this.snapshot(window, cx);
                 // 标记变化会重画 Composer；平台可能在同一输入批次内先提交拼音，
@@ -54,20 +70,30 @@ impl Composer {
             }
         });
         let weak = cx.entity().downgrade();
+        // Kit 的 preedit 更新只有 notify，没有 Change，必须观察编辑器本身。
+        let preedit = cx.observe_in(&input, window, |this: &mut Self, _, window, cx| {
+            this.observe_preedit(window, cx);
+        });
         let window_id = window.window_handle().window_id();
         let keys = cx.intercept_keystrokes(move |event, window, cx| {
             if window.window_handle().window_id() != window_id {
                 return;
             }
-            let key = match event.keystroke.key.as_str() {
-                "enter" => Key::Enter,
-                "escape" => Key::Escape,
-                _ => return,
-            };
             let _ = weak.update(cx, |this, cx| {
                 if !this.input.read(cx).focus_handle(cx).is_focused(window) {
                     return;
                 }
+                let key = match event.keystroke.key.as_str() {
+                    "enter" => {
+                        this.escape_burst = None;
+                        Key::Enter
+                    }
+                    "escape" => Key::Escape,
+                    _ => {
+                        this.escape_burst = None;
+                        return;
+                    }
+                };
                 // 必须在 Kit 的 Enter/Escape 动作之前取 marked range。
                 // 消费此键，避免 Kit 插入第二个换行或向会话再传播一次 Esc。
                 cx.stop_propagation();
@@ -100,7 +126,11 @@ impl Composer {
             pressed: [false; 2],
             painted_composing: false,
             pointer_composing: false,
-            _subscriptions: vec![changed, keys],
+            escape_released_at: None,
+            keyboard_repeat: KeyboardRepeat::read(),
+            uncommitted: None,
+            escape_burst: None,
+            _subscriptions: vec![changed, preedit, keys],
         }
     }
 
@@ -233,6 +263,42 @@ impl Composer {
     }
 
     fn dispatch(&mut self, event: InputEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.observe_preedit(window, cx);
+        if matches!(
+            event,
+            InputEvent::KeyDown {
+                key: Key::Escape,
+                ..
+            }
+        ) && let Some(burst) = &mut self.escape_burst
+        {
+            // 首次转发在 repeat delay 后；后续间隔是 1/rate。
+            // 允许一个周期的调度迟到/丢帧；不是全局 Esc 防抖。
+            let gap = burst.timing.interval * 2;
+            let window = if burst.repeating {
+                gap
+            } else {
+                burst.timing.delay + gap
+            };
+            // 已分派过首个 Esc 时，延迟开始前的再按仍算新的一次。
+            let earliest = if burst.cancelled || burst.repeating {
+                Duration::ZERO
+            } else {
+                burst.timing.delay.saturating_sub(gap)
+            };
+            let elapsed = burst.last.elapsed();
+            // Fcitx 的合成松开/按下紧邻；正常双按中间有真实的松开间隔。
+            // 普通 Esc 还要求二者在半个重复周期内，避免短 repeat delay 吞掉双 Esc。
+            let synthetic_release = self
+                .escape_released_at
+                .is_some_and(|up| up.elapsed() <= burst.timing.interval / 2);
+            if (burst.cancelled || synthetic_release) && elapsed >= earliest && elapsed <= window {
+                burst.last = Instant::now();
+                burst.repeating = true;
+                return;
+            }
+            self.escape_burst = None;
+        }
         let (_, actions) = step(self.snapshot(window, cx), event);
         for action in actions {
             match action {
@@ -245,8 +311,55 @@ impl Composer {
                         input.unmark_text(window, cx);
                     }
                 }),
-                action => cx.emit(ComposerEvent::Action(action)),
+                action => {
+                    if action == ComposerAction::Escape {
+                        self.escape_burst =
+                            self.keyboard_repeat.timing().map(|timing| EscapeBurst {
+                                last: Instant::now(),
+                                timing,
+                                repeating: false,
+                                cancelled: false,
+                            });
+                    }
+                    cx.emit(ComposerEvent::Action(action));
+                }
             }
+        }
+    }
+
+    fn observe_preedit(&mut self, window: &mut Window, cx: &mut App) {
+        let (text, marked, focused) = self.input.update(cx, |input, cx| {
+            (
+                input.value().to_string(),
+                input.marked_text_range(window, cx),
+                input.focus_handle(cx).is_focused(window),
+            )
+        });
+        if !focused {
+            self.uncommitted = None;
+            self.escape_burst = None;
+        } else if let Some(marked) = marked {
+            // marked range 是 UTF-16，编辑缓冲是 UTF-8；保留预编辑两侧的正文。
+            let plain: Vec<_> = text.encode_utf16().collect();
+            self.uncommitted =
+                String::from_utf16(&plain[..marked.start])
+                    .ok()
+                    .and_then(|mut left| {
+                        left.push_str(&String::from_utf16(&plain[marked.end..]).ok()?);
+                        Some(left)
+                    });
+            self.escape_burst = None;
+        } else if let Some(plain) = self.uncommitted.take()
+            && plain == text
+            && !self.pressed[key_index(Key::Escape)]
+        {
+            // 输入法消费了取消键：应用只见空 preedit，未收到首次 Esc。
+            self.escape_burst = self.keyboard_repeat.timing().map(|timing| EscapeBurst {
+                last: Instant::now(),
+                timing,
+                repeating: false,
+                cancelled: true,
+            });
         }
     }
 }
@@ -283,7 +396,10 @@ impl Render for Composer {
             .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| {
                 match event.keystroke.key.as_str() {
                     "enter" => this.pressed[key_index(Key::Enter)] = false,
-                    "escape" => this.pressed[key_index(Key::Escape)] = false,
+                    "escape" => {
+                        this.pressed[key_index(Key::Escape)] = false;
+                        this.escape_released_at = Some(Instant::now());
+                    }
                     _ => {}
                 }
             }))

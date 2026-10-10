@@ -5,6 +5,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 branch=$(git branch --show-current)
 case "$branch" in
   ticket/*) build_name="ticket-${branch#ticket/}" ;;
+  bug/*) build_name="bug-${branch#bug/}" ;;
   review/fixes) build_name=review-fixes ;;
   *) build_name=v1 ;;
 esac
@@ -20,3 +21,9 @@ export ND_TEST_WATCHDOG="$CARGO_TARGET_DIR/debug/nd-watchdog"
 export ND_TEST_DAEMON="$CARGO_TARGET_DIR/debug/nd-daemon"
 export ND_TEST_DESKTOP="$CARGO_TARGET_DIR/debug/nd-desktop"
 limited cargo test -p nd-daemon -p nd-testkit -p nd-claude --features nd-daemon/scenarios,nd-testkit/scenarios,nd-claude/scenarios --locked "$@"
+# 真 Fcitx/Rime + 独立 EIS 键盘；系统设置经私有 KWin repeat_info 进入产品。
+escape_output="${ND67_LAB_OUTPUT:-$(mktemp -d /mnt/wd_external/nd-build/tmp/native-escape-XXXXXX)}"
+python -B crates/nd-desktop/tests/native_escape.py --bin-dir "$CARGO_TARGET_DIR/debug" --output "$escape_output/default" --reconfigure
+python -B crates/nd-desktop/tests/native_escape.py --bin-dir "$CARGO_TARGET_DIR/debug" --output "$escape_output/fast" --repeat-rate 40 --repeat-delay 250
+python -B crates/nd-desktop/tests/native_escape.py --bin-dir "$CARGO_TARGET_DIR/debug" --output "$escape_output/slow" --repeat-rate 12 --repeat-delay 900
+python -B crates/nd-desktop/tests/native_escape.py --bin-dir "$CARGO_TARGET_DIR/debug" --output "$escape_output/disabled" --repeat-rate 0 --repeat-delay 600

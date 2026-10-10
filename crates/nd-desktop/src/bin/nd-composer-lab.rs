@@ -14,6 +14,7 @@ struct Lab {
     messages: Vec<String>,
     escapes: usize,
     _events: Subscription,
+    _editor_observer: Subscription,
     first_render: bool,
 }
 impl Lab {
@@ -48,22 +49,34 @@ impl Lab {
                 cx.notify();
             },
         );
+        let editor = composer.read(cx).editor().clone();
+        let editor_observer = cx.observe(&editor, |_, _, cx| cx.notify());
         Self {
             composer,
             theme,
             messages: vec![],
             escapes: 0,
             _events: events,
+            _editor_observer: editor_observer,
             first_render: true,
         }
     }
 }
 impl Render for Lab {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.first_render {
             println!("{}", serde_json::json!({"composer_lab_ready": true}));
             self.first_render = false;
         }
+        // 仅 scenarios 的离线实验窗：报告与可见计数、编辑缓冲相同的结果，不注入输入。
+        let state = self.composer.update(cx, |c, cx| c.snapshot(window, cx));
+        println!(
+            "{}",
+            serde_json::json!({"composer_lab_state": {
+                "text": state.text, "composing": state.composing,
+                "escapes": self.escapes, "submissions": self.messages.len()
+            }})
+        );
         let t = &self.theme;
         div()
             .size_full()
