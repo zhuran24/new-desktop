@@ -1256,7 +1256,11 @@ impl Fixture {
     }
     async fn with_tick(name: &str, idle_reclaim_ms: u64, tick_ms: u64, extra_env: &str) -> Self {
         let auto_title = name.starts_with("nd21-title-ai");
-        let poll_timeout_ms = if name == "nd20-thousand" { 20 } else { 5000 };
+        let poll_timeout_ms = if matches!(name, "nd20-thousand" | "nd68-idle-cpu") {
+            20
+        } else {
+            5000
+        };
         let config = format!(
             r#"
 [claude]
@@ -1300,6 +1304,9 @@ tick_ms = {tick_ms}
         options.watchdog = Some(std::env::var_os("ND_TEST_WATCHDOG").unwrap().into());
         options.config = config;
         options.timeout = Duration::from_secs(20);
+        if name == "nd68-idle-cpu" {
+            options.max_lifetime = Duration::from_secs(900);
+        }
         let scenario = Scenario::start(options).await.unwrap();
         let mods = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mods");
         for module in ["new-desktop", "new-desktop-actions"] {
@@ -4496,6 +4503,83 @@ async fn native_navigation_jumps_to_a_round_via_history_page() {
     )
     .await;
     assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+    fx.close();
+}
+
+/// CPU 依赖 release 构建与真实 GPU；单独运行，不能用 debug 的数字作性能验收。
+#[tokio::test]
+#[ignore = "requires plain release nd-desktop, private KWin and real Rime; three 60-second samples"]
+async fn focused_product_idle_cpu_stays_below_one_percent_with_real_rime() {
+    let fx = Fixture::start("nd68-idle-cpu", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("空闲 CPU 验收回答"));
+    let session = fx
+        .create("idle-cpu-create", "/sandbox/project", "空闲 CPU 验收提示")
+        .await;
+    fx.wait(&session, "completed round", |s| {
+        has_header(s, |h| h["process"]["turn_running"] == false) && !texts(s).is_empty()
+    })
+    .await;
+    // Fill the public history page (60 bodies) without fabricating database rows.
+    let rounds: usize = std::env::var("ND_NATIVE_CPU_ROUNDS")
+        .unwrap_or("40".into())
+        .parse()
+        .unwrap();
+    assert!(rounds > 0);
+    for round in 2..=rounds {
+        fx.scenario.endpoint().enqueue(
+            fx.main(),
+            ModelReply::text(format!("第 {round} 轮空闲 CPU 验收回答")),
+        );
+        fx.send(
+            &format!("idle-cpu-{round}"),
+            &session,
+            &format!("第 {round} 轮提示"),
+        )
+        .await;
+        fx.wait(&session, "completed history round", |s| {
+            s.items.iter().any(|i| {
+                i.kind == "navigation"
+                    && i.data["rounds"]
+                        .as_array()
+                        .is_some_and(|r| r.len() == round && r[round - 1]["complete"] == true)
+            })
+        })
+        .await;
+    }
+    let output = std::env::var_os("ND_NATIVE_CPU_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-idle-cpu"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_idle_cpu.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("provide plain release nd-desktop"))
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .args([
+            "--seconds",
+            &std::env::var("ND_NATIVE_CPU_SECONDS").unwrap_or("60".into()),
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let verdict: Value =
+        serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap();
+    assert_eq!(verdict["pass"], true);
+    assert_eq!(verdict["committed_text"], "你好你好");
+    assert_eq!(fx.scenario.endpoint().requests().len(), rounds);
     fx.close();
 }
 
