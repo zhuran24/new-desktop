@@ -75,6 +75,7 @@ pub struct Desktop {
     drafts: std::collections::BTreeMap<Option<String>, nd_view_model::Draft>,
     subscriptions: Vec<Subscription>,
     composer: Entity<composer::Composer>,
+    conversation_pane: Entity<chat::ConversationPane>,
     state: ViewState,
     theme: Theme,
     theme_catalog: nd_view_model::ThemeCatalog,
@@ -232,6 +233,10 @@ impl Desktop {
             drafts: Default::default(),
             subscriptions: vec![],
             composer,
+            conversation_pane: {
+                let desktop = cx.entity();
+                cx.new(|cx| chat::ConversationPane::new(&desktop, cx))
+            },
             state,
             theme,
             theme_catalog,
@@ -439,7 +444,6 @@ impl Render for Desktop {
             _ => {}
         }
         let chat_sidebar = self.chat_sidebar(cx);
-        let chat_content = self.chat_content(window, cx);
         let chat_header = self.chat_header(cx);
         let controls = self.chat_controls(cx);
         let navigation = self.navigation(cx);
@@ -518,18 +522,13 @@ impl Render for Desktop {
                                     .flex_1()
                                     .min_h_0()
                                     .child(
-                                        div()
-                                            .id("content")
-                                            .track_scroll(&self.scroll)
-                                            .flex_1()
-                                            .min_w_0()
-                                            .min_h_0()
-                                            .overflow_y_scroll()
-                                            .flex()
-                                            .flex_col()
-                                            .p(px(theme.spacing.large))
-                                            .gap(px(theme.spacing.medium))
-                                            .child(chat_content),
+                                        self.conversation_pane.clone().cached(
+                                            StyleRefinement::default()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .min_h_0()
+                                                .h_full(),
+                                        ),
                                     )
                                     .child(navigation)
                                     .when(true, |d| observed(d, "conversation")),

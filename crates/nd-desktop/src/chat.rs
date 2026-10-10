@@ -13,6 +13,45 @@ use nd_view_model::{ComposerInput, Slot, accepted, composer_input, conversation,
 use nd_wire::{Command, CommandReply, Receipt};
 use serde_json::json;
 
+/// 正文独立缓存：编辑区的光标通知不重建历史，宿主事实变化仍重绘。
+pub(crate) struct ConversationPane {
+    desktop: WeakEntity<Desktop>,
+    _desktop: Subscription,
+}
+
+impl ConversationPane {
+    pub(crate) fn new(desktop: &Entity<Desktop>, cx: &mut Context<Self>) -> Self {
+        Self {
+            desktop: desktop.downgrade(),
+            _desktop: cx.observe(desktop, |_, _, cx| cx.notify()),
+        }
+    }
+}
+
+impl Render for ConversationPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.desktop
+            .update(cx, |desktop, cx| {
+                let content = desktop.chat_content(window, cx);
+                let theme = &desktop.theme;
+                div()
+                    .id("content")
+                    .track_scroll(&desktop.scroll)
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .p(px(theme.spacing.large))
+                    .gap(px(theme.spacing.medium))
+                    .child(content)
+                    .into_any_element()
+            })
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
 impl Desktop {
     /// 隔离真窗口场景：只驱动产品输入与动作，不注入副本或后端事实。
     #[cfg(feature = "scenarios")]
