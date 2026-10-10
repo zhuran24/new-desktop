@@ -1256,7 +1256,11 @@ impl Fixture {
     }
     async fn with_tick(name: &str, idle_reclaim_ms: u64, tick_ms: u64, extra_env: &str) -> Self {
         let auto_title = name.starts_with("nd21-title-ai");
-        let poll_timeout_ms = if name == "nd20-thousand" { 20 } else { 5000 };
+        let poll_timeout_ms = if matches!(name, "nd20-thousand" | "nd68-idle-cpu") {
+            20
+        } else {
+            5000
+        };
         let config = format!(
             r#"
 [claude]
@@ -1300,6 +1304,9 @@ tick_ms = {tick_ms}
         options.watchdog = Some(std::env::var_os("ND_TEST_WATCHDOG").unwrap().into());
         options.config = config;
         options.timeout = Duration::from_secs(20);
+        if name == "nd68-idle-cpu" {
+            options.max_lifetime = Duration::from_secs(900);
+        }
         let scenario = Scenario::start(options).await.unwrap();
         let mods = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mods");
         for module in ["new-desktop", "new-desktop-actions"] {
@@ -1948,6 +1955,79 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
     assert!(request_text(&requests[1].body).contains("请写代码"));
     reopened.close().await;
     drop(client);
+    fx.close();
+}
+
+#[tokio::test]
+async fn native_session_header_stays_visible_with_a_running_turn_and_saved_draft() {
+    let fx = Fixture::start("nd69-native-header", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("短回答"));
+    let session = fx
+        .create("header-create", "/sandbox/project", "会话头验收")
+        .await;
+    fx.wait(&session, "first turn finished", |s| {
+        !texts(s).is_empty() && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let held = endpoint.enqueue_held(fx.main(), ModelReply::text("held turn"));
+    fx.send("header-running", &session, "保持回合进行中").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.wait(&session, "running turn", |s| {
+        header(s)["process"]["turn_running"] == true
+    })
+    .await;
+    // 公开草稿版本冲突生成另存稿，与真实双窗口编辑走同一条路径。
+    fx.ui()
+        .await
+        .command(&edit_draft(
+            "header-saved",
+            "second-window",
+            &session,
+            99,
+            "另存的草稿正文",
+        ))
+        .await
+        .unwrap();
+    fx.wait(&session, "saved draft", |s| {
+        draft(s)["saved"].as_array().is_some_and(|v| v.len() == 1)
+    })
+    .await;
+    let output = std::env::var_os("ND69_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-header"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_header.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"))
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot = fx.peek(&session).await;
+    assert_eq!(header(&snapshot)["process"]["turn_running"], true);
+    assert_eq!(
+        snapshot.items.iter().filter(|i| i.kind == "prompt").count(),
+        2,
+        "Rime commit must not send another prompt"
+    );
+    assert_eq!(draft(&snapshot)["saved"].as_array().unwrap().len(), 1);
+    held.release();
     fx.close();
 }
 
@@ -3569,6 +3649,72 @@ async fn desktop_upload_reads_file_bytes_and_rejects_unsupported_or_missing_file
 }
 
 #[tokio::test]
+async fn native_wayland_drag_adds_chinese_space_named_files_and_images_to_the_durable_draft() {
+    let fx = Fixture::start("nd70-native-drag", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("拖放验收就绪"));
+    let session = fx
+        .create("drag-create", "/sandbox/project", "拖放验收")
+        .await;
+    fx.wait(&session, "first turn finished", |s| {
+        !texts(s).is_empty() && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let output = std::env::var_os("ND70_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-drag"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_drag.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"))
+        .arg("--ndctl")
+        .arg(
+            std::path::PathBuf::from(std::env::var_os("ND_TEST_DAEMON").unwrap())
+                .with_file_name("ndctl"),
+        )
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot = fx.peek(&session).await;
+    assert_eq!(draft(&snapshot)["text"], "");
+    let attachments = draft(&snapshot)["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 2);
+    let file: nd_wire::Attachment = serde_json::from_value(attachments[0].clone()).unwrap();
+    let image: nd_wire::Attachment = serde_json::from_value(attachments[1].clone()).unwrap();
+    let ui = fx.ui().await;
+    assert_eq!(file.name, "拖入 中文 和空格.txt");
+    assert_eq!(file.media_type, "text/plain");
+    assert_eq!(
+        ui.get_blob(&file.blob).await.unwrap(),
+        "真实 Wayland 拖放正文".as_bytes()
+    );
+    assert_eq!(image.name, "拖入 图片 和空格.png");
+    assert_eq!(image.media_type, "image/png");
+    let image = ui.get_blob(&image.blob).await.unwrap();
+    assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(
+        snapshot.items.iter().filter(|i| i.kind == "prompt").count(),
+        1,
+        "Rime commit and file drops must not submit the draft"
+    );
+    fx.close();
+}
+
+#[tokio::test]
 async fn native_attachment_paste_drop_and_diff_rendering() {
     let fx = Fixture::start("nd17-window", 3_600_000).await;
     let answer = "说明\n```rust\nfn main() {}\n```\n```diff\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-旧内容\n+新内容🦀\n```\n结束";
@@ -4496,6 +4642,83 @@ async fn native_navigation_jumps_to_a_round_via_history_page() {
     )
     .await;
     assert_eq!(fx.scenario.endpoint().requests().len(), 1);
+    fx.close();
+}
+
+/// CPU 依赖 release 构建与真实 GPU；单独运行，不能用 debug 的数字作性能验收。
+#[tokio::test]
+#[ignore = "requires plain release nd-desktop, private KWin and real Rime; three 60-second samples"]
+async fn focused_product_idle_cpu_stays_below_one_percent_with_real_rime() {
+    let fx = Fixture::start("nd68-idle-cpu", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("空闲 CPU 验收回答"));
+    let session = fx
+        .create("idle-cpu-create", "/sandbox/project", "空闲 CPU 验收提示")
+        .await;
+    fx.wait(&session, "completed round", |s| {
+        has_header(s, |h| h["process"]["turn_running"] == false) && !texts(s).is_empty()
+    })
+    .await;
+    // Fill the public history page (60 bodies) without fabricating database rows.
+    let rounds: usize = std::env::var("ND_NATIVE_CPU_ROUNDS")
+        .unwrap_or("40".into())
+        .parse()
+        .unwrap();
+    assert!(rounds > 0);
+    for round in 2..=rounds {
+        fx.scenario.endpoint().enqueue(
+            fx.main(),
+            ModelReply::text(format!("第 {round} 轮空闲 CPU 验收回答")),
+        );
+        fx.send(
+            &format!("idle-cpu-{round}"),
+            &session,
+            &format!("第 {round} 轮提示"),
+        )
+        .await;
+        fx.wait(&session, "completed history round", |s| {
+            s.items.iter().any(|i| {
+                i.kind == "navigation"
+                    && i.data["rounds"]
+                        .as_array()
+                        .is_some_and(|r| r.len() == round && r[round - 1]["complete"] == true)
+            })
+        })
+        .await;
+    }
+    let output = std::env::var_os("ND_NATIVE_CPU_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-idle-cpu"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_idle_cpu.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("provide plain release nd-desktop"))
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .args([
+            "--seconds",
+            &std::env::var("ND_NATIVE_CPU_SECONDS").unwrap_or("60".into()),
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let verdict: Value =
+        serde_json::from_slice(&std::fs::read(output.join("result.json")).unwrap()).unwrap();
+    assert_eq!(verdict["pass"], true);
+    assert_eq!(verdict["committed_text"], "你好你好");
+    assert_eq!(fx.scenario.endpoint().requests().len(), rounds);
     fx.close();
 }
 

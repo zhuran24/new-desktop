@@ -5,6 +5,60 @@ use nd_wire::Attachment;
 use std::sync::Arc;
 
 impl Desktop {
+    pub(crate) fn attachment_drop_target(
+        &self,
+        element: Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let weak = cx.entity().downgrade();
+        element
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    this.external_drop_paths = Some(event.drag(cx).clone());
+                }),
+            )
+            .on_file_drop_exit(cx.listener(|this, _, _, _| {
+                this.external_drop_paths = None;
+            }))
+            .relative()
+            .child(
+                canvas(
+                    |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    move |_, hitbox, window, _| {
+                        let weak = weak.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                            if !phase.capture() || event.button != MouseButton::Left {
+                                return;
+                            }
+                            // GPUI 0.3.7 的 FileDrop 不更新输入模式。普通 on_drop 用
+                            // is_hovered，键盘输入后会漏掉已完成的拖放；按实际落点命中。
+                            let inside = hitbox.is_hovered_at(event.position, window);
+                            let active = cx.has_active_drag();
+                            let _ = weak.update(cx, |this, cx| {
+                                let paths = this.external_drop_paths.take();
+                                if inside
+                                    && active
+                                    && let Some(paths) = paths
+                                {
+                                    cx.stop_active_drag(window);
+                                    this.upload_attachments(
+                                        paths.0.into_iter().map(AttachmentSource::Path).collect(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+    }
+
     pub(crate) fn upload_attachments(
         &mut self,
         sources: Vec<AttachmentSource>,

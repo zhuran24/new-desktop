@@ -61,7 +61,9 @@ bash scripts/test-scenarios.sh
 
 `draft_native_windows_save_reopen_follow_and_recover` 验证真实输入、SIGKILL 后恢复、双窗口同步、载入落败稿和发送时清稿。`ND_NATIVE_DRAFT_OUTPUT` 可保留其截图和清理证据，接口及验证详见 [#16 记录](../../docs/verification/ticket-16.md)。
 
-`scenarios` 下的 stdout 副本/编辑器观测、`--scenario-create`、`--scenario-draft` 和 `--scenario-theme-controls` 仅用于上述隔离测试；生产构建没有自动输入入口、不打印对话。原生冒烟不能证明豆包/Rime、真实上屏性能、静止 CPU 或真模型服务。
+`native_session_header_stays_visible_with_a_running_turn_and_saved_draft` 在 1050×850 和 800×600 的产品窗中，用私有 KWin 的键盘、鼠标及 EIS 滚轮，经真 fcitx5/Rime 输入中文，核验会话头可见、设置入口可点，以及对话滚动不移动会话头。可设 `ND69_NATIVE_OUTPUT` 保留截图、控件几何和清理证据。该场景另需 fcitx5-rime、系统 Luna Pinyin 数据、C 编译器、wayland-scanner 和 libei 开发文件。参见 [#69 验证记录](../../docs/verification/bug-69.md)。
+
+`scenarios` 下的 stdout 副本/编辑器/控件几何观测、`--scenario-create`、`--scenario-draft` 和 `--scenario-theme-controls` 仅用于隔离测试；生产构建没有自动输入入口、不打印对话。上述内部驱动冒烟不证明真实输入法行为；#69 场景覆盖私有 KWin 中的 Rime 路径。日常桌面的豆包/Rime、真实上屏性能、静止 CPU 和真模型服务仍需分别验收。
 ## 附件与 diff
 
 粘贴图片、复制文件后粘贴，或拖到输入区，上传完成后可发送。支持 PNG/JPEG/GIF/WebP、PDF、UTF-8 文本，每个最多 5 MiB、每条最多 8 个且总计不超过 16 MiB。只有附件也能发送。失败保留草稿；移除只影响当前草稿。发送后的图片从守护进程加载，其他文件保留名称和散列引用。Wayland 复制文件粘贴需要 `wl-clipboard`（`/usr/bin/wl-paste`），图片/文字由 Kit 处理，拖放无需该程序。

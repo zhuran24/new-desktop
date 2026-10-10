@@ -8,6 +8,7 @@ mod history;
 mod settings;
 mod themes;
 use gpui_kit::component::input::InputState;
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use nd_ui_core::{FeedUpdate, ReplicaFeed};
 use nd_view_model::{Contribution, Slot, Slots, Theme, ThemeMode, ViewState};
@@ -15,6 +16,24 @@ use nd_wire::Snapshot;
 use std::{path::PathBuf, rc::Rc};
 
 pub type Renderer = Rc<dyn Fn(&Presentation<'_>, &mut Window, &mut App) -> AnyElement>;
+
+/// 场景构建只读绘制后的控件几何；输入仍从私有合成器进入。
+pub(crate) fn observed<E: Styled + ParentElement>(element: E, _id: &'static str) -> E {
+    #[cfg(feature = "scenarios")]
+    let element = element.relative().child(
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                println!("{}", serde_json::json!({"native_layout": {
+                    "id": _id, "x": f32::from(bounds.origin.x), "y": f32::from(bounds.origin.y),
+                    "width": f32::from(bounds.size.width), "height": f32::from(bounds.size.height),
+                    "viewport": [f32::from(window.viewport_size().width), f32::from(window.viewport_size().height)]
+                }}));
+            },
+        ).absolute().top_0().left_0().size_full(),
+    );
+    element
+}
 pub struct Presentation<'a> {
     pub snapshot: Option<&'a Snapshot>,
     pub state: &'a ViewState,
@@ -45,6 +64,7 @@ pub struct Desktop {
     escape: nd_view_model::EscapeState,
     started: std::time::Instant,
     uploading: usize,
+    external_drop_paths: Option<ExternalPaths>,
     images: nd_view_model::ImageCache<std::sync::Arc<Image>>,
     device: String,
     draft_writes: std::collections::BTreeSet<String>,
@@ -56,6 +76,7 @@ pub struct Desktop {
     drafts: std::collections::BTreeMap<Option<String>, nd_view_model::Draft>,
     subscriptions: Vec<Subscription>,
     composer: Entity<composer::Composer>,
+    conversation_pane: Entity<chat::ConversationPane>,
     state: ViewState,
     theme: Theme,
     theme_catalog: nd_view_model::ThemeCatalog,
@@ -204,6 +225,7 @@ impl Desktop {
             escape: Default::default(),
             started: std::time::Instant::now(),
             uploading: 0,
+            external_drop_paths: None,
             images: Default::default(),
             device: format!("desktop-{}", uuid::Uuid::new_v4()),
             draft_writes: Default::default(),
@@ -213,6 +235,10 @@ impl Desktop {
             drafts: Default::default(),
             subscriptions: vec![],
             composer,
+            conversation_pane: {
+                let desktop = cx.entity();
+                cx.new(|cx| chat::ConversationPane::new(&desktop, cx))
+            },
             state,
             theme,
             theme_catalog,
@@ -420,7 +446,7 @@ impl Render for Desktop {
             _ => {}
         }
         let chat_sidebar = self.chat_sidebar(cx);
-        let chat_content = self.chat_content(window, cx);
+        let chat_header = self.chat_header(cx);
         let controls = self.chat_controls(cx);
         let navigation = self.navigation(cx);
         let history_controls = self.history_controls(cx);
@@ -487,8 +513,10 @@ impl Render for Desktop {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .min_h_0()
                             .flex()
                             .flex_col()
+                            .children(chat_header)
                             .child(history_controls)
                             .child(
                                 div()
@@ -496,43 +524,38 @@ impl Render for Desktop {
                                     .flex_1()
                                     .min_h_0()
                                     .child(
-                                        div()
-                                            .id("content")
-                                            .track_scroll(&self.scroll)
-                                            .flex_1()
-                                            .min_w_0()
-                                            .min_h_0()
-                                            .overflow_y_scroll()
-                                            .flex()
-                                            .flex_col()
-                                            .p(px(theme.spacing.large))
-                                            .gap(px(theme.spacing.medium))
-                                            .child(chat_content),
+                                        self.conversation_pane.clone().cached(
+                                            StyleRefinement::default()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .min_h_0()
+                                                .h_full(),
+                                        ),
                                     )
-                                    .child(navigation),
+                                    .child(navigation)
+                                    .when(true, |d| observed(d, "conversation")),
                             )
                             .child(
                                 div()
                                     .id("attachment-drop")
-                                    .on_drop(cx.listener(
-                                        |this, paths: &ExternalPaths, window, cx| {
-                                            this.upload_attachments(
-                                                paths
-                                                    .0
-                                                    .iter()
-                                                    .cloned()
-                                                    .map(nd_ui_core::AttachmentSource::Path)
-                                                    .collect(),
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    ))
+                                    .flex()
+                                    .flex_col()
+                                    .flex_none()
+                                    .max_h(window.viewport_size().height / 2.)
                                     .p(px(theme.spacing.medium))
-                                    .child(controls)
-                                    .child(attachments)
-                                    .children(draft_panel)
-                                    .child(self.composer.clone()),
+                                    .child(
+                                        div()
+                                            .id("draft-controls")
+                                            .flex_1()
+                                            .min_h_0()
+                                            .overflow_y_scroll()
+                                            .child(controls)
+                                            .child(attachments)
+                                            .children(draft_panel),
+                                    )
+                                    .child(div().flex_none().child(self.composer.clone()))
+                                    .when(true, |d| self.attachment_drop_target(d, cx))
+                                    .when(true, |d| observed(d, "composer")),
                             ),
                     )
                     .children(right),
