@@ -5,6 +5,7 @@ pub mod composer;
 mod controls;
 mod drafts;
 mod history;
+mod scenario_view;
 mod settings;
 mod themes;
 use gpui_kit::component::input::InputState;
@@ -376,6 +377,8 @@ impl Render for Desktop {
                 "degraded": view.as_ref().and_then(|v| v.degraded.clone()),
                 "abilities": view.as_ref().map(|v| serde_json::json!({"summarize":v.abilities.summarize,"shell":v.abilities.shell,"subtask":v.abilities.subtask})),
                 "warning": self.warning,
+                "session": self.state.selected_session,
+                "creating": self.creating,
             });
             if self.last_notice_report.as_ref() != Some(&report) {
                 println!("{}", serde_json::json!({"rendered_notice":report}));

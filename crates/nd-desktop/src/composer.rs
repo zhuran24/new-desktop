@@ -1,5 +1,7 @@
 //! 输入法与编辑交给固定版 Kit，输入意图只从 nd-composer 产生。
+use crate::scenario_view::ScenarioBounds;
 use gpui_kit::component::input::{InputEvent as KitEvent, Textarea, TextareaState};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use nd_composer::{ComposerAction, ComposerState, InputEvent, Key, Modifiers, step};
 use nd_view_model::Theme;
@@ -9,6 +11,7 @@ pub enum ComposerEvent {
     Changed(ComposerState),
     Attach(Vec<nd_ui_core::AttachmentSource>),
     Action(ComposerAction),
+    CompositionClickBlocked,
 }
 
 /// 一个输入框实体对应一个编辑缓冲；宿主保持 Entity 和订阅的生命周期。
@@ -22,6 +25,8 @@ pub struct Composer {
     paste_pending: bool,
     paste_generation: u64,
     pressed: [bool; 2],
+    painted_composing: bool,
+    pointer_composing: bool,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -40,6 +45,11 @@ impl Composer {
                     this.pressed = [false; 2];
                 }
                 let state = this.snapshot(window, cx);
+                // 标记变化会重画 Composer；平台可能在同一输入批次内先提交拼音，
+                // 再分发鼠标按下，决策不能只看此时已被清掉的 marked range。
+                if state.composing != this.painted_composing {
+                    cx.notify();
+                }
                 cx.emit(ComposerEvent::Changed(state));
             }
         });
@@ -88,6 +98,8 @@ impl Composer {
             paste_pending: false,
             paste_generation: 0,
             pressed: [false; 2],
+            painted_composing: false,
+            pointer_composing: false,
             _subscriptions: vec![changed, keys],
         }
     }
@@ -130,6 +142,22 @@ impl Composer {
     /// 按钮、命令面板和其他发送入口必须共用此组词守卫。
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(InputEvent::Submit, window, cx);
+    }
+
+    /// 锁存这次按下之前画面中的组词状态，松开后的重画不能放行同一次点击。
+    pub fn begin_pointer_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pointer_composing = self.painted_composing || self.snapshot(window, cx).composing;
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    /// 发送与导航共用同一个鼠标手势守卫；键盘和程序命令仍检查现场状态。
+    pub fn finish_pointer_click(&mut self, cx: &mut Context<Self>) -> bool {
+        let allowed = !std::mem::take(&mut self.pointer_composing);
+        if !allowed {
+            cx.emit(ComposerEvent::CompositionClickBlocked);
+        }
+        allowed
     }
 
     #[cfg(feature = "scenarios")]
@@ -224,9 +252,30 @@ impl Composer {
 }
 
 impl Render for Composer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.painted_composing = self.snapshot(window, cx).composing;
+        #[cfg(feature = "scenarios")]
+        let observer = {
+            let weak = cx.entity().downgrade();
+            Some(canvas(move |_, window, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    let state = this.snapshot(window, cx);
+                    let bounds = this.input.read(cx).input_bounds();
+                    println!("{}", serde_json::json!({"composer_view":{
+                        "text":state.text,"composing":state.composing,"focused":state.focused,
+                        "selection":this.input.read(cx).selected_range(),
+                        "bounds":{"x":f32::from(bounds.origin.x),"y":f32::from(bounds.origin.y),
+                            "width":f32::from(bounds.size.width),"height":f32::from(bounds.size.height)}
+                    }}));
+                });
+            }, |_, (), _, _| {}).absolute().top_0().left_0().size_full().into_any_element())
+        };
+        #[cfg(not(feature = "scenarios"))]
+        let observer = None::<AnyElement>;
         let t = &self.theme;
         div()
+            .when(cfg!(feature = "scenarios"), |d| d.relative())
+            .children(observer)
             .capture_action(cx.listener(Self::paste))
             .flex()
             .flex_col()
@@ -298,6 +347,7 @@ impl Render for Composer {
                     .child(
                         div()
                             .id("composer-submit")
+                            .scenario_bounds("send")
                             .debug_selector(|| "composer-submit".into())
                             .cursor_pointer()
                             .text_color(rgba(if self.send_enabled {
@@ -305,11 +355,17 @@ impl Render for Composer {
                             } else {
                                 t.colors.muted
                             }))
-                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                window.prevent_default();
-                                cx.stop_propagation();
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.begin_pointer_click(window, cx);
+                                }),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.finish_pointer_click(cx) {
+                                    this.submit(window, cx);
+                                }
+                            }))
                             .child(if self.send_enabled {
                                 "发送"
                             } else {

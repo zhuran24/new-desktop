@@ -10,6 +10,53 @@ use std::{path::Path, time::Duration};
 
 const MODEL: &str = "claude-haiku-4-5";
 
+/// #66 的输入从私有 KWin 进入真 Rime；只读 UI 呈现和公开 nd-wire。
+#[tokio::test]
+async fn composing_clicks_do_not_send_or_navigate_with_real_rime() {
+    let fx = Fixture::start("nd66-ime-clicks", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("ime-click-original", "/sandbox/project", "original")
+        .await;
+    fx.wait(&session, "original ready", |s| texts(s) == ["ready"])
+        .await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let other = fx
+        .create("ime-click-other", "/sandbox/project", "other")
+        .await;
+    fx.wait(&other, "other ready", |s| texts(s) == ["ready"])
+        .await;
+    let output = std::env::var_os("ND66_IME_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("ime-clicks"));
+    let status = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_ime_clicks.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"))
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--other-session")
+        .arg(&other)
+        .arg("--output")
+        .arg(&output)
+        .kill_on_drop(true)
+        .status()
+        .await
+        .unwrap();
+    assert!(
+        status.success(),
+        "real Rime click regression: {}",
+        output.display()
+    );
+    fx.close();
+}
+
 #[tokio::test]
 async fn an_unavailable_command_does_not_block_other_desktop_commands_or_retry_forever() {
     let fx = Fixture::start("command-unavailable", 3_600_000).await;

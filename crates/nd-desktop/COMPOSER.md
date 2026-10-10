@@ -8,6 +8,7 @@
 
 - `Composer::set_send_enabled` 由会话能力根据准入更新；默认 false。按钮、命令面板都调用 `submit`，不能自行读取正文并绕过组词保护。
 - `Composer::snapshot(window, cx)` 直接读取编辑器正文、焦点、marked range 与发送准入。`Changed` 供草稿组件观察编辑和焦点变化；它不是完整的 IME 生命周期通知，发送或 Esc 必须重新采样。
+- 鼠标发送和会话导航在按下时调用 `begin_pointer_click`，点击完成时先检查 `finish_pointer_click`。守卫锁存最近一次 Composer 渲染中的组词状态，避免合成器先提交预编辑、再交付鼠标事件时放行同一次点击；被拦截时发出 `CompositionClickBlocked`，外壳提示先完成组词。KWin 6.7.5 自己提交拼音、重置候选的行为仍存在，范围与证据见 [#66 验证记录](../../docs/verification/issue-66-ime-clicks.md)。
 - `editor()` 提供真正的 `TextareaState`，供平台输入、附件粘贴、草稿恢复、选择区操作。Kit `set_selected_range` 的单位为 UTF-8 字节；`EntityInputHandler` 的 range 为 UTF-16，不能混用。
 - 提交动作保留正文，不代表后端受理。外壳先等草稿保存，再由守护进程在发送事务里按版本和正文清稿；界面只应用明确受理的对应修订结果，新编辑或正在组词时不清空。交付不明保留正文，不自动重投。已创建会话的草稿经 `session.draft.update` 持久化，版本冲突原文另存，详见 [桌面说明](README.md)；组词只留在编辑器。
 - Esc 取消组词时删除 marked range、结束标记，并消费按键；不会向会话再发一个 Esc。非组词时发出中立 `Escape`，外壳按面板、活动回合、空闲双 Esc 分派；它经 nd-wire 发停止命令。长按同一个键只处理一次，释放后才处理下一次。
@@ -30,6 +31,8 @@ python crates/nd-desktop/tests/native_smoke.py --composer \
 ```
 
 纯函数测试验证键位决策；GPUI 测试经真实控件、平台输入 trait 和合成按键/鼠标验证组词守卫、UTF-16 范围、选择区换行、按钮保护与长按。原生冒烟在断网、临时 HOME/XDG、私有 D-Bus/虚拟 KWin 和独立限额 slice 中打开桌面与离线窗口，保存截图并验证实际 Wayland 缓冲提交。它们不声称豆包/Rime、候选框、上屏延迟或 CPU 已达标。
+
+`scripts/test-scenarios.sh` 还运行 `composing_clicks_do_not_send_or_navigate_with_real_rime`：真实 fcitx5/Rime 在私有 KWin 中处理拼音与确认键，私有 fake-input 协议驱动鼠标和键盘；断言三处点击不误发、不导航，正文、编辑焦点和提示保持，重新完成组词后正常执行。场景不创建 uinput 设备，不连接日常 `wayland-0`。这个回归没有证明被 KWin 重置的候选可以保留。
 
 ## owner 真机入口
 
