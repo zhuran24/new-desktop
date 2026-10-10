@@ -1,6 +1,6 @@
 # #68：聚焦产品窗口的空闲 CPU
 
-日期：2026-10-09。状态：修复已实现，整套检查与最终嵌套验收进行中。真桌面复核为 `OWNER_PENDING`。
+日期：2026-10-09。状态：`fixed`。最新 v1 已合入，千轮嵌套正式验收和五项交付检查全部通过。真桌面复核为 `OWNER_PENDING`。
 
 ## 问题与修复
 
@@ -23,7 +23,7 @@ bash scripts/test-idle-cpu.sh
 
 测试通过同步副本连接真守护进程，使用钉住的 Claude CLI 2.1.289、两个 mod、看守、systemd 与 SQLite 生成历史；只有模型端点是离线伪端点。私有 KWin 的 fake-input 驱动真实 Fcitx/Rime，不调用产品输入处理函数。默认生成 40 轮，填满公开历史页的 60 条正文；`ND_NATIVE_CPU_ROUNDS=1000` 覆盖原报告的千轮历史。
 
-每种状态静置 15 秒后采样 60 秒，以 `/proc/<pid>/stat` 的进程 CPU ticks 除以实际墙钟时间，百分比按一个核心计。采样期间检查进程身份、实际活动窗口；预编辑状态还持续检查真实候选窗。先经 Rime 上屏「你好」、从公开草稿读回并清空，证明输入框已取得焦点。最后再次真实输入，读回「你好你好」，并从合成器截图差分确认可见光标仍闪烁。
+每种状态静置 15 秒后采样 60 秒，读取 `/proc/<pid>/stat` 的进程 CPU ticks，按 `100 × Δticks / SC_CLK_TCK / 实际墙钟秒数` 计算一个核心的百分比。采样期间检查进程身份、实际活动窗口；预编辑状态还持续检查真实候选窗。先经 Rime 上屏「你好」、从公开草稿读回并清空，证明输入框已取得焦点。最后再次真实输入，读回「你好你好」，并从合成器截图差分确认可见光标仍闪烁。
 
 `ND_NATIVE_CPU_SECONDS=5` 仅用于快速诊断，结果标为非正式采样，不能代替 60 秒验收。
 
@@ -33,29 +33,35 @@ bash scripts/test-idle-cpu.sh
 
 证据根目录：`/mnt/wd_external/nd-build/tmp/bug-68/`。修复前产品来自 `v1 c4632017fdce432fad4bdefd85a03402cc7b1a73`，二进制副本为 `nd-desktop-before`，SHA-256 为 `cca4683764fa9c38513d9db2798ee777a2af022c410ee6c3a11777f35fa955cf`。
 
-| 状态 | 修复前，40 轮，每格 60 秒 | 修复后，40 轮，每格 5 秒，仅快速诊断 |
+| 状态 | 修复前，40 轮，每格 60 秒 | 最终版本，1000 轮，每格 60 秒 |
 |---|---:|---:|
-| 聚焦空框 | 2.40% | 0.60% |
-| 保持预编辑 | 2.57% | 0.20% |
+| 聚焦空框 | 2.40% | 0.40% |
+| 保持预编辑 | 2.57% | 0.38% |
 | 失焦 | 0.00% | 0.00% |
 
 `red-ready-fast.log` 与 `red-ready-fast/result.json` 捕获真实输入前置条件通过后，聚焦空框 2.80% 导致的明确失败。`red-ready-60.log` 与 `red-ready-60/result.json` 完成三种状态、真实上屏与光标截图检查，最终因 CPU 门槛失败。`green-fast.log` 与 `green-fast/result.json` 全部通过，光标差分为 2×16 像素。
 
-最终千轮 60 秒回归：待完整通过后填写。一次千轮运行的 CPU 已全部达标，但守护进程夹具的默认 300 秒到期清理中断了最后输入读回；该次运行不计作整体验收。此工单夹具的寿命为 900 秒，其他场景仍采用原有默认值。
+最终证据为 `green-1000-final-60.log` 与 `green-1000-final-60/result.json`：测试完整通过，三段实际采样均超过 60 秒，确认最终上屏「你好你好」及 2×16 像素的可见光标闪烁差分。最终普通 release 的 SHA-256 为 `5c2fad8213b7d06e6424aae9f860cc929a6e1c8a58131dedeea8b952e5fea96d`。最终版本合入了 #69 的固定会话头，历史正文继续独立缓存；40 轮与千轮均受公开历史页 60 条正文的上限约束。
+
+此工单夹具的寿命为 900 秒，覆盖千轮准备与三段采样，其他场景仍采用原有默认值。早期 `green-1000-60/` 的 CPU 虽全部达标，但夹具默认 300 秒到期清理中断了最后输入读回，不计作整体验收。
+
+最终 `cleanup.json` 确认专用单元和 slice 无残留、临时根已删除；`owner-processes.json` 确认 owner KWin 与 Fcitx 的 PID/启动时间在该轮前后相同。测试没有向日常桌面发事件。
 
 环境：KWin 6.7.5、Fcitx 5.1.23、fcitx5-rime 5.1.16、librime 1.17.0；虚拟输出 1400×900，产品内容区 1050×850。证据目录包含 binary.json、逐秒 CPU 样本、候选截图、光标差分截图、窗口身份、owner 进程身份与 cleanup.json。
 
 ## 交付检查
 
-`git merge v1` 已执行，基线为 `c4632017fdce432fad4bdefd85a03402cc7b1a73`。检查使用外置 target、6 jobs、12 GiB/零 swap scope；日志在证据根目录。
+`git merge v1` 已执行，交付验证基于 `v1 78959374bd4334a54eb02fdf2194763000cd1674`，合并提交为 `7f76cfa`。五项检查在该次合并后重新执行，使用外置 target、6 jobs、12 GiB/零 swap scope；日志在证据根目录。
 
 | 检查 | 日志 | 状态 |
 |---|---|---|
-| `cargo test --workspace --locked` | workspace.log | 进行中 |
-| `bash scripts/test-scenarios.sh` | scenarios.log | 待执行 |
-| `cargo clippy --workspace --all-targets --features nd-daemon/scenarios,nd-testkit/scenarios,nd-claude/scenarios,nd-desktop/scenarios --locked -- -D warnings` | clippy.log | 待执行 |
+| `cargo test --workspace --locked` | workspace.log | 246 通过，2 ignored |
+| `bash scripts/test-scenarios.sh` | scenarios.log | 178 通过，2 ignored |
+| `cargo clippy --workspace --all-targets --features nd-daemon/scenarios,nd-testkit/scenarios,nd-claude/scenarios,nd-desktop/scenarios --locked -- -D warnings` | clippy.log | 通过 |
 | `cargo fmt --all -- --check` | fmt.log | 通过 |
-| `bash scripts/check-schemas.sh` | schemas.log | 待执行 |
+| `bash scripts/check-schemas.sh` | schemas.log | 通过，无生成差异 |
+
+场景套件包含 #69 的真实 Rime 固定会话头检查，以及已有的流式恢复、双窗口草稿、主题热切换、历史导航与设置原生回归。场景通过 systemd 用户测试服务启动，允许现有 `newuidmap` 执行子 UID 映射；直接继承代理进程的 `NoNewPrivs=1` 无法完成异 UID 权限检查，相关环境失败记录为 `scenarios-inherited-nnp.log`，未改动该权限测试或宿主设置。
 
 ## owner_checklist
 
