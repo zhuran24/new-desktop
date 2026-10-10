@@ -1959,6 +1959,79 @@ async fn desktop_client_cold_reopens_during_a_delta_and_continues_the_conversati
 }
 
 #[tokio::test]
+async fn native_session_header_stays_visible_with_a_running_turn_and_saved_draft() {
+    let fx = Fixture::start("nd69-native-header", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("短回答"));
+    let session = fx
+        .create("header-create", "/sandbox/project", "会话头验收")
+        .await;
+    fx.wait(&session, "first turn finished", |s| {
+        !texts(s).is_empty() && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let held = endpoint.enqueue_held(fx.main(), ModelReply::text("held turn"));
+    fx.send("header-running", &session, "保持回合进行中").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.wait(&session, "running turn", |s| {
+        header(s)["process"]["turn_running"] == true
+    })
+    .await;
+    // 公开草稿版本冲突生成另存稿，与真实双窗口编辑走同一条路径。
+    fx.ui()
+        .await
+        .command(&edit_draft(
+            "header-saved",
+            "second-window",
+            &session,
+            99,
+            "另存的草稿正文",
+        ))
+        .await
+        .unwrap();
+    fx.wait(&session, "saved draft", |s| {
+        draft(s)["saved"].as_array().is_some_and(|v| v.len() == 1)
+    })
+    .await;
+    let output = std::env::var_os("ND69_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-header"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_header.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"))
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot = fx.peek(&session).await;
+    assert_eq!(header(&snapshot)["process"]["turn_running"], true);
+    assert_eq!(
+        snapshot.items.iter().filter(|i| i.kind == "prompt").count(),
+        2,
+        "Rime commit must not send another prompt"
+    );
+    assert_eq!(draft(&snapshot)["saved"].as_array().unwrap().len(), 1);
+    held.release();
+    fx.close();
+}
+
+#[tokio::test]
 async fn native_chat_window_creates_and_recovers_during_streaming_markdown() {
     native_chat(false).await;
 }

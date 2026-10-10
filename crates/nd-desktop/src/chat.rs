@@ -987,22 +987,44 @@ impl Desktop {
             .flex()
             .flex_col()
             .gap(px(t.spacing.medium))
-            .child(div().text_color(rgba(t.colors.muted)).child(view.header))
-            .child(self.session_settings_view(cx))
-            .when_some(view.degraded, |d, degraded| {
-                d.child(
-                    div()
-                        .id("degraded")
-                        .p(px(t.spacing.small))
-                        .rounded(px(t.radius))
-                        .border(px(t.border_width))
-                        .border_color(rgba(t.colors.accent))
-                        .text_color(rgba(t.colors.accent))
-                        .child(degraded),
-                )
-            })
+            .children(self.session_settings_body(cx))
             .children(items)
+            .when(true, |d| crate::observed(d, "messages"))
             .into_any_element()
+    }
+
+    pub(crate) fn chat_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.creating {
+            return None;
+        }
+        let view = conversation(self.session_snapshot.as_ref()?);
+        let t = &self.theme;
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .p(px(t.spacing.medium))
+                .gap(px(t.spacing.small))
+                .child(crate::observed(
+                    div().text_color(rgba(t.colors.muted)).child(view.header),
+                    "session-header",
+                ))
+                .child(self.session_settings_view(cx))
+                .when_some(view.degraded, |d, degraded| {
+                    d.child(
+                        div()
+                            .id("degraded")
+                            .p(px(t.spacing.small))
+                            .rounded(px(t.radius))
+                            .border(px(t.border_width))
+                            .border_color(rgba(t.colors.accent))
+                            .text_color(rgba(t.colors.accent))
+                            .child(degraded),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 }
 
