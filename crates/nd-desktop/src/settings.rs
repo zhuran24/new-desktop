@@ -68,6 +68,7 @@ impl Desktop {
     pub(crate) fn open_session_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         if self.settings_open {
+            self.scroll.set_offset(point(px(0.), px(0.)));
             let title = self
                 .session_snapshot
                 .as_ref()
@@ -86,30 +87,46 @@ impl Desktop {
             .as_ref()
             .map(nd_view_model::session_settings)
             .unwrap_or_default();
-        let mut panel = div().flex().flex_col().gap(px(t.spacing.small)).child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(view.title.clone())
-                .child(
-                    div()
-                        .id("session-settings-toggle")
-                        .cursor_pointer()
-                        .text_color(rgba(t.colors.accent))
-                        .child(if self.settings_open {
-                            "收起设置"
-                        } else {
-                            "会话设置"
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_session_settings(window, cx)
-                        })),
-                ),
-        );
-        if !self.settings_open {
-            return panel.into_any_element();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(t.spacing.small))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(view.title.clone())
+                    .child(crate::observed(
+                        div()
+                            .id("session-settings-toggle")
+                            .cursor_pointer()
+                            .text_color(rgba(t.colors.accent))
+                            .child(if self.settings_open {
+                                "收起设置"
+                            } else {
+                                "会话设置"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_session_settings(window, cx)
+                            })),
+                        "settings",
+                    )),
+            )
+            .into_any_element()
+    }
+
+    pub(crate) fn session_settings_body(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.settings_open || self.creating {
+            return None;
         }
+        let t = &self.theme;
+        let view = self
+            .session_snapshot
+            .as_ref()
+            .map(nd_view_model::session_settings)
+            .unwrap_or_default();
+        let mut panel = div().flex().flex_col().gap(px(t.spacing.small));
         let busy = self.settings_sending || view.pending.is_some();
         let option = |id: String, label: String, selected: bool, disabled: bool| {
             div()
@@ -220,24 +237,26 @@ impl Desktop {
         if let Some(pending) = view.pending {
             panel = panel.child(div().text_color(rgba(t.colors.muted)).child(pending));
         }
-        panel
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(t.spacing.small))
-                    .child(Input::new(&self.title_editor))
-                    .child(
-                        option(
-                            "session-rename".into(),
-                            "保存标题".into(),
-                            false,
-                            self.settings_sending,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.rename_session(cx))),
-                    ),
-            )
-            .into_any_element()
+        Some(
+            panel
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(t.spacing.small))
+                        .child(Input::new(&self.title_editor))
+                        .child(
+                            option(
+                                "session-rename".into(),
+                                "保存标题".into(),
+                                false,
+                                self.settings_sending,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.rename_session(cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     #[cfg(feature = "scenarios")]
