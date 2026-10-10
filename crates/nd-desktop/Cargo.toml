@@ -16,6 +16,8 @@ nd-wire.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 notify.workspace = true
+wayland-client = "=0.31.15"
+rustix = { workspace = true, features = ["event"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

@@ -820,6 +820,70 @@ async fn e2b_send_now_moves_foreground_mcp_to_background_and_delivers_its_result
 }
 
 #[tokio::test]
+async fn native_rime_escape_hold_preserves_turn_and_real_double_escape_opens_rewind() {
+    let fx = Fixture::start("nd67-native", 3_600_000).await;
+    let endpoint = fx.scenario.endpoint();
+    endpoint.enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx
+        .create("native-escape", "/sandbox/project", "warm up")
+        .await;
+    fx.wait(&session, "created", |s| {
+        has_header(s, |h| h["status"] == "active")
+    })
+    .await;
+    let held = endpoint.enqueue_held(fx.main(), ModelReply::text("must remain running"));
+    fx.send("native-active", &session, "keep running").await;
+    endpoint
+        .wait_for_requests(&fx.main(), 2, Duration::from_secs(30))
+        .await
+        .unwrap();
+    fx.wait(&session, "running", |s| {
+        header(s)["process"]["turn_running"] == true
+    })
+    .await;
+    let output = std::env::var_os("ND67_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-escape"));
+    let desktop = std::path::PathBuf::from(
+        std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"),
+    );
+    let result = tokio::process::Command::new("python")
+        .arg("-B")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_escape.py"))
+        .arg("--bin-dir")
+        .arg(desktop.parent().unwrap())
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot = fx.peek(&session).await;
+    assert_eq!(
+        header(&snapshot)["process"]["turn_running"],
+        false,
+        "genuine later Esc still interrupts"
+    );
+    assert_eq!(
+        snapshot.items.iter().filter(|i| i.kind == "prompt").count(),
+        2,
+        "Rime Escape never sends a prompt"
+    );
+    held.release();
+    fx.close();
+}
+
+#[tokio::test]
 async fn native_controls_send_withdraw_reopen_and_dispatch_escape() {
     let fx = Fixture::start("nd18-native", 3_600_000).await;
     let endpoint = fx.scenario.endpoint();

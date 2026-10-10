@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 static struct ei_device *keyboard;
+static struct ei_device *pointer;
 static unsigned char pressed[256];
 static volatile sig_atomic_t stopping;
 static void stop(int sig) { (void)sig; stopping = 1; }
@@ -19,12 +20,18 @@ static void dispatch(struct ei *sender) {
     struct ei_event *event;
     while ((event = ei_get_event(sender))) {
         if (ei_event_get_type(event) == EI_EVENT_SEAT_ADDED)
-            ei_seat_bind_capabilities(ei_event_get_seat(event), EI_DEVICE_CAP_KEYBOARD, NULL);
+            ei_seat_bind_capabilities(ei_event_get_seat(event), EI_DEVICE_CAP_KEYBOARD,
+                                     EI_DEVICE_CAP_POINTER_ABSOLUTE, EI_DEVICE_CAP_BUTTON, NULL);
         if (ei_event_get_type(event) == EI_EVENT_DEVICE_RESUMED) {
             struct ei_device *device = ei_event_get_device(event);
             if (!keyboard && ei_device_has_capability(device, EI_DEVICE_CAP_KEYBOARD)) {
                 keyboard = ei_device_ref(device);
                 ei_device_start_emulating(keyboard, 1);
+            }
+            if (!pointer && ei_device_has_capability(device, EI_DEVICE_CAP_POINTER_ABSOLUTE)
+                && ei_device_has_capability(device, EI_DEVICE_CAP_BUTTON)) {
+                pointer = ei_device_ref(device);
+                ei_device_start_emulating(pointer, 2);
             }
         }
         if (ei_event_get_type(event) == EI_EVENT_DISCONNECT) stopping = 1;
@@ -34,7 +41,7 @@ static void dispatch(struct ei *sender) {
 
 int main(int argc, char **argv) {
     const char *runtime = getenv("XDG_RUNTIME_DIR"), *socket = getenv("WAYLAND_DISPLAY");
-    if (argc != 2 || !runtime || strcmp(runtime, "/sandbox/runtime") ||
+    if ((argc != 2 && !(argc == 3 && !strcmp(argv[2], "--pointer"))) || !runtime || strcmp(runtime, "/sandbox/runtime") ||
         !socket || strcmp(socket, "nd-test-ime") || getenv("WAYLAND_SOCKET")) return 2;
     pid_t parent = getppid();
     if (prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() != parent) return 3;
@@ -42,21 +49,33 @@ int main(int argc, char **argv) {
     struct ei *sender = ei_new_sender(NULL);
     ei_configure_name(sender, "nd-test-private-keyboard");
     if (ei_setup_backend_fd(sender, atoi(argv[1]))) return 4;
-    for (int n = 0; !keyboard && !stopping && n < 100; n++) {
+    for (int n = 0; (!keyboard || (argc == 3 && !pointer)) && !stopping && n < 100; n++) {
         struct pollfd fd = { ei_get_fd(sender), POLLIN, 0 };
         poll(&fd, 1, 50); dispatch(sender);
     }
-    if (!keyboard) return 5;
+    if (!keyboard || (argc == 3 && !pointer)) return 5;
     puts("ready"); fflush(stdout);
     while (!stopping) {
         struct pollfd fd = { STDIN_FILENO, POLLIN, 0 };
         if (poll(&fd, 1, 100) <= 0) continue;
         unsigned key, value;
-        if (scanf("%u %u", &key, &value) != 2) break;
+        char line[128]; double x, y;
+        if (!fgets(line, sizeof(line), stdin)) break;
+        if (pointer && sscanf(line, "motion %lf %lf", &x, &y) == 2) {
+            ei_device_pointer_motion_absolute(pointer, x, y);
+            ei_device_frame(pointer, ei_now(sender)); ei_dispatch(sender);
+            puts("ok"); fflush(stdout); continue;
+        }
+        if (pointer && sscanf(line, "button %u", &value) == 1 && value <= 1) {
+            ei_device_button_button(pointer, 272, value);
+            ei_device_frame(pointer, ei_now(sender)); ei_dispatch(sender);
+            puts("ok"); fflush(stdout); continue;
+        }
+        if (sscanf(line, "%u %u", &key, &value) != 2) break;
         /* Only the test's text, navigation, paste and Esc keys. */
         if (key >= 256 || value > 1 || !(key == 1 || key == 14 || key == 28 ||
             key == 29 || key == 47 || key == 49 || key == 23 || key == 35 ||
-            key == 30 || key == 24 || key == 105 || key == 106)) break;
+            key == 30 || key == 24 || key == 57 || key == 105 || key == 106)) break;
         pressed[key] = value;
         ei_device_keyboard_key(keyboard, key, value);
         ei_device_frame(keyboard, ei_now(sender));
@@ -68,6 +87,7 @@ int main(int argc, char **argv) {
     ei_device_frame(keyboard, ei_now(sender));
     ei_dispatch(sender);
     ei_device_stop_emulating(keyboard);
+    if (pointer) { ei_device_stop_emulating(pointer); ei_device_unref(pointer); }
     ei_device_unref(keyboard); ei_unref(sender);
     return 0;
 }
