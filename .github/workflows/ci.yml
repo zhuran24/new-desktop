@@ -20,7 +20,7 @@ jobs:
       options: --memory=12g --memory-swap=12g
     env:
       CARGO_BUILD_JOBS: 6
-      CARGO_TARGET_DIR: /tmp/nd-target
+      CARGO_TARGET_DIR: target
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
       PROPTEST_CASES: 512
@@ -42,9 +42,9 @@ jobs:
             libssl-dev libzstd-dev libasound2-dev \
             vulkan-validationlayers libvulkan1
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: . -> /tmp/nd-target
+          workspaces: . -> target
           cache-on-failure: true
       - name: Format
         run: cargo fmt --all -- --check
