@@ -64,6 +64,7 @@ pub struct Desktop {
     escape: nd_view_model::EscapeState,
     started: std::time::Instant,
     uploading: usize,
+    external_drop_paths: Option<ExternalPaths>,
     images: nd_view_model::ImageCache<std::sync::Arc<Image>>,
     device: String,
     draft_writes: std::collections::BTreeSet<String>,
@@ -224,6 +225,7 @@ impl Desktop {
             escape: Default::default(),
             started: std::time::Instant::now(),
             uploading: 0,
+            external_drop_paths: None,
             images: Default::default(),
             device: format!("desktop-{}", uuid::Uuid::new_v4()),
             draft_writes: Default::default(),
@@ -540,20 +542,6 @@ impl Render for Desktop {
                                     .flex_col()
                                     .flex_none()
                                     .max_h(window.viewport_size().height / 2.)
-                                    .on_drop(cx.listener(
-                                        |this, paths: &ExternalPaths, window, cx| {
-                                            this.upload_attachments(
-                                                paths
-                                                    .0
-                                                    .iter()
-                                                    .cloned()
-                                                    .map(nd_ui_core::AttachmentSource::Path)
-                                                    .collect(),
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    ))
                                     .p(px(theme.spacing.medium))
                                     .child(
                                         div()
@@ -566,6 +554,7 @@ impl Render for Desktop {
                                             .children(draft_panel),
                                     )
                                     .child(div().flex_none().child(self.composer.clone()))
+                                    .when(true, |d| self.attachment_drop_target(d, cx))
                                     .when(true, |d| observed(d, "composer")),
                             ),
                     )

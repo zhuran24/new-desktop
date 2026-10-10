@@ -3649,6 +3649,72 @@ async fn desktop_upload_reads_file_bytes_and_rejects_unsupported_or_missing_file
 }
 
 #[tokio::test]
+async fn native_wayland_drag_adds_chinese_space_named_files_and_images_to_the_durable_draft() {
+    let fx = Fixture::start("nd70-native-drag", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("拖放验收就绪"));
+    let session = fx
+        .create("drag-create", "/sandbox/project", "拖放验收")
+        .await;
+    fx.wait(&session, "first turn finished", |s| {
+        !texts(s).is_empty() && header(s)["process"]["turn_running"] == false
+    })
+    .await;
+    let output = std::env::var_os("ND70_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("native-drag"));
+    let result = tokio::process::Command::new("python")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_drag.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"))
+        .arg("--ndctl")
+        .arg(
+            std::path::PathBuf::from(std::env::var_os("ND_TEST_DAEMON").unwrap())
+                .with_file_name("ndctl"),
+        )
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot = fx.peek(&session).await;
+    assert_eq!(draft(&snapshot)["text"], "");
+    let attachments = draft(&snapshot)["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 2);
+    let file: nd_wire::Attachment = serde_json::from_value(attachments[0].clone()).unwrap();
+    let image: nd_wire::Attachment = serde_json::from_value(attachments[1].clone()).unwrap();
+    let ui = fx.ui().await;
+    assert_eq!(file.name, "拖入 中文 和空格.txt");
+    assert_eq!(file.media_type, "text/plain");
+    assert_eq!(
+        ui.get_blob(&file.blob).await.unwrap(),
+        "真实 Wayland 拖放正文".as_bytes()
+    );
+    assert_eq!(image.name, "拖入 图片 和空格.png");
+    assert_eq!(image.media_type, "image/png");
+    let image = ui.get_blob(&image.blob).await.unwrap();
+    assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(
+        snapshot.items.iter().filter(|i| i.kind == "prompt").count(),
+        1,
+        "Rime commit and file drops must not submit the draft"
+    );
+    fx.close();
+}
+
+#[tokio::test]
 async fn native_attachment_paste_drop_and_diff_rendering() {
     let fx = Fixture::start("nd17-window", 3_600_000).await;
     let answer = "说明\n```rust\nfn main() {}\n```\n```diff\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-旧内容\n+新内容🦀\n```\n结束";
