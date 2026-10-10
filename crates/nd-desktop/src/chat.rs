@@ -1,4 +1,4 @@
-use crate::{Desktop, Presentation, composer::ComposerEvent};
+use crate::{Desktop, Presentation, composer::ComposerEvent, scenario_view::ScenarioBounds};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     component::{
@@ -175,6 +175,10 @@ impl Desktop {
                 }
                 ComposerEvent::Action(ComposerAction::Escape) => {
                     this.escape_pressed(cx);
+                }
+                ComposerEvent::CompositionClickBlocked => {
+                    this.warning = Some("请先完成组词，再发送或切换会话".into());
+                    cx.notify();
                 }
                 _ => {}
             },
@@ -744,10 +748,22 @@ impl Desktop {
             .child(
                 div()
                     .id("new-session")
+                    .scenario_bounds("new-session")
                     .cursor_pointer()
                     .text_color(rgba(t.colors.accent))
                     .child("＋ 新建会话")
-                    .on_click(cx.listener(|this, _, window, cx| this.begin_create(window, cx))),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.composer
+                                .update(cx, |c, cx| c.begin_pointer_click(window, cx));
+                        }),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.composer.update(cx, |c, cx| c.finish_pointer_click(cx)) {
+                            this.begin_create(window, cx);
+                        }
+                    })),
             )
             .when(rows.is_empty(), |d| d.child("暂无会话"))
             .children(rows.into_iter().map(|row| {
@@ -755,6 +771,7 @@ impl Desktop {
                 let target = row.session;
                 div()
                     .id(SharedString::from(row.id))
+                    .scenario_bounds(format!("session/{}", target.as_deref().unwrap_or_default()))
                     .p(px(t.spacing.small))
                     .rounded(px(t.radius))
                     .bg(rgba(if selected {
@@ -766,8 +783,17 @@ impl Desktop {
                     .flex_col()
                     .gap(px(t.spacing.small))
                     .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.composer
+                                .update(cx, |c, cx| c.begin_pointer_click(window, cx));
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(session) = &target {
+                        if this.composer.update(cx, |c, cx| c.finish_pointer_click(cx))
+                            && let Some(session) = &target
+                        {
                             this.select_session(session.clone(), window, cx);
                         }
                     }))
