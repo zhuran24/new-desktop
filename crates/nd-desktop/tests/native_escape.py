@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""#67：私有 KWin、真实 Fcitx/Rime，按住 Esc 不应成为新按键。"""
+"""#67/#75：私有 KWin、真实 Fcitx/Rime，区分 Esc 长按和取消后的真实再按。"""
 import argparse
 import json
 import os
@@ -115,15 +115,34 @@ def inner():
         keyboard.stdin.write(f'{key} {value}\n'); keyboard.stdin.flush()
         assert select.select([keyboard.stdout], [], [], 3)[0], 'private keyboard timed out'
         assert keyboard.stdout.readline().strip() == f'{key} {value}', 'private keyboard stopped'
-        inputs.write(json.dumps({'key':key,'value':value,'t_ns':time.monotonic_ns()})+'\n'); inputs.flush()
+        stamp = time.monotonic_ns()
+        inputs.write(json.dumps({'key':key,'value':value,'t_ns':stamp})+'\n'); inputs.flush()
+        return stamp
 
     def key(code, hold=.03):
-        event(code, 1)
+        pressed_at = event(code, 1)
         try:
             end = time.monotonic()+hold
             while time.monotonic()<end:
                 time.sleep(min(.02, max(0, end-time.monotonic()))); focus()
         finally: event(code, 0)
+        return pressed_at
+
+    def cancel_then_repress():
+        # 独立的真实按下必须早于 repeat_info 的 D；约 0.33 秒覆盖 #75。
+        before = state()
+        assert before['composing'], before
+        cancelled_at = key(1)
+        cancelled = wait(lambda s:not s['composing'])
+        for field in (['running', 'panel'] if product else ['escapes']):
+            assert cancelled[field] == before[field], (before, cancelled)
+        target = min(.33, plan['delay']/1000*.6) if plan['rate'] else .33
+        time.sleep(max(0, target-(time.monotonic_ns()-cancelled_at)/1e9))
+        pressed_at = key(1)
+        elapsed_ms = (pressed_at-cancelled_at)/1e6
+        result.setdefault('cancel_repress_ms', []).append(elapsed_ms)
+        if plan['rate']:
+            assert elapsed_ms < plan['delay'], ('test missed pre-repeat interval', elapsed_ms, plan)
 
     try:
         stdout = (out/'lab.jsonl').open('w'); stderr = (out/'lab.wayland.log').open('w')
@@ -178,9 +197,12 @@ def inner():
             assert after['text'] == '左🙂右', after
             unchanged(start, True, None)
             result['checks'].append('取消组词后长按 Esc，整个期间回合持续运行、面板不打开')
-            # 明显停顿后的一次真 Esc 仍可停止回合。
-            key(1); wait(lambda s:s['running'] is False and s['can_rewind'])
-            result['checks'].append('停顿后真实 Esc 可停止回合')
+            # 点按取消后，D 之前的真实再按不能被当成长按重复吞掉。
+            for code in [49,23,35,30,24]: key(code)
+            wait(lambda s:s['composing'])
+            cancel_then_repress()
+            wait(lambda s:s['running'] is False and s['can_rewind'])
+            result['checks'].append('点按取消组词后约 0.33 秒真实再按 Esc 可停止回合')
             for code in [49,23,35,30,24]: key(code)
             wait(lambda s:s['composing'])
             start = len(reports())
@@ -190,6 +212,12 @@ def inner():
             result['checks'].append('空闲取消组词后长按 Esc，全程没有反复开合回退菜单')
             key(1); key(1); wait(lambda s:s['panel']=='rewind')
             result['checks'].append('空闲时真的连按两次 Esc 打开回退菜单')
+            for code in [49,23,35,30,24]: key(code)
+            wait(lambda s:s['composing'])
+            cancel_then_repress()
+            wait(lambda s:s['panel'] is None)
+            result['checks'].append('面板打开时点按取消组词后约 0.33 秒真实 Esc 收起面板')
+            key(1); key(1); wait(lambda s:s['panel']=='rewind')
             time.sleep(plan['delay']/1000 + pause)
             start = len(reports())
             key(1, hold); time.sleep(pause)
@@ -234,6 +262,13 @@ def inner():
             count = state()['escapes']; key(1)
             wait(lambda s:s['escapes']==count+1)
             result['checks'].append('预编辑提交后立即按 Esc 有效')
+            plain, count = state()['text'], state()['escapes']
+            for code in [49,23,35,30,24]: key(code)
+            wait(lambda s:s['composing'])
+            cancel_then_repress()
+            after = wait(lambda s:s['escapes']==count+1)
+            assert after['text']==plain and not after['composing'], after
+            result['checks'].append('点按取消组词后 D 之前的真实 Esc 分派一次、正文保留')
             if plan['reconfigure']:
                 for setting, value in [('RepeatRate','5'),('RepeatDelay','900')]:
                     subprocess.run(['kwriteconfig6','--file','kcminputrc','--group','Keyboard',
