@@ -10,6 +10,70 @@ use std::{path::Path, time::Duration};
 
 const MODEL: &str = "claude-haiku-4-5";
 
+/// #74：载回另存稿经原生点击进入产品；组词、提示与落库都从公开接缝观察。
+#[tokio::test]
+async fn composing_click_does_not_restore_saved_draft_with_real_rime() {
+    let fx = Fixture::start("nd74-ime-restore", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("ime-restore", "/sandbox/project", "ready").await;
+    fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
+    // 真实版本冲突生成另存稿，不改数据库，也不在产品内部制造组词。
+    fx.ui()
+        .await
+        .command(&edit_draft(
+            "ime-restore-saved",
+            "second-window",
+            &session,
+            99,
+            "另存草稿🙂",
+        ))
+        .await
+        .unwrap();
+    let saved = fx
+        .wait(&session, "saved draft", |s| {
+            draft(s)["saved"].as_array().is_some_and(|v| v.len() == 1)
+        })
+        .await;
+    let output = std::env::var_os("ND74_IME_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("ime-restore"));
+    let result = tokio::process::Command::new("python")
+        .arg("-B")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../nd-desktop/tests/native_ime_clicks.py"))
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"))
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--other-session")
+        .arg(&session)
+        .arg("--saved-draft")
+        .arg(draft(&saved)["saved"][0]["id"].as_str().unwrap())
+        .arg("--output")
+        .arg(&output)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot = fx.peek(&session).await;
+    assert_eq!(draft(&snapshot)["text"], "另存草稿🙂");
+    assert_eq!(draft(&snapshot)["saved"], draft(&saved)["saved"]);
+    assert_eq!(
+        snapshot.items.iter().filter(|i| i.kind == "prompt").count(),
+        1
+    );
+    fx.close();
+}
+
 /// #73：真实 Rime 候选必须跟随窗口布局；判据来自截图里的预编辑字形。
 #[tokio::test]
 async fn real_rime_candidates_follow_window_resize_and_cross_output_drag() {

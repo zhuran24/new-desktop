@@ -1,4 +1,4 @@
-use crate::Desktop;
+use crate::{Desktop, scenario_view::ScenarioBounds};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use nd_wire::{CommandReply, Receipt};
@@ -247,11 +247,21 @@ impl Desktop {
                     .child(
                         div()
                             .id(SharedString::from(format!("restore/{id}")))
+                            .scenario_bounds(format!("restore/{id}"))
                             .cursor_pointer()
                             .text_color(rgba(t.colors.accent))
                             .child("载入这份草稿")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.composer
+                                        .update(cx, |c, cx| c.begin_pointer_click(window, cx));
+                                }),
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.restore_saved_draft(&id, window, cx)
+                                if this.composer.update(cx, |c, cx| c.finish_pointer_click(cx)) {
+                                    this.restore_saved_draft(&id, window, cx);
+                                }
                             })),
                     )
             }))

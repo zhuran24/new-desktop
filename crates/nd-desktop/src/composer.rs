@@ -186,7 +186,7 @@ impl Composer {
         cx.stop_propagation();
     }
 
-    /// 发送与导航共用同一个鼠标手势守卫；键盘和程序命令仍检查现场状态。
+    /// 发送、导航与载回草稿共用鼠标手势守卫；键盘和程序命令仍检查现场状态。
     pub fn finish_pointer_click(&mut self, cx: &mut Context<Self>) -> bool {
         let allowed = !std::mem::take(&mut self.pointer_composing);
         if !allowed {

@@ -260,7 +260,7 @@ def outer(args):
     for mode, name in [('client-header', 'fake-input.h'), ('private-code', 'fake-input.c')]:
         subprocess.run(['wayland-scanner', mode, protocol, str(helper_dir / name)], check=True)
     source = Path(__file__).with_name('ime_pointer.c')
-    flags = subprocess.check_output(['pkg-config', '--cflags', '--libs', 'wayland-client'], text=True).split()
+    flags = subprocess.check_output(['pkg-config', '--cflags', '--libs', 'wayland-client', 'libei-1.0'], text=True).split()
     helper = helper_dir / 'ime-pointer'
     subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-I' + str(helper_dir), str(source),
                     str(helper_dir / 'fake-input.c'), '-o', str(helper), *flags], check=True)
