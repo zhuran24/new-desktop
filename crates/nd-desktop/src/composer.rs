@@ -285,8 +285,9 @@ impl Composer {
             } else {
                 burst.timing.delay + gap
             };
-            // 已分派过首个 Esc 时，延迟开始前的再按仍算新的一次。
-            let earliest = if burst.cancelled || burst.repeating {
+            // 首个重复只在 D 附近识别；取消组词也不能吞掉远早于 D 的真再按。
+            // Fcitx 首次定时器会提前，应用观察取消也有迟到，沿用两个周期的余量。
+            let earliest = if burst.repeating {
                 Duration::ZERO
             } else {
                 burst.timing.delay.saturating_sub(gap)
