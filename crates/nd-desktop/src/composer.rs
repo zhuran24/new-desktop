@@ -73,6 +73,11 @@ impl Composer {
         // Kit 的 preedit 更新只有 notify，没有 Change，必须观察编辑器本身。
         let preedit = cx.observe_in(&input, window, |this: &mut Self, _, window, cx| {
             this.observe_preedit(window, cx);
+            // GPUI 0.3.7 只在输入法事件后更新候选位置，窗口缩放后的布局不触发上报。
+            // Kit 在绘制后通知编辑器几何变化；下一帧用已绘制的布局更新真实输入法。
+            if this.input.read(cx).focus_handle(cx).is_focused(window) {
+                window.invalidate_character_coordinates();
+            }
         });
         let window_id = window.window_handle().window_id();
         let keys = cx.intercept_keystrokes(move |event, window, cx| {
