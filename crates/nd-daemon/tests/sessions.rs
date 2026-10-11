@@ -10,6 +10,52 @@ use std::{path::Path, time::Duration};
 
 const MODEL: &str = "claude-haiku-4-5";
 
+/// #73：真实 Rime 候选必须跟随窗口布局；判据来自截图里的预编辑字形。
+#[tokio::test]
+async fn real_rime_candidates_follow_window_resize_and_cross_output_drag() {
+    let fx = Fixture::start("nd73-ime-position", 3_600_000).await;
+    fx.scenario
+        .endpoint()
+        .enqueue(fx.main(), ModelReply::text("ready"));
+    let session = fx.create("ime-position", "/sandbox/project", "ready").await;
+    fx.wait(&session, "ready", |s| texts(s) == ["ready"]).await;
+    let output = std::env::var_os("ND73_NATIVE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fx.scenario.root().join("ime-position"));
+    let result = tokio::process::Command::new("python")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../nd-desktop/tests/native_ime_position.py"),
+        )
+        .arg("--desktop")
+        .arg(std::env::var_os("ND_TEST_DESKTOP").expect("run scripts/test-scenarios.sh"))
+        .arg("--socket")
+        .arg(fx.socket())
+        .arg("--session")
+        .arg(&session)
+        .arg("--output")
+        .arg(&output)
+        .arg("--only")
+        .arg("all")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot = fx.peek(&session).await;
+    assert_eq!(
+        snapshot.items.iter().filter(|i| i.kind == "prompt").count(),
+        1
+    );
+    assert_eq!(draft(&snapshot)["text"], "");
+    fx.close();
+}
+
 /// #66 的输入从私有 KWin 进入真 Rime；只读 UI 呈现和公开 nd-wire。
 #[tokio::test]
 async fn composing_clicks_do_not_send_or_navigate_with_real_rime() {
