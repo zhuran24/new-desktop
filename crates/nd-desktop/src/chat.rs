@@ -177,7 +177,7 @@ impl Desktop {
                     this.escape_pressed(cx);
                 }
                 ComposerEvent::CompositionClickBlocked => {
-                    this.warning = Some("请先完成组词，再发送或切换会话".into());
+                    this.warning = Some("请先完成组词，再继续操作".into());
                     cx.notify();
                 }
                 _ => {}

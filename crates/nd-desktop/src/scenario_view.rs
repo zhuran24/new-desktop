@@ -18,12 +18,15 @@ impl ScenarioBounds for Stateful<Div> {
             self.relative().child(
                 canvas(
                     |_, _, _| (),
-                    move |b, (), _, _| {
+                    move |b, (), window, _| {
+                        let clip = window.content_mask().bounds;
                         println!(
                             "{}",
                             serde_json::json!({"scenario_bounds":{"id":id,"rect":{
                         "x":f32::from(b.origin.x),"y":f32::from(b.origin.y),
-                        "width":f32::from(b.size.width),"height":f32::from(b.size.height)}}})
+                        "width":f32::from(b.size.width),"height":f32::from(b.size.height)},"clip":{
+                        "x":f32::from(clip.origin.x),"y":f32::from(clip.origin.y),
+                        "width":f32::from(clip.size.width),"height":f32::from(clip.size.height)}}})
                         );
                     },
                 )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""#66：私有 KWin + 真 fcitx5/Rime，经原生输入观察按钮、草稿与 nd-wire。
+"""#66/#74：私有 KWin + 真 fcitx5/Rime，经原生输入观察按钮、草稿与 nd-wire。
 
 需要 scenarios 构建。没有输入处理函数调用，也不创建全局 uinput 设备。
 """
@@ -79,7 +79,18 @@ def inner():
     controller = dbus.Interface(bus.get_object('org.fcitx.Fcitx5', '/controller'), 'org.fcitx.Fcitx.Controller1')
     rime = dbus.Interface(bus.get_object('org.fcitx.Fcitx5', '/rime'), 'org.fcitx.Fcitx.Rime1')
     scripting = dbus.Interface(bus.get_object('org.kde.KWin', '/Scripting'), 'org.kde.kwin.Scripting')
-    worker = subprocess.Popen(['/ime-pointer'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    if plan.get('saved_draft'):
+        eis = dbus.Interface(bus.get_object('org.kde.KWin', '/org/kde/KWin/EIS/RemoteDesktop'),
+                             'org.kde.KWin.EIS.RemoteDesktop')
+        descriptor, _ = eis.connectToEIS(dbus.Int32(2)); descriptor = descriptor.take()
+        try:
+            worker = subprocess.Popen(['/ime-pointer', str(descriptor)], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, text=True, pass_fds=(descriptor,))
+        finally:
+            os.close(descriptor)
+        assert worker.stdout.readline().strip() == 'ready', 'private wheel not ready'
+    else:
+        worker = subprocess.Popen(['/ime-pointer'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     trace = (out / 'input.jsonl').open('w')
     checks = []
     app = None
@@ -140,10 +151,26 @@ def inner():
 
     def click(name):
         window = active()
-        rows = [e['scenario_bounds']['rect'] for e in events(stdout_path)
-                if e.get('scenario_bounds', {}).get('id') == name]
-        assert rows, 'no laid out control: ' + name
-        rect = rows[-1]
+        def bounds():
+            rows = [e['scenario_bounds'] for e in events(stdout_path)
+                    if e.get('scenario_bounds', {}).get('id') == name]
+            assert rows, 'no laid out control: ' + name
+            return rows[-1]
+        rect = bounds()['rect']
+        if name.startswith('restore/'):
+            for _ in range(5):
+                observed = bounds(); rect = observed['rect']; clip = observed['clip']
+                top = max(rect['y'], clip['y']); bottom = min(rect['y'] + rect['height'], clip['y'] + clip['height'])
+                if bottom - top >= 4:
+                    rect = dict(rect, y=top, height=bottom - top)
+                    break
+                inject('motion', window['client']['x'] + clip['x'] + clip['width'] / 2,
+                       window['client']['y'] + clip['y'] + clip['height'] / 2)
+                inject('wheel', 0, 120)
+                wait(lambda: bounds()['rect'] != observed['rect'], 'native scroll reveals restore control')
+            else:
+                raise AssertionError('restore control is clipped: ' + repr(bounds()))
+            record(dict(event='visible-control', control=name, rect=rect, clip=clip, view=view()))
         x = window['client']['x'] + rect['x'] + rect['width'] / 2
         y = window['client']['y'] + rect['y'] + rect['height'] / 2
         frame = window['geometry']
@@ -176,11 +203,18 @@ def inner():
                        check=True, timeout=10, capture_output=True, env=dict(os.environ, QT_QPA_PLATFORM='wayland'))
 
     try:
-        for control in ['send', 'session/' + plan['other_session'], 'new-session']:
-            label = control.split('/')[0]
+        controls = [(c, None) for c in ['send', 'session/' + plan['other_session'], 'new-session']]
+        if plan.get('saved_draft'):
+            controls = [('restore/' + plan['saved_draft'], theme) for theme in ['light', 'dark']]
+        for control, theme in controls:
+            restoring = control.startswith('restore/')
+            label = control.split('/')[0] + ('-' + theme if theme else '')
             stdout_path = out / (label + '.jsonl')
             state_path = Path('/sandbox/state') / (label + '.json')
-            state_path.write_text(json.dumps({'selected_session': plan['session'], 'window': {'width': 1050, 'height': 850}}))
+            state = {'selected_session': plan['session'], 'window': {'width': 1050, 'height': 850}}
+            if theme:
+                state['theme_selection'] = {'kind': theme}
+            state_path.write_text(json.dumps(state))
             with stdout_path.open('w') as stdout, (out / (label + '.wayland.log')).open('w') as stderr:
                 app = subprocess.Popen(['/nd-desktop', '--socket', plan['socket'], '--state', str(state_path), '--quit-after', '40'],
                                        stdout=stdout, stderr=stderr, env=dict(os.environ, WAYLAND_DEBUG='client'))
@@ -194,19 +228,41 @@ def inner():
                     inject('button', 272, 1); inject('button', 272, 0)
                     inject('key', ecodes.KEY_LEFTCTRL, 1); key('A'); inject('key', ecodes.KEY_LEFTCTRL, 0); key('BACKSPACE')
                     wait(lambda: view().get('text') == '', 'empty draft')
+                    if restoring:
+                        # 在行中组词，载回不能改变前后文或当前插入位置。
+                        subprocess.run(['wl-copy', 'leftright'], check=True, timeout=5)
+                        inject('key', ecodes.KEY_LEFTCTRL, 1); key('V'); inject('key', ecodes.KEY_LEFTCTRL, 0)
+                        wait(lambda: view().get('text') == 'leftright', 'pasted surrounding text')
+                        for _ in range(5):
+                            key('LEFT')
+                        wait(lambda: view().get('text') == 'leftright' and view().get('selection') == {'start': 4, 'end': 4}, 'middle caret')
                     controller.SetCurrentIM('rime', timeout=3); controller.Activate(timeout=3)
                     rime.SetSchema('luna_pinyin', timeout=3); rime.SetAsciiMode(False, timeout=3)
                     assert str(controller.CurrentInputMethod(timeout=3)) == 'rime'
                     for char in 'nihao':
                         key(char.upper())
-                    old = wait(lambda: view() if view().get('composing') and view().get('text') == 'ni hao' else None, 'real Rime preedit')
+                    expected = 'leftni haoright' if restoring else 'ni hao'
+                    old = wait(lambda: view() if view().get('composing') and view().get('text') == expected else None, 'real Rime preedit')
                     panel_before = candidate(); before = prompts(); screenshot(label + '-before')
+                    prior_notice = notice()
+                    assert prior_notice.get('warning') is None, ('fresh window must have no earlier warning', prior_notice)
+                    record(dict(event='before-click', view=old, notice=prior_notice, control=control, theme=theme))
                     click(control); time.sleep(.2)
                     current = view(); after = prompts(); message = notice()
+                    record(dict(event='after-click', view=current, notice=message, control=control, theme=theme))
                     assert after == before, dict(before=before, after=after, view=current)
                     assert message.get('session') == plan['session'] and not message.get('creating'), message
                     assert current['text'] == old['text'] and current['focused'], current
-                    assert '组词' in (message.get('warning') or ''), message
+                    assert current['selection'] == old['selection'], dict(before=old, after=current)
+                    assert '请先完成组词' in (message.get('warning') or ''), message
+                    # 再观察 0.7 秒，异步同步/保存不能迟到覆盖预编辑正文。
+                    deadline = time.monotonic() + .7
+                    while time.monotonic() < deadline:
+                        latest = view()
+                        assert latest['text'] == old['text'] and latest['selection'] == old['selection'] and latest['focused'], latest
+                        assert notice().get('session') == plan['session'] and not notice().get('creating'), notice()
+                        time.sleep(.03)
+                    assert prompts() == before
                     screenshot(label + '-blocked')
                     # Completion, then a distinct click, must restore normal behavior.
                     if current['composing']:
@@ -220,7 +276,12 @@ def inner():
                         key('SPACE'); wait(lambda: not view().get('composing') and view().get('text') == '你好', 'candidate confirmation')
                     completed = view()['text']
                     click(control)
-                    if control == 'send':
+                    if restoring:
+                        wait(lambda: view().get('text') == '另存草稿🙂', 'saved draft restored after composition')
+                        wait(lambda: next(i['data']['text'] for i in snapshot()['items'] if i['id'] == 'draft') == '另存草稿🙂', 'restored draft persisted')
+                        assert prompts() == before
+                        screenshot(label + '-restored')
+                    elif control == 'send':
                         wait(lambda: any(text == completed for _, text in prompts()), 'completed message sent once')
                         assert len(prompts()) == len(before) + 1
                     elif control == 'new-session':
@@ -228,10 +289,11 @@ def inner():
                     else:
                         wait(lambda: notice().get('session') == plan['other_session'], 'selected session')
                     checks.append(dict(control=control, status='PASS', preedit=old, blocked=current,
-                                       candidate_before=panel_before, completed=completed))
+                                       candidate_before=panel_before, completed=completed, theme=theme,
+                                       notice_before=prior_notice, notice_after=message))
                 except AssertionError as error:
                     screenshot(label + '-failed')
-                    checks.append(dict(control=control, status='FAIL', error=str(error)))
+                    checks.append(dict(control=control, status='FAIL', error=str(error), theme=theme))
                 finally:
                     if app.poll() is None:
                         app.terminate()
@@ -260,7 +322,7 @@ def outer(args):
     for mode, name in [('client-header', 'fake-input.h'), ('private-code', 'fake-input.c')]:
         subprocess.run(['wayland-scanner', mode, protocol, str(helper_dir / name)], check=True)
     source = Path(__file__).with_name('ime_pointer.c')
-    flags = subprocess.check_output(['pkg-config', '--cflags', '--libs', 'wayland-client'], text=True).split()
+    flags = subprocess.check_output(['pkg-config', '--cflags', '--libs', 'wayland-client', 'libei-1.0'], text=True).split()
     helper = helper_dir / 'ime-pointer'
     subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-I' + str(helper_dir), str(source),
                     str(helper_dir / 'fake-input.c'), '-o', str(helper), *flags], check=True)
@@ -282,7 +344,8 @@ def outer(args):
         (box.root / 'fcitx.sh').chmod(0o700)
         (box.root / 'session.sh').write_text('#!/bin/sh\nunset WAYLAND_SOCKET\nexec python /scenario.py --inner\n')
         (box.root / 'session.sh').chmod(0o700)
-        (box.root / 'plan.json').write_text(json.dumps(dict(socket=str(args.socket), session=args.session, other_session=args.other_session)))
+        (box.root / 'plan.json').write_text(json.dumps(dict(socket=str(args.socket), session=args.session,
+                                                         other_session=args.other_session, saved_draft=args.saved_draft)))
         bindings = [(Path(__file__), '/scenario.py'), (args.desktop, '/nd-desktop'),
                     (args.desktop.with_name('ndctl'), '/ndctl'), (helper, '/ime-pointer'), (args.socket.parent, args.socket.parent)]
         command = box.command(['dbus-run-session', '--config-file', '/sandbox/dbus.conf', '--', 'kwin_wayland',
@@ -309,5 +372,6 @@ if __name__ == '__main__':
         parser.add_argument('--socket', type=Path, required=True)
         parser.add_argument('--session', required=True)
         parser.add_argument('--other-session', required=True)
+        parser.add_argument('--saved-draft', help='#74：只检查此另存稿的原生载回点击（明暗主题）')
         parser.add_argument('--output', type=Path, required=True)
         outer(parser.parse_args())
